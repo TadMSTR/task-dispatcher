@@ -47,6 +47,8 @@ TERMINAL_STATES = {"completed", "failed"}
 ALERT_INTERVAL_HOURS = 24
 RETRY_BASE_SECONDS = 300  # 5 min base; backoff: 5m, 10m, 20m
 
+TEMPORAL_START_SCRIPT = Path.home() / "scripts" / "temporal-workflow-start.sh"
+
 # Hardcoded whitelist — no user-supplied paths reach subprocess.Popen
 AGENT_PROJECT_DIRS = {
     "sysadmin":  Path.home() / ".claude/projects/sysadmin",
@@ -222,6 +224,65 @@ def launch_agent_headless(task: dict) -> None:
     log.info(f"Headless launch: {target} (pid={proc.pid}) task={task_id[:8]}")
 
 
+# --- Temporal workflow launch ---
+# SECURITY[control]: workflow_type allowlisted before subprocess invocation.
+# Audit: 2026-06-02/temporal-workflow-trigger-2026-06.
+ALLOWED_WORKFLOW_TYPES = {"BuildPipelineWorkflow", "BuildPlanWorkflow"}
+
+
+def launch_temporal_workflow(path: Path, task: dict) -> bool:
+    """Submit a Temporal workflow for a task_type=workflow task.
+
+    Returns True on success, False on failure (failure already handled via
+    handle_routing_failure before returning).
+    """
+    payload = task.get("payload", {})
+    workflow_type = payload.get("workflow_type", "BuildPipelineWorkflow")
+    if workflow_type not in ALLOWED_WORKFLOW_TYPES:
+        handle_routing_failure(
+            path, task,
+            f"Unknown workflow_type: {workflow_type!r} (allowed: {ALLOWED_WORKFLOW_TYPES})"
+        )
+        return False
+    task_id = task.get("id", "unknown")
+    if not re.fullmatch(r'[0-9a-f\-]{36}', task_id):
+        task_id = "invalid-id"
+    plan_name = payload.get("plan_name", "")
+    if not re.fullmatch(r'[a-z0-9][a-z0-9\-]*', plan_name):
+        handle_routing_failure(
+            path, task,
+            f"Invalid plan_name for workflow submission: {plan_name!r}"
+        )
+        return False
+    workflow_id = f"{plan_name}-{task_id[:8]}"
+    input_json = json.dumps({
+        "plan_name": plan_name,
+        **{k: v for k, v in payload.items()
+           if k not in ("workflow_type", "plan_name", "task_token")}
+    })
+    log_file = Path.home() / ".pm2" / "logs" / f"temporal-start-{task_id[:8]}.log"
+    try:
+        with open(log_file, "a") as lf:
+            result = subprocess.run(
+                [str(TEMPORAL_START_SCRIPT), workflow_type, workflow_id, input_json],
+                stdout=lf, stderr=lf, timeout=30
+            )
+        if result.returncode != 0:
+            handle_routing_failure(
+                path, task,
+                f"temporal-workflow-start.sh exited {result.returncode}"
+            )
+            return False
+        log.info(f"Temporal workflow started: {workflow_type} id={workflow_id} task={task_id[:8]}")
+        return True
+    except subprocess.TimeoutExpired:
+        handle_routing_failure(
+            path, task,
+            "temporal-workflow-start.sh timed out (30s)"
+        )
+        return False
+
+
 # --- Dead-letter queue ---
 def move_to_dead_letter(path: Path, task: dict, reason: str) -> None:
     """Move a permanently failed task to the dead-letters directory and alert."""
@@ -387,7 +448,24 @@ def process_submitted(manifests: dict) -> None:
                 "target_agent": target_agent,
                 "summary": task.get("summary"),
             })
-            if task.get("task_type") == "audit" and target_agent == "security":
+            if task.get("task_type") == "workflow":
+                if launch_temporal_workflow(path, task):
+                    task["status"] = "in-progress"
+                    append_history(task, "in-progress", "dispatcher",
+                                   "Temporal workflow submitted")
+                    atomic_write(path, task)
+                    bus_log("task.workflow_started", source="dispatcher",
+                            summary=f"Temporal workflow started: {task.get('summary', path.stem)}",
+                            target=target_agent, artifact_path=str(path))
+                    log.info(f"{path.name}: → in-progress (temporal workflow)")
+                    matrix_notify(
+                        "forge",
+                        f"[temporal] {task.get('summary', path.stem)}",
+                        f"Workflow: {task.get('payload', {}).get('workflow_type', 'BuildPipelineWorkflow')}"
+                        f" | plan: {task.get('payload', {}).get('plan_name', '?')}",
+                    )
+                continue
+            elif task.get("task_type") == "audit" and target_agent == "security":
                 payload = task.get("payload", {})
                 request_path_str = payload.get("request", "") or next(
                     (r for r in (payload.get("context_refs") or []) if "audit-requests" in r), ""
