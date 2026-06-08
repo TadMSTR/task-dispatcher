@@ -517,6 +517,9 @@ def process_submitted(manifests: dict) -> None:
                     # semi-auto mode (default): queue for operator pickup, notify agent room
                     log.info(f"{path.name}: workflow_mode=semi-auto — queued for operator pickup")
                     task_id = task.get("id", path.stem)
+                    # SECURITY[accepted]: summary interpolated into Matrix notification title — Markdown injection possible
+                    # but not HTML/JSON injection. Trust model: internal agents not adversarial. Pre-existing pattern.
+                    # Audit: 2026-06-08/workflow-qol-2026-06 INFO-1.
                     summary = task.get("summary", path.stem)
                     source = task.get("source_agent", "unknown")
                     matrix_notify(
