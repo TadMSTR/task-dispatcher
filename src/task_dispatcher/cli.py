@@ -470,7 +470,11 @@ def process_submitted(manifests: dict) -> None:
                 request_path_str = payload.get("request", "") or next(
                     (r for r in (payload.get("context_refs") or []) if "audit-requests" in r), ""
                 )
-                build_name = Path(request_path_str).parent.name if request_path_str else "unknown"
+                build_name = (
+                    Path(request_path_str).parent.name
+                    if request_path_str else
+                    next(iter(re.findall(r'audit-requests/([a-zA-Z0-9_\-]+)', payload.get("description", ""))), "unknown")
+                )
                 # SECURITY[resolved]: reject "unknown" build_name to prevent silent non-functional audit launches.
                 # Audit: 2026-05-29/forge-build-workflow-infra-2026-05.
                 if build_name == "unknown" or not re.fullmatch(r'[a-zA-Z0-9_\-]+', build_name):
@@ -504,11 +508,23 @@ def process_submitted(manifests: dict) -> None:
                     )
                 log.info(f"{path.name}: headless audit launched for {build_name} (pid={proc.pid}) log={audit_log}")
             else:
-                if task.get("auto_start", False):
-                    log.info(f"{path.name}: auto_start=true — launching headless")
+                workflow_mode = task.get("workflow_mode", "semi-auto")
+                if workflow_mode == "auto":
+                    # auto mode: headless launch if auto_start or auto mode implies it
+                    log.info(f"{path.name}: workflow_mode=auto — launching headless")
                     launch_agent_headless(task)
                 else:
-                    log.info(f"{path.name}: approved, auto_start=false — queued for operator pickup")
+                    # semi-auto mode (default): queue for operator pickup, notify agent room
+                    log.info(f"{path.name}: workflow_mode=semi-auto — queued for operator pickup")
+                    task_id = task.get("id", path.stem)
+                    summary = task.get("summary", path.stem)
+                    source = task.get("source_agent", "unknown")
+                    matrix_notify(
+                        target_agent,
+                        f"[task ready] {summary}",
+                        f"Task ID: {task_id}\nFrom: {source} | Risk: {risk}\n"
+                        f'Resume: Check task queue (id={task_id}) and run shared-build-review.',
+                    )
             bus_log("task.approved", source="dispatcher",
                     summary=task.get("summary", path.stem),
                     target=target_agent, artifact_path=str(path))
@@ -516,7 +532,7 @@ def process_submitted(manifests: dict) -> None:
             matrix_notify(
                 "forge",
                 f"[auto-approved] {task.get('summary', path.stem)}",
-                f"Agent: {target_agent} | Risk: {risk}",
+                f"Agent: {target_agent} | Risk: {risk} | Mode: {task.get('workflow_mode', 'semi-auto')}",
             )
 
 
