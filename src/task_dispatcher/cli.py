@@ -112,7 +112,19 @@ def is_eligible(task: dict) -> bool:
 
 # --- Routing failure handler with exponential backoff ---
 def handle_routing_failure(path: Path, task: dict, reason: str) -> None:
-    """Handle a task routing failure with exponential backoff retry."""
+    """Handle a task routing failure with exponential backoff retry.
+
+    Between retries the task sits in "routing-failed" status so it does NOT
+    re-enter the submitted → approval pipeline on each attempt.  A separate
+    process_routing_failed() pass picks up eligible tasks and retries routing
+    directly, bypassing re-approval (the task was already approved).
+
+    On exhaustion the task is dead-lettered and moved out of the active queue.
+    Failure behavior is documented explicitly so operators understand the outcome:
+      - retry 1-3: status=routing-failed, next_retry_at set (exponential backoff)
+      - after 3 retries: status=failed → dead-lettered to dead-letters/
+      - Matrix #forge notification on dead-letter
+    """
     policy = task.setdefault("retry_policy", {})
     retry_count = policy.get("retry_count", 0)
     max_retries = policy.get("max_retries", 3)
@@ -126,7 +138,12 @@ def handle_routing_failure(path: Path, task: dict, reason: str) -> None:
         policy["next_retry_at"] = (
             datetime.now(timezone.utc) + timedelta(seconds=backoff_seconds)
         ).isoformat()
-        task["status"] = "submitted"  # re-enter the queue
+        # FIX(TQMCP-1/MDISP-1): park in "routing-failed" not "submitted".
+        # Previously reset to "submitted" caused the task to re-run the full
+        # approval pipeline (submitted→approved→routing-failed) on every retry,
+        # firing spurious NATS tasks.approved events.  process_routing_failed()
+        # now handles retry routing directly without re-approval.
+        task["status"] = "routing-failed"
         atomic_write(path, task)
         bus_log("task.routing-failed", source="dispatcher",
                 summary=f"Routing failed (retry {retry_count + 1}/{max_retries}): {reason}",
@@ -188,7 +205,14 @@ def publish_nats(subject: str, payload: dict) -> None:
 
 # --- Headless agent launch ---
 def launch_agent_headless(task: dict) -> None:
-    """Launch the target agent headlessly via claude -p."""
+    """Launch the target agent headlessly via claude -p.
+
+    Passes FORGE_WORKFLOW_MODE into the subprocess environment so that child
+    tasks submitted by the launched agent can inherit the parent's workflow_mode
+    (FIX: TQMCP-2 — workflow_mode not propagated to child tasks by dispatcher).
+    Agents should read FORGE_WORKFLOW_MODE when calling submit_task and pass it
+    as workflow_mode if they do not have an explicit override.
+    """
     target = task.get("target_agent", "")
     project_dir = AGENT_PROJECT_DIRS.get(target)
     if project_dir is None:
@@ -210,6 +234,12 @@ def launch_agent_headless(task: dict) -> None:
         task_id = "invalid-id"
     # SECURITY[resolved]: summary removed from prompt to prevent prompt injection.
     # Agent discovers task content via task-queue tools using task_id. Audit: 2026-05-29/forge-build-workflow-infra-2026-05.
+    workflow_mode = task.get("workflow_mode", "semi-auto")
+    # Build a minimal env: inherit the running process env, then inject FORGE_WORKFLOW_MODE.
+    # SECURITY[control]: workflow_mode is validated against VALID_WORKFLOW_MODES in task-queue-mcp
+    # before reaching the dispatcher; we accept only the stored value, never user-supplied input.
+    child_env = dict(os.environ)
+    child_env["FORGE_WORKFLOW_MODE"] = workflow_mode
     log_file = Path.home() / ".pm2" / "logs" / f"agent-launch-{target}-{task_id[:8]}.log"
     with open(log_file, "a") as lf:
         proc = subprocess.Popen(
@@ -220,8 +250,9 @@ def launch_agent_headless(task: dict) -> None:
             cwd=str(project_dir),
             stdout=lf,
             stderr=lf,
+            env=child_env,
         )
-    log.info(f"Headless launch: {target} (pid={proc.pid}) task={task_id[:8]}")
+    log.info(f"Headless launch: {target} (pid={proc.pid}) task={task_id[:8]} workflow_mode={workflow_mode}")
 
 
 # --- Temporal workflow launch ---
@@ -625,6 +656,132 @@ def archive_expired() -> None:
             log.info(f"Archived {path.name} (age={age_days}d, ttl={ttl_days}d, status={task['status']})")
 
 
+
+# --- Phase 1b: Retry routing-failed tasks (FIX: TQMCP-1/MDISP-1) ---
+def process_routing_failed(manifests: dict) -> None:
+    """Retry tasks that failed routing but haven't exhausted their retry budget.
+
+    These tasks sit in "routing-failed" status between retries (not "submitted"),
+    so they skip the approval pipeline — they were already approved.  When the
+    retry window passes, this function picks them up and attempts routing directly,
+    jumping to the post-approval dispatch logic.
+
+    If routing succeeds the task transitions normally (in-progress, approved, etc.).
+    If it fails again, handle_routing_failure() increments the counter and parks
+    the task in "routing-failed" again until the next window or dead-letter.
+    """
+    for path in sorted(TASK_QUEUE_DIR.glob("*.yml")):
+        if path.name.startswith("."):
+            continue
+        try:
+            task = load_yaml(path)
+        except Exception as e:
+            log.warning(f"Failed to parse {path.name}: {e}")
+            continue
+
+        if task.get("status") != "routing-failed":
+            continue
+
+        if not is_eligible(task):
+            log.debug(f"{path.name}: routing-failed retry not yet eligible, skipping")
+            continue
+
+        policy = task.get("retry_policy", {})
+        retry_count = policy.get("retry_count", 0)
+        max_retries = policy.get("max_retries", 3)
+        log.info(
+            f"{path.name}: retrying routing-failed task "
+            f"(attempt {retry_count}/{max_retries}): "
+            f"{policy.get('last_failure_reason', '?')}"
+        )
+
+        # Re-attempt routing: resolve target and dispatch exactly as process_submitted
+        # would after approval — but skip the approval check since it already passed.
+        target_agent = task.get("target_agent", "")
+        if not target_agent or target_agent == "auto":
+            resolved = find_agent(task, manifests)
+            if resolved is None:
+                handle_routing_failure(
+                    path, task,
+                    f"No agent found for task_type={task.get('task_type')} (routing-failed retry)"
+                )
+                continue
+            task["target_agent"] = resolved
+            target_agent = resolved
+
+        if task.get("task_type") == "workflow":
+            if launch_temporal_workflow(path, task):
+                task["status"] = "in-progress"
+                append_history(task, "in-progress", "dispatcher",
+                               "Temporal workflow submitted (routing-failed retry)")
+                atomic_write(path, task)
+                log.info(f"{path.name}: → in-progress (temporal, routing-failed retry)")
+            continue
+
+        if task.get("task_type") == "audit" and target_agent == "security":
+            payload = task.get("payload", {})
+            request_path_str = payload.get("request", "") or next(
+                (r for r in (payload.get("context_refs") or []) if "audit-requests" in r), ""
+            )
+            build_name = (
+                Path(request_path_str).parent.name
+                if request_path_str else
+                next(iter(re.findall(r'audit-requests/([a-zA-Z0-9_\-]+)', payload.get("description", ""))), "unknown")
+            )
+            if build_name == "unknown" or not re.fullmatch(r'[a-zA-Z0-9_\-]+', build_name):
+                handle_routing_failure(path, task, f"Invalid or missing build_name in payload: {build_name!r}")
+                continue
+            audit_root = (Path.home() / ".claude/comms/artifacts/audit-requests").resolve()
+            request_path = Path(request_path_str).expanduser().resolve() if request_path_str else (
+                audit_root / build_name / "request.md"
+            )
+            try:
+                request_path.relative_to(audit_root)
+            except ValueError:
+                handle_routing_failure(path, task, f"request_path outside audit-requests: {request_path}")
+                continue
+            if not request_path.exists():
+                handle_routing_failure(path, task, f"request_path does not exist: {request_path}")
+                continue
+            security_project_dir = Path.home() / ".claude" / "projects" / "security"
+            audit_log = Path.home() / ".pm2" / "logs" / f"security-audit-{build_name}.log"
+            with open(audit_log, "a") as audit_log_fh:
+                proc = subprocess.Popen(
+                    ["claude", "-p",
+                     "--dangerously-skip-permissions",
+                     f"Run security audit for build: {build_name}. "
+                     f"Request at: {request_path}"],
+                    cwd=str(security_project_dir),
+                    stdout=audit_log_fh,
+                    stderr=audit_log_fh,
+                )
+            task["status"] = "approved"
+            append_history(task, "approved", "dispatcher", "Routing retry succeeded")
+            atomic_write(path, task)
+            log.info(f"{path.name}: headless audit launched for {build_name} (pid={proc.pid}) — routing-failed retry")
+            continue
+
+        # Generic task: launch headless or semi-auto notify
+        workflow_mode = task.get("workflow_mode", "semi-auto")
+        if workflow_mode == "auto":
+            launch_agent_headless(task)
+        else:
+            task_id = task.get("id", path.stem)
+            summary = task.get("summary", path.stem)
+            source = task.get("source_agent", "unknown")
+            risk = task.get("risk_level", "low")
+            matrix_notify(
+                target_agent,
+                f"[task ready] {summary}",
+                f"Task ID: {task_id}\nFrom: {source} | Risk: {risk}\n"
+                f"Resume: Check task queue (id={task_id}) and run shared-build-review.",
+            )
+        task["status"] = "approved"
+        append_history(task, "approved", "dispatcher", "Routing retry succeeded")
+        atomic_write(path, task)
+        log.info(f"{path.name}: → approved (routing-failed retry, workflow_mode={workflow_mode})")
+
+
 # --- Main ---
 def main():
     log.info("=== task-dispatcher run start ===")
@@ -632,6 +789,7 @@ def main():
     log.info(f"Loaded {len(manifests)} agent manifests: {list(manifests.keys())}")
 
     process_submitted(manifests)
+    process_routing_failed(manifests)
     alert_stale_approved()
     archive_expired()
 
