@@ -351,6 +351,22 @@ def load_manifests() -> dict:
     return manifests
 
 
+# --- Parent task lookup ---
+def find_task_by_id(task_id: str) -> dict | None:
+    """Search main queue and archive for a task by UUID. Returns the task dict or None."""
+    for search_path in [TASK_QUEUE_DIR, ARCHIVE_DIR]:
+        for yml in search_path.glob("*.yml"):
+            if yml.name.startswith(".") or yml.suffix == ".tmp":
+                continue
+            try:
+                t = load_yaml(yml)
+                if t.get("id") == task_id:
+                    return t
+            except Exception:
+                continue
+    return None
+
+
 # --- Auto-routing for target_agent: auto ---
 def find_agent(task: dict, manifests: dict) -> str | None:
     """Match task_type + scope to an agent. Returns agent name or None."""
@@ -405,6 +421,26 @@ def process_submitted(manifests: dict) -> None:
             log.info(f"{path.name}: auto-routed to {resolved}")
 
         target_agent = task["target_agent"]
+
+        # Inherit workflow_mode from parent task if originating_task_id is set.
+        # This ensures auto-mode pipelines stay in auto across agent handoff boundaries.
+        originating_task_id = task.get("payload", {}).get("originating_task_id")
+        if originating_task_id:
+            parent = find_task_by_id(originating_task_id)
+            if parent:
+                parent_mode = parent.get("workflow_mode")
+                if parent_mode:
+                    task["workflow_mode"] = parent_mode
+                    log.info(
+                        f"{path.name}: inherited workflow_mode={parent_mode} "
+                        f"from parent {originating_task_id[:8]}"
+                    )
+            else:
+                log.warning(
+                    f"{path.name}: originating_task_id={originating_task_id[:8]} not found; "
+                    f"keeping workflow_mode={task.get('workflow_mode', 'semi-auto')}"
+                )
+
         manifest = manifests.get(target_agent)
         risk = task.get("risk_level", "low")
 
