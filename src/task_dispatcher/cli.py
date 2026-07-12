@@ -203,6 +203,30 @@ def publish_nats(subject: str, payload: dict) -> None:
         pass
 
 
+# --- Per-agent .env loader (SMCP-28) ---
+def load_agent_env(agent_type: str) -> dict:
+    """Read /opt/appdata/agents/<agent_type>/.env (KEY=VALUE lines).
+
+    Mirrors the sourcing run-scoped-mcp-http.sh does server-side, so headlessly
+    launched claude -p sessions get SCOPED_MCP_BEARER_TOKEN (and other agent
+    secrets) in their environment instead of relying on the dispatcher's own env.
+    """
+    env_path = Path(f"/opt/appdata/agents/{agent_type}/.env")
+    env = {}
+    if not env_path.is_file():
+        return env
+    for line in env_path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key:
+            env[key] = value
+    return env
+
+
 # --- Headless agent launch ---
 def launch_agent_headless(task: dict) -> None:
     """Launch the target agent headlessly via claude -p.
@@ -235,10 +259,12 @@ def launch_agent_headless(task: dict) -> None:
     # SECURITY[resolved]: summary removed from prompt to prevent prompt injection.
     # Agent discovers task content via task-queue tools using task_id. Audit: 2026-05-29/forge-build-workflow-infra-2026-05.
     workflow_mode = task.get("workflow_mode", "semi-auto")
-    # Build a minimal env: inherit the running process env, then inject FORGE_WORKFLOW_MODE.
+    # Build env: inherit the running process env, layer in the target agent's
+    # own .env (SCOPED_MCP_BEARER_TOKEN etc. — SMCP-28), then inject FORGE_WORKFLOW_MODE.
     # SECURITY[control]: workflow_mode is validated against VALID_WORKFLOW_MODES in task-queue-mcp
     # before reaching the dispatcher; we accept only the stored value, never user-supplied input.
     child_env = dict(os.environ)
+    child_env.update(load_agent_env(target))
     child_env["FORGE_WORKFLOW_MODE"] = workflow_mode
     log_file = Path.home() / ".pm2" / "logs" / f"agent-launch-{target}-{task_id[:8]}.log"
     with open(log_file, "a") as lf:
@@ -563,6 +589,9 @@ def process_submitted(manifests: dict) -> None:
                     continue
                 security_project_dir = Path.home() / ".claude" / "projects" / "security"
                 audit_log = Path.home() / ".pm2" / "logs" / f"security-audit-{build_name}.log"
+                # SMCP-28: layer in security agent's .env (SCOPED_MCP_BEARER_TOKEN etc.)
+                audit_env = dict(os.environ)
+                audit_env.update(load_agent_env("security"))
                 with open(audit_log, "a") as audit_log_fh:
                     proc = subprocess.Popen(
                         ["claude", "-p",
@@ -572,6 +601,7 @@ def process_submitted(manifests: dict) -> None:
                         cwd=str(security_project_dir),
                         stdout=audit_log_fh,
                         stderr=audit_log_fh,
+                        env=audit_env,
                     )
                 log.info(f"{path.name}: headless audit launched for {build_name} (pid={proc.pid}) log={audit_log}")
             else:
@@ -781,6 +811,9 @@ def process_routing_failed(manifests: dict) -> None:
                 continue
             security_project_dir = Path.home() / ".claude" / "projects" / "security"
             audit_log = Path.home() / ".pm2" / "logs" / f"security-audit-{build_name}.log"
+            # SMCP-28: layer in security agent's .env (SCOPED_MCP_BEARER_TOKEN etc.)
+            audit_env = dict(os.environ)
+            audit_env.update(load_agent_env("security"))
             with open(audit_log, "a") as audit_log_fh:
                 proc = subprocess.Popen(
                     ["claude", "-p",
@@ -790,6 +823,7 @@ def process_routing_failed(manifests: dict) -> None:
                     cwd=str(security_project_dir),
                     stdout=audit_log_fh,
                     stderr=audit_log_fh,
+                    env=audit_env,
                 )
             task["status"] = "approved"
             append_history(task, "approved", "dispatcher", "Routing retry succeeded")
