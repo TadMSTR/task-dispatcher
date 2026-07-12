@@ -227,6 +227,56 @@ def load_agent_env(agent_type: str) -> dict:
     return env
 
 
+# --- Anthropic credential preflight (SMCP-29) ---
+# A headless `claude -p` needs valid Anthropic credentials at startup or it
+# short-circuits to "Not logged in - Please run /login" and never reads the
+# task prompt.  It gets them from ANTHROPIC_API_KEY in its env, or a valid
+# OAuth token in ~/.claude/.credentials.json.  Crucially, headless mode does
+# NOT interactively refresh an expired OAuth token (it prints the login prompt
+# instead), so an expired/zeroed expiry is genuinely unusable here — making
+# `expiresAt > now` a correct usability test with no false positives on
+# refreshable-but-valid tokens.
+OAUTH_CRED_PATH = Path.home() / ".claude" / ".credentials.json"
+AUTH_ALERT_STAMP = TASK_QUEUE_DIR / ".auth-alert-stamp"
+AUTH_ALERT_DEBOUNCE_SEC = 900  # 15 min — a dead OAuth hits every queued task at once
+
+
+def anthropic_creds_usable(child_env: dict) -> bool:
+    """True if a headless claude -p launched with child_env can authenticate."""
+    if child_env.get("ANTHROPIC_API_KEY"):
+        return True
+    try:
+        oauth = json.loads(OAUTH_CRED_PATH.read_text()).get("claudeAiOauth", {})
+    except Exception:
+        return False
+    if not oauth.get("accessToken"):
+        return False
+    now_ms = datetime.now(timezone.utc).timestamp() * 1000
+    return oauth.get("expiresAt", 0) > now_ms
+
+
+def alert_auth_blocked(agent: str, task_id: str) -> None:
+    """Debounced Matrix alert to #sysadmin when the auth guard blocks a launch."""
+    try:
+        if AUTH_ALERT_STAMP.exists():
+            last = datetime.fromisoformat(AUTH_ALERT_STAMP.read_text().strip())
+            if (datetime.now(timezone.utc) - last).total_seconds() < AUTH_ALERT_DEBOUNCE_SEC:
+                return
+    except Exception:
+        pass
+    matrix_notify(
+        "sysadmin",
+        "[auth] Headless launch blocked — no usable Anthropic credential",
+        f"claude -p cannot start (OAuth expired / no ANTHROPIC_API_KEY). "
+        f"Run `claude /login` to restore headless agents. "
+        f"Latest blocked task: {task_id} (agent: {agent}).",
+    )
+    try:
+        AUTH_ALERT_STAMP.write_text(now_iso())
+    except Exception:
+        pass
+
+
 # --- Headless agent launch ---
 def launch_agent_headless(task: dict) -> None:
     """Launch the target agent headlessly via claude -p.
@@ -276,6 +326,16 @@ def launch_agent_headless(task: dict) -> None:
             TASK_QUEUE_DIR / f"{task.get('id', 'unknown')}.yml",
             task,
             f"SCOPED_MCP_BEARER_TOKEN unresolved for agent '{target}' — refusing headless launch"
+        )
+        return
+    # SMCP-29 auth guard: don't launch a session that will just print
+    # "Not logged in" — fail loud and alert instead.
+    if not anthropic_creds_usable(child_env):
+        alert_auth_blocked(target, task_id)
+        handle_routing_failure(
+            TASK_QUEUE_DIR / f"{task.get('id', 'unknown')}.yml",
+            task,
+            f"No usable Anthropic credential (OAuth expired / no ANTHROPIC_API_KEY) — refusing headless launch for '{target}'"
         )
         return
     log_file = Path.home() / ".pm2" / "logs" / f"agent-launch-{target}-{task_id[:8]}.log"
@@ -607,6 +667,10 @@ def process_submitted(manifests: dict) -> None:
                 if not audit_env.get("SCOPED_MCP_BEARER_TOKEN"):
                     handle_routing_failure(path, task, "SCOPED_MCP_BEARER_TOKEN unresolved for agent 'security' — refusing headless audit launch")
                     continue
+                if not anthropic_creds_usable(audit_env):  # SMCP-29 auth guard
+                    alert_auth_blocked("security", task.get("id", "unknown"))
+                    handle_routing_failure(path, task, "No usable Anthropic credential (OAuth expired / no ANTHROPIC_API_KEY) — refusing headless audit launch")
+                    continue
                 with open(audit_log, "a") as audit_log_fh:
                     proc = subprocess.Popen(
                         ["claude", "-p",
@@ -831,6 +895,10 @@ def process_routing_failed(manifests: dict) -> None:
             audit_env.update(load_agent_env("security"))
             if not audit_env.get("SCOPED_MCP_BEARER_TOKEN"):
                 handle_routing_failure(path, task, "SCOPED_MCP_BEARER_TOKEN unresolved for agent 'security' — refusing headless audit launch")
+                continue
+            if not anthropic_creds_usable(audit_env):  # SMCP-29 auth guard
+                alert_auth_blocked("security", task.get("id", "unknown"))
+                handle_routing_failure(path, task, "No usable Anthropic credential (OAuth expired / no ANTHROPIC_API_KEY) — refusing headless audit launch")
                 continue
             with open(audit_log, "a") as audit_log_fh:
                 proc = subprocess.Popen(
