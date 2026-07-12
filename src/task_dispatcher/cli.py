@@ -266,6 +266,18 @@ def launch_agent_headless(task: dict) -> None:
     child_env = dict(os.environ)
     child_env.update(load_agent_env(target))
     child_env["FORGE_WORKFLOW_MODE"] = workflow_mode
+    # SMCP-28 fail-loud guard: .mcp.json's ${VAR} header interpolation only
+    # supports bare $VAR/${VAR} (no bash :?/:- operators), so an unresolved
+    # bearer token fails silently as a 401 deep inside the launched session
+    # instead of here. Catch it before spawning a session doomed to have no
+    # scoped-mcp tools.
+    if not child_env.get("SCOPED_MCP_BEARER_TOKEN"):
+        handle_routing_failure(
+            TASK_QUEUE_DIR / f"{task.get('id', 'unknown')}.yml",
+            task,
+            f"SCOPED_MCP_BEARER_TOKEN unresolved for agent '{target}' — refusing headless launch"
+        )
+        return
     log_file = Path.home() / ".pm2" / "logs" / f"agent-launch-{target}-{task_id[:8]}.log"
     with open(log_file, "a") as lf:
         proc = subprocess.Popen(
@@ -592,6 +604,9 @@ def process_submitted(manifests: dict) -> None:
                 # SMCP-28: layer in security agent's .env (SCOPED_MCP_BEARER_TOKEN etc.)
                 audit_env = dict(os.environ)
                 audit_env.update(load_agent_env("security"))
+                if not audit_env.get("SCOPED_MCP_BEARER_TOKEN"):
+                    handle_routing_failure(path, task, "SCOPED_MCP_BEARER_TOKEN unresolved for agent 'security' — refusing headless audit launch")
+                    continue
                 with open(audit_log, "a") as audit_log_fh:
                     proc = subprocess.Popen(
                         ["claude", "-p",
@@ -814,6 +829,9 @@ def process_routing_failed(manifests: dict) -> None:
             # SMCP-28: layer in security agent's .env (SCOPED_MCP_BEARER_TOKEN etc.)
             audit_env = dict(os.environ)
             audit_env.update(load_agent_env("security"))
+            if not audit_env.get("SCOPED_MCP_BEARER_TOKEN"):
+                handle_routing_failure(path, task, "SCOPED_MCP_BEARER_TOKEN unresolved for agent 'security' — refusing headless audit launch")
+                continue
             with open(audit_log, "a") as audit_log_fh:
                 proc = subprocess.Popen(
                     ["claude", "-p",
