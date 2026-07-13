@@ -179,11 +179,24 @@ _MCP_HEADERS = {
 }
 
 
-def _parse_mcp_response(resp: httpx.Response) -> dict:
-    """Extract the JSON-RPC payload from an SSE- or JSON-formatted MCP response body."""
+def _parse_mcp_response(resp: httpx.Response, expected_id: int) -> dict:
+    """Extract the JSON-RPC payload matching expected_id from an SSE- or JSON-formatted body.
+
+    Scans every `data:` line rather than just the first (SECURITY[fixed]: F-2 from
+    dispatcher-auth-and-notify-2026-07 audit) — if matrix-mcp's streamable-HTTP
+    transport ever emits an intermediate event (e.g. notifications/progress) ahead
+    of the terminal JSON-RPC response, taking the first line would treat that
+    intermediate event as the answer instead of the actual result.
+    """
+    candidates = []
     for line in resp.text.splitlines():
         if line.startswith("data:"):
-            return json.loads(line[len("data:"):].strip())
+            candidate = json.loads(line[len("data:"):].strip())
+            if candidate.get("id") == expected_id:
+                return candidate
+            candidates.append(candidate)
+    if candidates:
+        return candidates[-1]
     return resp.json()
 
 
@@ -202,7 +215,7 @@ def matrix_notify(room: str, title: str, body: str) -> None:
                 "id": 1,
             })
             session_id = init_resp.headers.get("mcp-session-id")
-            init_body = _parse_mcp_response(init_resp)
+            init_body = _parse_mcp_response(init_resp, expected_id=1)
             if init_resp.status_code // 100 != 2 or init_body.get("error") or not session_id:
                 log.warning(
                     f"matrix_notify: init handshake failed for #{room} "
@@ -223,7 +236,7 @@ def matrix_notify(room: str, title: str, body: str) -> None:
                 },
                 "id": 2,
             })
-            call_body = _parse_mcp_response(call_resp)
+            call_body = _parse_mcp_response(call_resp, expected_id=2)
             tool_result = call_body.get("result", {})
             if call_resp.status_code // 100 != 2 or call_body.get("error") or tool_result.get("isError"):
                 log.warning(
