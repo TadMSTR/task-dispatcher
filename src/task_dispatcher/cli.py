@@ -125,7 +125,7 @@ def handle_routing_failure(path: Path, task: dict, reason: str) -> None:
     Failure behavior is documented explicitly so operators understand the outcome:
       - retry 1-3: status=routing-failed, next_retry_at set (exponential backoff)
       - after 3 retries: status=failed → dead-lettered to dead-letters/
-      - Matrix #forge notification on dead-letter
+      - Matrix #alerts notification on dead-letter
     """
     policy = task.setdefault("retry_policy", {})
     retry_count = policy.get("retry_count", 0)
