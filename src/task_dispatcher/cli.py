@@ -24,6 +24,7 @@ import uuid
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
+import httpx
 import yaml
 
 # agent-bus client — write path for Python scripts that cannot call MCP directly
@@ -68,6 +69,7 @@ logging.basicConfig(
     ],
 )
 log = logging.getLogger(__name__)
+logging.getLogger("httpx").setLevel(logging.WARNING)  # keep matrix_notify()'s own per-request lines out of dispatcher.log
 
 
 # --- Atomic YAML write ---
@@ -163,31 +165,75 @@ def handle_routing_failure(path: Path, task: dict, reason: str) -> None:
 
 
 # --- Matrix notification (via matrix-mcp HTTP endpoint) ---
+# MDISP-2: matrix-mcp's streamable-HTTP endpoint requires a completed MCP
+# handshake (initialize -> capture the Mcp-Session-Id response header -> pass
+# it on the follow-up tools/call) and rejects requests without it (406 with no
+# Accept header, 400 "Missing session ID" without the session header). The
+# dispatcher runs as a PM2 cron job, not a launched agent session, so it has no
+# scoped-mcp bearer identity to route through scoped-mcp's gateway with — this
+# talks to matrix-mcp's own unauthenticated localhost endpoint directly instead,
+# same as the original code did (just completing the handshake this time).
+_MCP_HEADERS = {
+    "Content-Type": "application/json",
+    "Accept": "application/json, text/event-stream",
+}
+
+
+def _parse_mcp_response(resp: httpx.Response) -> dict:
+    """Extract the JSON-RPC payload from an SSE- or JSON-formatted MCP response body."""
+    for line in resp.text.splitlines():
+        if line.startswith("data:"):
+            return json.loads(line[len("data:"):].strip())
+    return resp.json()
+
+
 def matrix_notify(room: str, title: str, body: str) -> None:
-    """Post a notification to a named Matrix room via matrix-mcp."""
+    """Post a notification to a named Matrix room via matrix-mcp, verifying delivery."""
     try:
-        payload = json.dumps({
-            "jsonrpc": "2.0",
-            "method": "tools/call",
-            "params": {
-                "name": "send_matrix_message",
-                "arguments": {
-                    "room_name": room,
-                    "message": f"**{title}**\n{body}"
-                }
-            },
-            "id": 1
-        })
-        subprocess.run(
-            ["curl", "-s", "-X", "POST", MATRIX_MCP_URL,
-             "-H", "Content-Type: application/json",
-             "-d", payload],
-            timeout=10,
-            capture_output=True,
-        )
+        with httpx.Client(timeout=10) as client:
+            init_resp = client.post(MATRIX_MCP_URL, headers=_MCP_HEADERS, json={
+                "jsonrpc": "2.0",
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "clientInfo": {"name": "task-dispatcher", "version": "1.0"},
+                },
+                "id": 1,
+            })
+            session_id = init_resp.headers.get("mcp-session-id")
+            init_body = _parse_mcp_response(init_resp)
+            if init_resp.status_code // 100 != 2 or init_body.get("error") or not session_id:
+                log.warning(
+                    f"matrix_notify: init handshake failed for #{room} "
+                    f"(status={init_resp.status_code}, body={init_body})"
+                )
+                return
+
+            call_headers = {**_MCP_HEADERS, "mcp-session-id": session_id}
+            call_resp = client.post(MATRIX_MCP_URL, headers=call_headers, json={
+                "jsonrpc": "2.0",
+                "method": "tools/call",
+                "params": {
+                    "name": "send_matrix_message",
+                    "arguments": {
+                        "room_name": room,
+                        "message": f"**{title}**\n{body}",
+                    },
+                },
+                "id": 2,
+            })
+            call_body = _parse_mcp_response(call_resp)
+            tool_result = call_body.get("result", {})
+            if call_resp.status_code // 100 != 2 or call_body.get("error") or tool_result.get("isError"):
+                log.warning(
+                    f"matrix_notify failed for #{room}: {title!r} "
+                    f"(status={call_resp.status_code}, body={call_body})"
+                )
+                return
         log.info(f"matrix_notify sent to #{room}: {title}")
     except Exception as e:
-        log.warning(f"matrix_notify failed: {e}")
+        log.warning(f"matrix_notify failed for #{room}: {title!r}: {e}")
 
 
 # --- NATS publish (fire-and-forget) ---
@@ -230,8 +276,10 @@ def load_agent_env(agent_type: str) -> dict:
 # --- Anthropic credential preflight (SMCP-29) ---
 # A headless `claude -p` needs valid Anthropic credentials at startup or it
 # short-circuits to "Not logged in - Please run /login" and never reads the
-# task prompt.  It gets them from ANTHROPIC_API_KEY in its env, or a valid
-# OAuth token in ~/.claude/.credentials.json.  Crucially, headless mode does
+# task prompt.  It gets them from ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN, or
+# CLAUDE_CODE_OAUTH_TOKEN in its env (SMCP-32 — any of the three is sufficient,
+# same short-circuit pattern), or a valid OAuth token in
+# ~/.claude/.credentials.json as a last resort.  Crucially, headless mode does
 # NOT interactively refresh an expired OAuth token (it prints the login prompt
 # instead), so an expired/zeroed expiry is genuinely unusable here — making
 # `expiresAt > now` a correct usability test with no false positives on
@@ -243,7 +291,11 @@ AUTH_ALERT_DEBOUNCE_SEC = 900  # 15 min — a dead OAuth hits every queued task 
 
 def anthropic_creds_usable(child_env: dict) -> bool:
     """True if a headless claude -p launched with child_env can authenticate."""
-    if child_env.get("ANTHROPIC_API_KEY"):
+    if (
+        child_env.get("ANTHROPIC_API_KEY")
+        or child_env.get("ANTHROPIC_AUTH_TOKEN")
+        or child_env.get("CLAUDE_CODE_OAUTH_TOKEN")
+    ):
         return True
     try:
         oauth = json.loads(OAUTH_CRED_PATH.read_text()).get("claudeAiOauth", {})
@@ -425,7 +477,7 @@ def move_to_dead_letter(path: Path, task: dict, reason: str) -> None:
     atomic_write(dest, task)
     path.unlink(missing_ok=True)
     matrix_notify(
-        "forge",
+        "alerts",
         f"[dead-letter] {task.get('summary', path.stem)}",
         f"Task {task.get('id', path.stem)} failed after max retries.\nReason: {reason}",
     )
@@ -599,7 +651,7 @@ def process_submitted(manifests: dict) -> None:
                 f"`task-approve {task.get('id', path.stem)}`",
             )
             matrix_notify(
-                "forge",
+                "alerts",
                 f"[pending-approval] {task.get('summary', path.stem)}",
                 f"Agent: {target_agent} | Risk: {risk}",
             )
@@ -624,7 +676,7 @@ def process_submitted(manifests: dict) -> None:
                             target=target_agent, artifact_path=str(path))
                     log.info(f"{path.name}: → in-progress (temporal workflow)")
                     matrix_notify(
-                        "forge",
+                        "announcements",
                         f"[temporal] {task.get('summary', path.stem)}",
                         f"Workflow: {task.get('payload', {}).get('workflow_type', 'BuildPipelineWorkflow')}"
                         f" | plan: {task.get('payload', {}).get('plan_name', '?')}",
@@ -709,7 +761,7 @@ def process_submitted(manifests: dict) -> None:
                     target=target_agent, artifact_path=str(path))
             log.info(f"{path.name}: → approved (auto)")
             matrix_notify(
-                "forge",
+                "announcements",
                 f"[auto-approved] {task.get('summary', path.stem)}",
                 f"Agent: {target_agent} | Risk: {risk} | Mode: {task.get('workflow_mode', 'semi-auto')}",
             )
@@ -756,7 +808,7 @@ def alert_stale_approved() -> None:
 
             log.info(f"{path.name}: stale approved task ({age_hours}h unclaimed), sending alert")
             matrix_notify(
-                "forge",
+                "alerts",
                 f"[stale] {task.get('summary', path.stem)}",
                 f"Approved {age_hours}h ago, unclaimed | Agent: {task.get('target_agent')}",
             )
