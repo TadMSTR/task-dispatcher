@@ -378,6 +378,10 @@ def launch_agent_headless(task: dict) -> None:
     # own .env (SCOPED_MCP_BEARER_TOKEN etc. — SMCP-28), then inject FORGE_WORKFLOW_MODE.
     # SECURITY[control]: workflow_mode is validated against VALID_WORKFLOW_MODES in task-queue-mcp
     # before reaching the dispatcher; we accept only the stored value, never user-supplied input.
+    # SECURITY[deferred]: dict(os.environ) is a broad passthrough, not an explicit allowlist —
+    # any var in the dispatcher's own process env reaches every headlessly launched agent.
+    # Target: refactor alongside the instant-clone agent pool work. Audit: 2026-07-12/
+    # dispatcher-auth-and-notify-2026-07 F-1. Ticket: MDISP-4.
     child_env = dict(os.environ)
     child_env.update(load_agent_env(target))
     child_env["FORGE_WORKFLOW_MODE"] = workflow_mode
