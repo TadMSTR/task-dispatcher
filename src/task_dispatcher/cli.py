@@ -802,9 +802,11 @@ def alert_stale_approved() -> None:
         for entry in reversed(task.get("history", [])):
             if entry.get("status") == "approved":
                 ts_str = entry.get("timestamp", "")
+                # PyYAML auto-parses unquoted ISO8601 strings into datetime objects on
+                # load, so ts_str may already be a datetime, not a str.
                 try:
-                    approved_at = datetime.fromisoformat(ts_str)
-                except ValueError:
+                    approved_at = ts_str if isinstance(ts_str, datetime) else datetime.fromisoformat(ts_str)
+                except (ValueError, TypeError):
                     pass
                 break
 
@@ -813,9 +815,14 @@ def alert_stale_approved() -> None:
 
             alert_state = task.get("alert_state", {})
             last_alerted = alert_state.get("last_alerted_at")
+            if last_alerted is not None and not isinstance(last_alerted, datetime):
+                try:
+                    last_alerted = datetime.fromisoformat(last_alerted)
+                except (ValueError, TypeError):
+                    last_alerted = None
             should_alert = (
                 last_alerted is None or
-                (datetime.now(timezone.utc) - datetime.fromisoformat(last_alerted)).total_seconds()
+                (datetime.now(timezone.utc) - last_alerted).total_seconds()
                 > ALERT_INTERVAL_HOURS * 3600
             )
 
