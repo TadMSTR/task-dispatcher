@@ -6,9 +6,8 @@ Runs every 2 minutes via PM2 cron.
 Logic:
   1. Process submitted tasks: route to agent, auto-approve or set pending-approval
      - Exponential backoff retry on routing failures (default 3 retries: 5m, 10m, 20m)
-  2. Alert on stale approved tasks (unclaimed >24h, re-alert interval: 24h)
-  3. Archive terminal tasks past ttl_days
-  4. Log all transitions to dispatcher.log
+  2. Archive terminal tasks past ttl_days
+  3. Log all transitions to dispatcher.log
 """
 
 import glob
