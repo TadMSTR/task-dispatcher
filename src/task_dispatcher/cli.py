@@ -666,11 +666,6 @@ def process_submitted(manifests: dict) -> None:
                 f"Source: {task.get('source_agent')} | Type: {task.get('task_type')} | Risk: {risk} | Agent: {target_agent}\n"
                 f"`task-approve {task.get('id', path.stem)}`",
             )
-            matrix_notify(
-                "alerts",
-                f"[pending-approval] {task.get('summary', path.stem)}",
-                f"Agent: {target_agent} | Risk: {risk}",
-            )
         else:
             task["status"] = "approved"
             append_history(task, "approved", "dispatcher",
