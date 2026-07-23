@@ -45,7 +45,6 @@ MATRIX_MCP_URL = "http://127.0.0.1:8487/mcp"
 
 RISK_ORDER = {"low": 0, "medium": 1, "high": 2}
 TERMINAL_STATES = {"completed", "failed"}
-ALERT_INTERVAL_HOURS = 24
 RETRY_BASE_SECONDS = 300  # 5 min base; backoff: 5m, 10m, 20m
 
 TEMPORAL_START_SCRIPT = Path.home() / "scripts" / "temporal-workflow-start.sh"
@@ -784,68 +783,6 @@ def process_submitted(manifests: dict) -> None:
             )
 
 
-# --- Phase 2: Alert on stale approved tasks ---
-def alert_stale_approved() -> None:
-    threshold = datetime.now(timezone.utc) - timedelta(hours=24)
-    for path in sorted(TASK_QUEUE_DIR.glob("*.yml")):
-        if path.name.startswith("."):
-            continue
-        try:
-            task = load_yaml(path)
-        except Exception:
-            continue
-
-        if task.get("status") != "approved":
-            continue
-
-        approved_at = None
-        for entry in reversed(task.get("history", [])):
-            if entry.get("status") == "approved":
-                ts_str = entry.get("timestamp", "")
-                # PyYAML auto-parses unquoted ISO8601 strings into datetime objects on
-                # load, so ts_str may already be a datetime, not a str.
-                try:
-                    approved_at = ts_str if isinstance(ts_str, datetime) else datetime.fromisoformat(ts_str)
-                except (ValueError, TypeError):
-                    pass
-                break
-
-        if approved_at and approved_at < threshold:
-            age_hours = int((datetime.now(timezone.utc) - approved_at).total_seconds() / 3600)
-
-            alert_state = task.get("alert_state", {})
-            last_alerted = alert_state.get("last_alerted_at")
-            if last_alerted is not None and not isinstance(last_alerted, datetime):
-                try:
-                    last_alerted = datetime.fromisoformat(last_alerted)
-                except (ValueError, TypeError):
-                    last_alerted = None
-            should_alert = (
-                last_alerted is None or
-                (datetime.now(timezone.utc) - last_alerted).total_seconds()
-                > ALERT_INTERVAL_HOURS * 3600
-            )
-
-            if not should_alert:
-                log.debug(f"{path.name}: stale alert suppressed (last sent {last_alerted})")
-                continue
-
-            log.info(f"{path.name}: stale approved task ({age_hours}h unclaimed), sending alert")
-            matrix_notify(
-                "alerts",
-                f"[stale] {task.get('summary', path.stem)}",
-                f"Approved {age_hours}h ago, unclaimed | Agent: {task.get('target_agent')}",
-            )
-
-            now_str = now_iso()
-            task.setdefault("alert_state", {})
-            if task["alert_state"].get("first_alerted_at") is None:
-                task["alert_state"]["first_alerted_at"] = now_str
-            task["alert_state"]["last_alerted_at"] = now_str
-            task["alert_state"]["alert_count"] = task["alert_state"].get("alert_count", 0) + 1
-            atomic_write(path, task)
-
-
 # --- Phase 3: Archive terminal tasks past TTL ---
 def archive_expired() -> None:
     ARCHIVE_DIR.mkdir(exist_ok=True)
@@ -1022,7 +959,6 @@ def main():
 
     process_submitted(manifests)
     process_routing_failed(manifests)
-    alert_stale_approved()
     archive_expired()
 
     log.info("=== task-dispatcher run complete ===")
