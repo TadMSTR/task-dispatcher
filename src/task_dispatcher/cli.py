@@ -43,7 +43,7 @@ LOG_FILE = TASK_QUEUE_DIR / "dispatcher.log"
 MATRIX_MCP_URL = "http://127.0.0.1:8487/mcp"
 
 RISK_ORDER = {"low": 0, "medium": 1, "high": 2}
-TERMINAL_STATES = {"completed", "failed"}
+TERMINAL_STATES = {"completed", "failed", "cancelled"}
 RETRY_BASE_SECONDS = 300  # 5 min base; backoff: 5m, 10m, 20m
 
 TEMPORAL_START_SCRIPT = Path.home() / "scripts" / "temporal-workflow-start.sh"
