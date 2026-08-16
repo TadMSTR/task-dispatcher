@@ -692,6 +692,12 @@ def process_submitted(manifests: dict) -> None:
                         f" | plan: {task.get('payload', {}).get('plan_name', '?')}",
                     )
                 continue
+            # NOTE: this branch is evaluated BEFORE the workflow_mode check below, so an
+            # audit task launches headlessly even in semi-auto. That is deliberate — an
+            # audit is a fixed, bounded, read-only procedure the operator has already
+            # implicitly approved by requesting it, and gating it behind a manual resume
+            # would stall every build at the same point. Recorded here because it reads
+            # like an oversight and has been questioned more than once.
             elif task.get("task_type") == "audit" and target_agent == "security":
                 payload = task.get("payload", {})
                 request_path_str = payload.get("request", "") or next(
@@ -733,11 +739,21 @@ def process_submitted(manifests: dict) -> None:
                     alert_auth_blocked("security", task.get("id", "unknown"))
                     handle_routing_failure(path, task, "No usable Anthropic credential (OAuth expired / no ANTHROPIC_API_KEY) — refusing headless audit launch")
                     continue
+                # Name the task in the prompt. Headlessly this is the only way the security
+                # agent learns which queue entry to claim and close — it has no session-start
+                # sweep to fall back on, and build_name alone does not identify a task. Same
+                # guard as launch_agent_headless: a malformed id degrades to a literal rather
+                # than reaching the prompt. Still no `summary` — that was deliberately
+                # removed as a prompt-injection vector.
+                audit_task_id = task.get("id", "unknown")
+                if not re.fullmatch(r'[0-9a-f\-]{36}', audit_task_id):
+                    audit_task_id = "invalid-id"
                 with open(audit_log, "a") as audit_log_fh:
                     proc = subprocess.Popen(
                         ["claude", "-p",
                          "--dangerously-skip-permissions",
                          f"Run security audit for build: {build_name}. "
+                         f"Task ID: {audit_task_id}. "
                          f"Request at: {request_path}"],
                         cwd=str(security_project_dir),
                         stdout=audit_log_fh,
@@ -748,7 +764,10 @@ def process_submitted(manifests: dict) -> None:
             else:
                 workflow_mode = task.get("workflow_mode", "semi-auto")
                 if workflow_mode == "auto":
-                    # auto mode: headless launch if auto_start or auto mode implies it
+                    # workflow_mode is the only switch here. An older comment mentioned an
+                    # `auto_start` flag as an alternative trigger; no such field is a
+                    # submit_task parameter, none is written to any task, and nothing reads
+                    # one — it is gone from the agent docs too as of 2026-08-16.
                     log.info(f"{path.name}: workflow_mode=auto — launching headless")
                     launch_agent_headless(task)
                 else:
