@@ -764,7 +764,10 @@ def process_submitted(manifests: dict) -> None:
             else:
                 workflow_mode = task.get("workflow_mode", "semi-auto")
                 if workflow_mode == "auto":
-                    # auto mode: headless launch if auto_start or auto mode implies it
+                    # workflow_mode is the only switch here. An older comment mentioned an
+                    # `auto_start` flag as an alternative trigger; no such field is a
+                    # submit_task parameter, none is written to any task, and nothing reads
+                    # one — it is gone from the agent docs too as of 2026-08-16.
                     log.info(f"{path.name}: workflow_mode=auto — launching headless")
                     launch_agent_headless(task)
                 else:
