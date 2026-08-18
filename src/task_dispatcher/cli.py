@@ -55,6 +55,28 @@ AGENT_PROJECT_DIRS = {
     "research":  Path.home() / ".claude/projects/research",
     "writer":    Path.home() / ".claude/projects/writer",
     "security":  Path.home() / ".claude/projects/security",
+    "steward":   Path.home() / ".claude/projects/steward",
+}
+
+# --- Per-agent run-as map (build steward-config-agent-2026-08, vikunja#350) ---
+# Agents listed here are NOT launched as the dispatcher's own user. They are
+# launched via `sudo -u <user> <launcher>`, and the launcher sources their .env
+# itself, as that user.
+#
+# This exists because a run-as agent's environment file is readable only by
+# the user it runs as. THE INVARIANT: such an agent is launched only via its
+# launcher, which runs as that user and is the only thing that can read that
+# file. (vikunja#404.) The direct
+#
+# consequence is that load_agent_env() below MUST NOT be called for these agents:
+# it would raise PermissionError on read_text() and take down the whole
+# dispatcher tick, not merely return an empty dict.
+#
+# Literal dict on purpose, for the same reason AGENT_PROJECT_DIRS above is one:
+# no user-supplied value reaches subprocess.Popen. Both the user and the
+# launcher path are constants here, never derived from task content.
+AGENT_RUN_AS = {
+    "steward": ("agent-steward", "/usr/local/sbin/forge/run-steward.sh"),
 }
 
 # --- Logging ---
@@ -381,37 +403,71 @@ def launch_agent_headless(task: dict) -> None:
     # Target: refactor alongside the instant-clone agent pool work. Audit: 2026-07-12/
     # dispatcher-auth-and-notify-2026-07 F-1. Ticket: MDISP-4.
     child_env = dict(os.environ)
-    child_env.update(load_agent_env(target))
+    run_as = AGENT_RUN_AS.get(target)
+    if run_as is None:
+        child_env.update(load_agent_env(target))
     child_env["FORGE_WORKFLOW_MODE"] = workflow_mode
     # SMCP-28 fail-loud guard: .mcp.json's ${VAR} header interpolation only
     # supports bare $VAR/${VAR} (no bash :?/:- operators), so an unresolved
     # bearer token fails silently as a 401 deep inside the launched session
     # instead of here. Catch it before spawning a session doomed to have no
     # scoped-mcp tools.
-    if not child_env.get("SCOPED_MCP_BEARER_TOKEN"):
-        handle_routing_failure(
-            TASK_QUEUE_DIR / f"{task.get('id', 'unknown')}.yml",
-            task,
-            f"SCOPED_MCP_BEARER_TOKEN unresolved for agent '{target}' — refusing headless launch"
-        )
-        return
-    # SMCP-29 auth guard: don't launch a session that will just print
-    # "Not logged in" — fail loud and alert instead.
-    if not anthropic_creds_usable(child_env):
-        alert_auth_blocked(target, task_id)
-        handle_routing_failure(
-            TASK_QUEUE_DIR / f"{task.get('id', 'unknown')}.yml",
-            task,
-            f"No usable Anthropic credential (OAuth expired / no ANTHROPIC_API_KEY) — refusing headless launch for '{target}'"
-        )
-        return
+    prompt = (f"You have a pending task (id={task_id}). "
+              f"Check your task queue and proceed.")
+
+    if run_as is None:
+        if not child_env.get("SCOPED_MCP_BEARER_TOKEN"):
+            handle_routing_failure(
+                TASK_QUEUE_DIR / f"{task.get('id', 'unknown')}.yml",
+                task,
+                f"SCOPED_MCP_BEARER_TOKEN unresolved for agent '{target}' — refusing headless launch"
+            )
+            return
+        # SMCP-29 auth guard: don't launch a session that will just print
+        # "Not logged in" — fail loud and alert instead.
+        if not anthropic_creds_usable(child_env):
+            alert_auth_blocked(target, task_id)
+            handle_routing_failure(
+                TASK_QUEUE_DIR / f"{task.get('id', 'unknown')}.yml",
+                task,
+                f"No usable Anthropic credential (OAuth expired / no ANTHROPIC_API_KEY) — refusing headless launch for '{target}'"
+            )
+            return
+        argv = ["claude", "-p", "--dangerously-skip-permissions", prompt]
+    else:
+        # Run-as agent. The two guards above are deliberately skipped rather
+        # than adapted: both inspect child_env, and for a run-as agent the
+        # credentials are not in child_env by design — the launcher sources
+        # them as the target user from a file this process cannot read. Running
+        # them here would fail every launch for the one agent whose isolation
+        # is working correctly.
+        #
+        # The launcher performs the equivalent fail-loud checks itself
+        # (SCOPED_MCP_BEARER_TOKEN, TASK_QUEUE_TOKEN, GITHOST_MCP_AUTH_TOKEN,
+        # CLAUDE_CODE_OAUTH_TOKEN, all `: "${VAR:?}"`-guarded by name). What is
+        # NOT covered there is the launcher itself going missing — an
+        # undeployed script would surface as an uncaught FileNotFoundError from
+        # Popen and kill the tick for every other agent too.
+        run_user, launcher = run_as
+        if not os.access(launcher, os.X_OK):
+            handle_routing_failure(
+                TASK_QUEUE_DIR / f"{task.get('id', 'unknown')}.yml",
+                task,
+                f"Launcher missing or not executable for run-as agent '{target}': {launcher} "
+                f"— deploy it with forge-scripts-deploy.sh"
+            )
+            return
+        # sudo resets the environment, so FORGE_WORKFLOW_MODE cannot be passed
+        # through child_env here; the launcher takes it as a validated flag and
+        # re-exports it. Setting it on the sudo command line instead would need
+        # a SETENV tag in sudoers, which widens that rule for no gain.
+        argv = ["sudo", "-n", "-u", run_user, launcher,
+                "--workflow-mode", workflow_mode, "--", prompt]
+
     log_file = Path.home() / ".pm2" / "logs" / f"agent-launch-{target}-{task_id[:8]}.log"
     with open(log_file, "a") as lf:
         proc = subprocess.Popen(
-            ["claude", "-p",
-             "--dangerously-skip-permissions",
-             f"You have a pending task (id={task_id}). "
-             f"Check your task queue and proceed."],
+            argv,
             cwd=str(project_dir),
             stdout=lf,
             stderr=lf,
