@@ -24,13 +24,21 @@ description = "Private network address"
 regex = '''\b(?:10\.\d{1,3}|192\.168|172\.(?:1[6-9]|2\d|3[01]))\.\d{1,3}\.\d{1,3}\b'''
 tags = ["topology"]
 
-[allowlist]
-description = "Credential variable NAMES (never values) and loopback endpoints"
-regexes = [
-  '''SCOPED_MCP_BEARER_TOKEN''',
-  '''ANTHROPIC_API_KEY''',
-  '''ANTHROPIC_AUTH_TOKEN''',
-  '''CLAUDE_CODE_OAUTH_TOKEN''',
-  '''TASK_QUEUE_API_SECRET''',
-  '''127\.0\.0\.1''',
-]
+# NO ALLOWLIST — and that is deliberate, not an omission.
+#
+# This file previously carried an [allowlist] block naming the credential VARIABLES this
+# codebase legitimately mentions (SCOPED_MCP_BEARER_TOKEN, ANTHROPIC_API_KEY, ...), on the
+# theory that a scanner which always fires gets ignored. It was removed after testing it:
+# on the pinned gitleaks version a global allowlist suppresses nothing — not the default
+# ruleset, and not even the two custom rules defined above. Both the [allowlist] and
+# [[allowlists]] spellings were tried, with regexTarget unset, "secret", "match" and
+# "line". A co-located secret was detected in every one of the twelve combinations.
+#
+# It failed safe, so nothing was ever masked. But a config block that documents a
+# protection it does not provide is worse than no block: the next reader trusts it. The
+# repo scans clean without it, so it is gone.
+#
+# tests/test_gitleaks_gate.py asserts the behaviour rather than the configuration — that
+# the gate fires on a secret co-located with those same variable names. If a future
+# gitleaks version starts honouring global allowlists, that test still holds, because it
+# tests what the gate DOES.
