@@ -10,6 +10,12 @@
 *secret*
 .secrets/
 
+# Core dumps — a core file from this process contains resolved bearer tokens and
+# API keys in memory. SC-02.
+core
+core.*
+*.core
+
 # Python
 __pycache__/
 *.py[cod]

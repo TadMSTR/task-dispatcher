@@ -370,6 +370,34 @@ def test_vocabulary_is_internally_consistent() -> None:
     )
 
 
+def test_task_id_validation() -> None:
+    """IV-02: the id must be the exact UUID form, not a loose 36-char hex/dash run.
+
+    The spelling this replaced — r"[0-9a-f\\-]{36}" — accepted all the values below. None
+    is anything a UUID generator emits. The id reaches a `claude -p` prompt and a Temporal
+    workflow id; neither is a traversal or shell sink, so this pins a validator rather than
+    a hole. It is still the validator's job not to pass them.
+    """
+    print("\ntask id validation")
+    for bad, why in [
+        ("-" * 36, "36 dashes"),
+        ("a" * 36, "36 hex chars, no dashes"),
+        ("0123456789abcdef-0123-4567-89ab-cdef", "right charset, wrong grouping"),
+        ("0123456789abcdef", "too short"),
+        ("0123456i-89ab-cdef-0123-456789abcdef", "non-hex character"),
+        ("0123456789ab-cdef-0123-4567-89abcdef01", "36 chars, wrong field widths"),
+    ]:
+        check(not td.TASK_ID_RE.fullmatch(bad), f"rejects {why}")
+    check(
+        bool(td.TASK_ID_RE.fullmatch("1fe416cf-3a15-4da5-9e9a-2e763fe720e4")),
+        "accepts a real canonical task id",
+    )
+    check(
+        not td.TASK_ID_RE.fullmatch("1fe416cf-3a15-4da5-9e9a-2e763fe720e4X"),
+        "fullmatch, not a prefix match",
+    )
+
+
 def main() -> int:
     test_helper_across_every_input()
     test_site_1_env_var()
@@ -379,6 +407,7 @@ def main() -> int:
     test_notify_is_never_launched()
     test_unknown_vocabulary_fails_loudly()
     test_vocabulary_is_internally_consistent()
+    test_task_id_validation()
 
     print()
     if FAILURES:

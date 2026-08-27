@@ -42,6 +42,13 @@ MANIFEST_DIR = Path.home() / ".claude" / "manifests"
 LOG_FILE = TASK_QUEUE_DIR / "dispatcher.log"
 MATRIX_MCP_URL = "http://127.0.0.1:8487/mcp"
 
+# IV-02: the exact 8-4-4-4-12 UUID form, not a loose 36-character hex/dash run. The loose
+# spelling accepted things no generator produces — 36 dashes, for one — and this value
+# reaches a `claude -p` prompt and a Temporal workflow id. Neither is a traversal or shell
+# sink (Popen takes a list, and the charset excludes `/` and `.`), so this is tightening a
+# validator rather than closing a hole. One constant, because it was spelled three times.
+TASK_ID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+
 RISK_ORDER = {"low": 0, "medium": 1, "high": 2}
 RETRY_BASE_SECONDS = 300  # 5 min base; backoff: 5m, 10m, 20m
 
@@ -614,7 +621,7 @@ def launch_agent_headless(task: dict) -> None:
         )
         return
     task_id = task.get("id", "unknown")
-    if not re.fullmatch(r"[0-9a-f\-]{36}", task_id):
+    if not TASK_ID_RE.fullmatch(task_id):
         task_id = "invalid-id"
     # SECURITY[resolved]: summary removed from prompt to prevent prompt injection.
     # Agent discovers task content via task-queue tools using task_id.
@@ -760,7 +767,7 @@ def launch_temporal_workflow(path: Path, task: dict) -> bool:
         )
         return False
     task_id = task.get("id", "unknown")
-    if not re.fullmatch(r"[0-9a-f\-]{36}", task_id):
+    if not TASK_ID_RE.fullmatch(task_id):
         task_id = "invalid-id"
     plan_name = payload.get("plan_name", "")
     if not re.fullmatch(r"[a-z0-9][a-z0-9\-]*", plan_name):
@@ -1186,7 +1193,7 @@ def process_submitted(manifests: dict) -> None:
                 # than reaching the prompt. Still no `summary` — that was deliberately
                 # removed as a prompt-injection vector.
                 audit_task_id = task.get("id", "unknown")
-                if not re.fullmatch(r"[0-9a-f\-]{36}", audit_task_id):
+                if not TASK_ID_RE.fullmatch(audit_task_id):
                     audit_task_id = "invalid-id"
                 with open(audit_log, "a") as audit_log_fh:
                     proc = subprocess.Popen(
