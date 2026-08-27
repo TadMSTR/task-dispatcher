@@ -43,8 +43,62 @@ LOG_FILE = TASK_QUEUE_DIR / "dispatcher.log"
 MATRIX_MCP_URL = "http://127.0.0.1:8487/mcp"
 
 RISK_ORDER = {"low": 0, "medium": 1, "high": 2}
-TERMINAL_STATES = {"completed", "failed", "cancelled"}
 RETRY_BASE_SECONDS = 300  # 5 min base; backoff: 5m, 10m, 20m
+
+# --- Task queue vocabulary (vikunja#324) -----------------------------------
+# These four sets MUST stay identical to task-queue-mcp's src/tools/queue.py.
+#
+# This dispatcher is a fourth writer to the same queue and shares no validation code
+# with the MCP that owns it, so the two spellings can drift apart silently — and have.
+# task-queue-headless-chain-2026-08 added two more values that both sides must agree on
+# (`notify` being self-terminal, `manual-then-auto`), which is what finally justified
+# pinning them down here instead of scattering the literals through the branches below.
+#
+# scripts/tests/test_task_queue_vocabulary.py asserts these are equal to the MCP's, read
+# from the source of truth rather than from a second copy. It fails on a mismatch AND on
+# being unable to read the upstream — a vocabulary check that quietly skips is
+# indistinguishable from one that passes, which is the failure mode that produced #324.
+VALID_STATUSES = {
+    "submitted",
+    "approved",
+    "pending-approval",
+    "in-progress",
+    "parked",
+    "routing-failed",
+    "completed",
+    "failed",
+    "cancelled",
+}
+VALID_TASK_TYPES = {
+    "build",
+    "deploy",
+    "fix",
+    "research",
+    "review",
+    "audit",
+    "notify",
+    "docs",
+    "ticket_audit",
+    "ticket_audit_complete",
+}
+VALID_WORKFLOW_MODES = {"semi-auto", "auto", "manual-then-auto"}
+TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
+
+# Types this dispatcher must never launch a session for. `notify` carries a result, not
+# work: task-queue-mcp writes it straight to `completed`, so it should never reach here
+# as `submitted` at all. The branch below is defence in depth for a queue file written by
+# something other than the MCP — see #324 for why that is not hypothetical.
+SELF_TERMINAL_TASK_TYPES = {"notify"}
+
+# `workflow` is NOT in VALID_TASK_TYPES and never has been: Temporal workflow tasks are
+# written to the queue directly by temporal-workflow-start.sh, bypassing submit_task. The
+# branch that handles them predates the MCP's validation. Recorded here so the unknown-type
+# guard below does not dead-letter every workflow task the first time it runs.
+DISPATCHER_ONLY_TASK_TYPES = {"workflow"}
+
+# Backwards-compatible alias. The dispatcher spelled this TERMINAL_STATES for its whole
+# life; the MCP spells it TERMINAL_STATUSES. Same set, and now provably so.
+TERMINAL_STATES = TERMINAL_STATUSES
 
 TEMPORAL_START_SCRIPT = Path.home() / "scripts" / "temporal-workflow-start.sh"
 
@@ -362,6 +416,25 @@ def alert_auth_blocked(agent: str, task_id: str) -> None:
         pass
 
 
+# --- Workflow mode propagation ---
+def child_workflow_mode(parent_mode: str) -> str:
+    """The mode a task spawned by this task should inherit.
+
+    `manual-then-auto` gates only its own leg. By the time anything downstream exists,
+    the operator has already pressed Start — the gate has been satisfied, and repeating
+    it on every handoff is the behaviour that left four security→steward return tasks
+    unactioned from 2026-08-18 (vikunja#533). Everything else propagates verbatim.
+
+    THIS MUST BE THE ONLY PLACE THAT DECIDES THIS. There are three propagation sites —
+    the env var a launched agent reads, the --workflow-mode flag handed to a run-as
+    launcher, and the originating_task_id inheritance for a task submitted by an agent
+    that never read either. Implementing the downgrade at some of them and not others
+    gives a mode that leaks correctly in one direction only, which is close to invisible
+    in testing: the failure looks like an occasional handoff that did not auto-run.
+    """
+    return "auto" if parent_mode == "manual-then-auto" else parent_mode
+
+
 # --- Headless agent launch ---
 def launch_agent_headless(task: dict) -> None:
     """Launch the target agent headlessly via claude -p.
@@ -394,6 +467,11 @@ def launch_agent_headless(task: dict) -> None:
     # SECURITY[resolved]: summary removed from prompt to prevent prompt injection.
     # Agent discovers task content via task-queue tools using task_id. Audit: 2026-05-29/forge-build-workflow-infra-2026-05.
     workflow_mode = task.get("workflow_mode", "semi-auto")
+    # PROPAGATION SITE 1 of 3 — the env var the launched agent reads and passes back to
+    # submit_task. Downgraded, not copied: see child_workflow_mode(). The task's OWN mode
+    # is what still gets logged below, because that is what the operator chose; this is
+    # what its children will get.
+    inherited_mode = child_workflow_mode(workflow_mode)
     # Build env: inherit the running process env, layer in the target agent's
     # own .env (SCOPED_MCP_BEARER_TOKEN etc. — SMCP-28), then inject FORGE_WORKFLOW_MODE.
     # SECURITY[control]: workflow_mode is validated against VALID_WORKFLOW_MODES in task-queue-mcp
@@ -406,7 +484,7 @@ def launch_agent_headless(task: dict) -> None:
     run_as = AGENT_RUN_AS.get(target)
     if run_as is None:
         child_env.update(load_agent_env(target))
-    child_env["FORGE_WORKFLOW_MODE"] = workflow_mode
+    child_env["FORGE_WORKFLOW_MODE"] = inherited_mode
     # SMCP-28 fail-loud guard: .mcp.json's ${VAR} header interpolation only
     # supports bare $VAR/${VAR} (no bash :?/:- operators), so an unresolved
     # bearer token fails silently as a 401 deep inside the launched session
@@ -461,8 +539,14 @@ def launch_agent_headless(task: dict) -> None:
         # through child_env here; the launcher takes it as a validated flag and
         # re-exports it. Setting it on the sudo command line instead would need
         # a SETENV tag in sudoers, which widens that rule for no gain.
+        #
+        # PROPAGATION SITE 2 of 3. Because the launcher re-exports this flag verbatim as
+        # FORGE_WORKFLOW_MODE, it is the same channel as site 1 and takes the same
+        # downgrade — passing the parent mode here would leave the one run-as agent
+        # (steward, which is precisely the agent #533 is about) as the only one whose
+        # children did not inherit correctly.
         argv = ["sudo", "-n", "-u", run_user, launcher,
-                "--workflow-mode", workflow_mode, "--", prompt]
+                "--workflow-mode", inherited_mode, "--", prompt]
 
     log_file = Path.home() / ".pm2" / "logs" / f"agent-launch-{target}-{task_id[:8]}.log"
     with open(log_file, "a") as lf:
@@ -473,7 +557,10 @@ def launch_agent_headless(task: dict) -> None:
             stderr=lf,
             env=child_env,
         )
-    log.info(f"Headless launch: {target} (pid={proc.pid}) task={task_id[:8]} workflow_mode={workflow_mode}")
+    log.info(
+        f"Headless launch: {target} (pid={proc.pid}) task={task_id[:8]} "
+        f"workflow_mode={workflow_mode} child_workflow_mode={inherited_mode}"
+    )
 
 
 # --- Temporal workflow launch ---
@@ -621,6 +708,69 @@ def process_submitted(manifests: dict) -> None:
             log.debug(f"{path.name}: retry not yet eligible, skipping")
             continue
 
+        # Fail loudly on a value neither side of the vocabulary recognises, rather than
+        # falling through to a default branch (vikunja#324). A task_type nothing routes
+        # used to reach find_agent() and dead-letter with "No agent found", which reads
+        # as a missing manifest capability; an unknown workflow_mode was worse, because
+        # every branch below tests equality against "auto" and anything else silently
+        # became operator-pickup. Both now say what actually happened.
+        task_type = task.get("task_type")
+        if task_type not in VALID_TASK_TYPES | DISPATCHER_ONLY_TASK_TYPES:
+            handle_routing_failure(
+                path, task,
+                f"Unknown task_type {task_type!r} — not in task-queue-mcp's vocabulary "
+                f"({sorted(VALID_TASK_TYPES)}). Queue file written outside submit_task?"
+            )
+            continue
+        submitted_mode = task.get("workflow_mode", "semi-auto")
+        if submitted_mode not in VALID_WORKFLOW_MODES:
+            handle_routing_failure(
+                path, task,
+                f"Unknown workflow_mode {submitted_mode!r} — not in task-queue-mcp's "
+                f"vocabulary ({sorted(VALID_WORKFLOW_MODES)}). Refusing to guess: "
+                f"treating it as semi-auto would silently gate an auto chain, and as auto "
+                f"would silently launch an ungated session."
+            )
+            continue
+
+        # A self-terminal type has no session and no target work list. submit_task writes
+        # it straight to `completed`, so reaching here in `submitted` means the queue file
+        # came from somewhere else. Record and close it rather than launching an agent to
+        # read a notification — which is the entire point of vikunja#507.
+        if task_type in SELF_TERMINAL_TASK_TYPES:
+            task["status"] = "completed"
+            task.setdefault("result", {})
+            task["result"]["output"] = task.get("payload", {}).get("description")
+            task["result"]["completed_by"] = f"dispatcher ({task_type})"
+            task["result"]["completed_at"] = now_iso()
+            append_history(task, "completed", "dispatcher",
+                           "Notification delivered — no session required")
+            atomic_write(path, task)
+            log.info(f"{path.name}: → completed ({task_type}, no launch)")
+            bus_log("task.completed", source="dispatcher",
+                    summary=f"Notification delivered: {task.get('summary', path.stem)}",
+                    target=task.get("target_agent", ""), artifact_path=str(path))
+            # The room name is the ONE value here that is not just rendered — it selects
+            # a destination. This branch returns before the routing block, so unlike the
+            # semi-auto notify below, `target_agent` has NOT been through find_agent() or
+            # a manifest lookup. Constrain it to a room we know, rather than passing a
+            # queue file's string straight into a send call.
+            notify_room = task.get("target_agent", "")
+            if notify_room not in AGENT_PROJECT_DIRS:
+                notify_room = "alerts"
+            # SECURITY[accepted]: summary interpolated into a Matrix notification title —
+            # Markdown injection possible but not HTML/JSON injection. Same disposition as
+            # the semi-auto branch below; trust model is internal agents, not adversarial.
+            # Audit: 2026-06-08/workflow-qol-2026-06 INFO-2. Recorded here rather than
+            # inherited silently, so this instance is visible to the next audit.
+            matrix_notify(
+                notify_room,
+                f"[notify] {task.get('summary', path.stem)}",
+                f"From: {task.get('source_agent', 'unknown')}\n"
+                f"No action required — this notification is already closed.",
+            )
+            continue
+
         log.info(f"Processing submitted task: {path.name}")
         publish_nats("tasks.submitted", {
             "task_id": task.get("id"),
@@ -645,16 +795,21 @@ def process_submitted(manifests: dict) -> None:
 
         # Inherit workflow_mode from parent task if originating_task_id is set.
         # This ensures auto-mode pipelines stay in auto across agent handoff boundaries.
+        #
+        # PROPAGATION SITE 3 of 3, and the one that is easy to forget: it covers a task
+        # submitted by an agent that never read FORGE_WORKFLOW_MODE at all — an agent
+        # started by hand, or one whose skill omits the inheritance line. Same helper as
+        # sites 1 and 2 by construction, so the two directions cannot disagree.
         originating_task_id = task.get("payload", {}).get("originating_task_id")
         if originating_task_id:
             parent = find_task_by_id(originating_task_id)
             if parent:
                 parent_mode = parent.get("workflow_mode")
                 if parent_mode:
-                    task["workflow_mode"] = parent_mode
+                    task["workflow_mode"] = child_workflow_mode(parent_mode)
                     log.info(
-                        f"{path.name}: inherited workflow_mode={parent_mode} "
-                        f"from parent {originating_task_id[:8]}"
+                        f"{path.name}: inherited workflow_mode={task['workflow_mode']} "
+                        f"from parent {originating_task_id[:8]} (parent mode={parent_mode})"
                     )
             else:
                 log.warning(
@@ -819,6 +974,11 @@ def process_submitted(manifests: dict) -> None:
                 log.info(f"{path.name}: headless audit launched for {build_name} (pid={proc.pid}) log={audit_log}")
             else:
                 workflow_mode = task.get("workflow_mode", "semi-auto")
+                # DO NOT rewrite this as `!= "semi-auto"`. It reads like a tidy-up and it
+                # is the one edit that would silently auto-launch `manual-then-auto`,
+                # destroying the only property that mode has: that its own leg waits for
+                # an operator. An equality test against "auto" is load-bearing — every
+                # mode that is not literally "auto" must fall to operator pickup.
                 if workflow_mode == "auto":
                     # workflow_mode is the only switch here. An older comment mentioned an
                     # `auto_start` flag as an alternative trigger; no such field is a
@@ -828,7 +988,10 @@ def process_submitted(manifests: dict) -> None:
                     launch_agent_headless(task)
                 else:
                     # semi-auto mode (default): queue for operator pickup, notify agent room
-                    log.info(f"{path.name}: workflow_mode=semi-auto — queued for operator pickup")
+                    log.info(
+                        f"{path.name}: workflow_mode={workflow_mode} — "
+                        f"queued for operator pickup"
+                    )
                     task_id = task.get("id", path.stem)
                     # SECURITY[accepted]: summary interpolated into Matrix notification title — Markdown injection possible
                     # but not HTML/JSON injection. Trust model: internal agents not adversarial. Pre-existing pattern.
@@ -922,6 +1085,39 @@ def process_routing_failed(manifests: dict) -> None:
             f"{policy.get('last_failure_reason', '?')}"
         )
 
+        # The same vocabulary guards process_submitted applies. Without them the retry
+        # pass is a way around them: an unknown workflow_mode dead-lettered on the first
+        # tick would come back here five minutes later and fall through the `== "auto"`
+        # test into operator-pickup, quietly reaching the state the guard exists to
+        # refuse. A guard only on the first pass is not a guard.
+        retry_type = task.get("task_type")
+        if retry_type not in VALID_TASK_TYPES | DISPATCHER_ONLY_TASK_TYPES:
+            handle_routing_failure(
+                path, task,
+                f"Unknown task_type {retry_type!r} (routing-failed retry) — not in "
+                f"task-queue-mcp's vocabulary ({sorted(VALID_TASK_TYPES)})"
+            )
+            continue
+        retry_mode = task.get("workflow_mode", "semi-auto")
+        if retry_mode not in VALID_WORKFLOW_MODES:
+            handle_routing_failure(
+                path, task,
+                f"Unknown workflow_mode {retry_mode!r} (routing-failed retry) — not in "
+                f"task-queue-mcp's vocabulary ({sorted(VALID_WORKFLOW_MODES)})"
+            )
+            continue
+        if retry_type in SELF_TERMINAL_TASK_TYPES:
+            task["status"] = "completed"
+            task.setdefault("result", {})
+            task["result"]["output"] = task.get("payload", {}).get("description")
+            task["result"]["completed_by"] = f"dispatcher ({retry_type})"
+            task["result"]["completed_at"] = now_iso()
+            append_history(task, "completed", "dispatcher",
+                           "Notification delivered — no session required (routing-failed retry)")
+            atomic_write(path, task)
+            log.info(f"{path.name}: → completed ({retry_type}, no launch, routing-failed retry)")
+            continue
+
         # Re-attempt routing: resolve target and dispatch exactly as process_submitted
         # would after approval — but skip the approval check since it already passed.
         target_agent = task.get("target_agent", "")
@@ -999,7 +1195,9 @@ def process_routing_failed(manifests: dict) -> None:
             log.info(f"{path.name}: headless audit launched for {build_name} (pid={proc.pid}) — routing-failed retry")
             continue
 
-        # Generic task: launch headless or semi-auto notify
+        # Generic task: launch headless or queue for operator pickup.
+        # Equality against "auto" is load-bearing here too — see the note on the matching
+        # branch in process_submitted.
         workflow_mode = task.get("workflow_mode", "semi-auto")
         if workflow_mode == "auto":
             launch_agent_headless(task)
