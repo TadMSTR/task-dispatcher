@@ -102,35 +102,156 @@ TERMINAL_STATES = TERMINAL_STATUSES
 
 TEMPORAL_START_SCRIPT = Path.home() / "scripts" / "temporal-workflow-start.sh"
 
-# Hardcoded whitelist — no user-supplied paths reach subprocess.Popen
-AGENT_PROJECT_DIRS = {
-    "sysadmin":  Path.home() / ".claude/projects/sysadmin",
-    "developer": Path.home() / ".claude/projects/developer",
-    "research":  Path.home() / ".claude/projects/research",
-    "writer":    Path.home() / ".claude/projects/writer",
-    "security":  Path.home() / ".claude/projects/security",
-    "steward":   Path.home() / ".claude/projects/steward",
-}
+# --- Agent launch policy (build task-queue-plugin-repair-2026-08, vikunja#523) ---
+#
+# AGENT_PROJECT_DIRS and AGENT_RUN_AS used to be two literal dicts here. The CloudCLI
+# task-queue plugin carried a THIRD literal — its own `AGENT_PROJECTS`, which never
+# gained a steward entry, so its Start button could not launch steward at all. Three
+# rosters of one fact, and the drift between them is #523.
+#
+# They are now one file, scripts/agent-launch.yml, read by this dispatcher and by the
+# plugin. Editing the roster means editing that file; do not reintroduce a literal here.
+#
+# WHAT THE OLD COMMENT GOT RIGHT AND THIS MUST KEEP. The literals existed so that no
+# user-supplied value could reach subprocess.Popen. Loading from a file does not by
+# itself preserve that, so validate_launch_policy() below re-establishes it: every field
+# is checked against a closed set (name shape, project_dir under ~/.claude/projects,
+# run_as_user shape, launcher under /usr/local/sbin/forge) and the WHOLE file is
+# rejected on any violation. Nothing derived from task content ever enters this table.
+#
+# A missing or malformed file raises. It must NOT degrade to {} — an empty roster makes
+# run_as_user absent for every agent, which is exactly how steward gets launched as ted:
+# a session that looks like steward in every log and holds none of its credentials
+# (vikunja#404). Failing the tick loudly is strictly better than that.
+#
+# Why run-as exists at all: a run-as agent's environment file is owned and readable
+# only by the user it runs as, so the launcher is the only thing that can source it.
+# readable by the launching user. THE INVARIANT: load_agent_env() MUST
+# NOT be called for a run-as agent: as ted it would raise PermissionError on read_text()
+# and take down the whole dispatcher tick, not merely return an empty dict.
+#
+# Resolved from this script's own directory, not from $HOME. The two ship together in
+# host-forge/scripts, and a $HOME-relative path breaks under any test that redirects HOME
+# (scripts/tests/test_dispatcher_headless_chain.py does exactly that). AGENT_LAUNCH_POLICY
+# overrides it for tests.
+LAUNCH_POLICY_PATH = Path(
+    os.environ.get("AGENT_LAUNCH_POLICY")
+    or (Path(__file__).resolve().parent / "agent-launch.yml")
+)
 
-# --- Per-agent run-as map (build steward-config-agent-2026-08, vikunja#350) ---
-# Agents listed here are NOT launched as the dispatcher's own user. They are
-# launched via `sudo -u <user> <launcher>`, and the launcher sources their .env
-# itself, as that user.
-#
-# This exists because a run-as agent's environment file is readable only by
-# the user it runs as. THE INVARIANT: such an agent is launched only via its
-# launcher, which runs as that user and is the only thing that can read that
-# file. (vikunja#404.) The direct
-#
-# consequence is that load_agent_env() below MUST NOT be called for these agents:
-# it would raise PermissionError on read_text() and take down the whole
-# dispatcher tick, not merely return an empty dict.
-#
-# Literal dict on purpose, for the same reason AGENT_PROJECT_DIRS above is one:
-# no user-supplied value reaches subprocess.Popen. Both the user and the
-# launcher path are constants here, never derived from task content.
+# Closed sets. These are the constants that used to be the dict literals: a policy file
+# cannot introduce a user, a launcher directory, or a project root outside them.
+_AGENT_NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
+_RUN_AS_USER_RE = re.compile(r"^agent-[a-z0-9-]{1,30}$")
+_LAUNCHER_DIR = "/usr/local/sbin/forge/"
+_PROJECT_ROOT = Path.home() / ".claude" / "projects"
+
+
+class LaunchPolicyError(Exception):
+    """Raised when agent-launch.yml is missing, unparseable, or fails validation."""
+
+
+def validate_launch_policy(raw: object, project_root: Path | None = None) -> dict:
+    """Validate a parsed agent-launch.yml and return {agent: {...}}.
+
+    Rejects the whole document on any violation. A partially-honoured roster would
+    silently launch some agent the wrong way, which is the failure this guards.
+
+    project_root is injectable so tests need not own ~/.claude/projects.
+    """
+    # NO .resolve() here, deliberately — see the matching comment in the plugin's
+    # validateLaunchPolicy(). This used to be `.resolve()`, which follows symlinks, while
+    # the TypeScript side computes its root with a plain path join. Neither side resolves
+    # the CANDIDATE project_dir (it may legitimately not exist yet), so resolving only the
+    # root makes the two halves of the comparison incommensurable the moment anything in
+    # the path becomes a symlink — and `~/.claude/manifests` on this host already is one,
+    # so that is not hypothetical.
+    #
+    # The effect was not a rejected entry. LAUNCH_POLICY = load_launch_policy() runs at
+    # import, so a symlinked ~/.claude/projects made THIS MODULE fail to import — every
+    # tick, for every agent. Fail-closed, but a total dispatcher outage.
+    #
+    # Found by the security audit of task-queue-plugin-repair-2026-08 (Low, dormant:
+    # nothing on that path is a symlink today). Both sides now compute the root the same
+    # way, and test_agent_launch_policy.py pins it with a symlinked-root fixture.
+    root = Path(os.path.normpath(str(project_root or _PROJECT_ROOT)))
+    if not isinstance(raw, dict) or not raw:
+        raise LaunchPolicyError(f"{LAUNCH_POLICY_PATH}: expected a non-empty mapping of agents")
+
+    policy: dict[str, dict] = {}
+    for agent, entry in raw.items():
+        if not isinstance(agent, str) or not _AGENT_NAME_RE.match(agent):
+            raise LaunchPolicyError(f"{LAUNCH_POLICY_PATH}: invalid agent name {agent!r}")
+        if not isinstance(entry, dict):
+            raise LaunchPolicyError(f"{LAUNCH_POLICY_PATH}: {agent}: expected a mapping")
+
+        unknown = set(entry) - {"project_dir", "run_as_user", "launcher"}
+        if unknown:
+            raise LaunchPolicyError(f"{LAUNCH_POLICY_PATH}: {agent}: unknown key(s) {sorted(unknown)}")
+
+        project_dir = entry.get("project_dir")
+        if not isinstance(project_dir, str) or not project_dir:
+            raise LaunchPolicyError(f"{LAUNCH_POLICY_PATH}: {agent}: project_dir is required")
+        resolved = Path(project_dir).expanduser()
+        if not resolved.is_absolute():
+            raise LaunchPolicyError(f"{LAUNCH_POLICY_PATH}: {agent}: project_dir must be absolute: {project_dir}")
+        # Normalise `..` before the containment check; do not resolve symlinks, which
+        # would depend on the dir existing (it may legitimately not, and the caller
+        # reports that as a routing failure with a better message than this would).
+        normalised = Path(os.path.normpath(str(resolved)))
+        if root != normalised and root not in normalised.parents:
+            raise LaunchPolicyError(
+                f"{LAUNCH_POLICY_PATH}: {agent}: project_dir must be under {root}: {project_dir}"
+            )
+
+        run_as_user = entry.get("run_as_user")
+        launcher = entry.get("launcher")
+        if (run_as_user is None) != (launcher is None):
+            raise LaunchPolicyError(
+                f"{LAUNCH_POLICY_PATH}: {agent}: run_as_user and launcher must be given together"
+            )
+        if run_as_user is not None:
+            if not isinstance(run_as_user, str) or not _RUN_AS_USER_RE.match(run_as_user):
+                raise LaunchPolicyError(f"{LAUNCH_POLICY_PATH}: {agent}: invalid run_as_user {run_as_user!r}")
+            if not isinstance(launcher, str) or not launcher.startswith(_LAUNCHER_DIR):
+                raise LaunchPolicyError(
+                    f"{LAUNCH_POLICY_PATH}: {agent}: launcher must be under {_LAUNCHER_DIR}: {launcher!r}"
+                )
+            # No `..` escape out of the launcher dir.
+            if os.path.normpath(launcher) != launcher:
+                raise LaunchPolicyError(f"{LAUNCH_POLICY_PATH}: {agent}: launcher must be a normalised path: {launcher!r}")
+
+        policy[agent] = {
+            "project_dir": normalised,
+            "run_as_user": run_as_user,
+            "launcher": launcher,
+        }
+    return policy
+
+
+def load_launch_policy(path: Path | None = None) -> dict:
+    """Read and validate agent-launch.yml. Raises LaunchPolicyError; never returns {}."""
+    p = path or LAUNCH_POLICY_PATH
+    try:
+        text = p.read_text()
+    except OSError as e:
+        raise LaunchPolicyError(f"cannot read launch policy {p}: {e}") from e
+    try:
+        raw = yaml.safe_load(text)
+    except yaml.YAMLError as e:
+        raise LaunchPolicyError(f"cannot parse launch policy {p}: {e}") from e
+    return validate_launch_policy(raw)
+
+
+LAUNCH_POLICY = load_launch_policy()
+
+# Kept as names so the rest of the file — and anything importing this module — reads the
+# same as it did before the extraction. Both are now views of one source.
+AGENT_PROJECT_DIRS = {a: e["project_dir"] for a, e in LAUNCH_POLICY.items()}
 AGENT_RUN_AS = {
-    "steward": ("agent-steward", "/usr/local/sbin/forge/run-steward.sh"),
+    a: (e["run_as_user"], e["launcher"])
+    for a, e in LAUNCH_POLICY.items()
+    if e["run_as_user"] is not None
 }
 
 # --- Logging ---
@@ -548,7 +669,19 @@ def launch_agent_headless(task: dict) -> None:
         argv = ["sudo", "-n", "-u", run_user, launcher,
                 "--workflow-mode", inherited_mode, "--", prompt]
 
-    log_file = Path.home() / ".pm2" / "logs" / f"agent-launch-{target}-{task_id[:8]}.log"
+    # One launch-log destination, shared with the CloudCLI task-queue plugin
+    # (task-queue-plugin-repair-2026-08 Phase 3). This used to be
+    # ~/.pm2/logs/agent-launch-<agent>-<task8>.log while the plugin wrote
+    # ~/.claude/comms/artifacts/task-launches/<taskId>.log — two destinations for one
+    # concept, so no consumer could list "the launches" without knowing both.
+    #
+    # ~/.claude/comms is the side both can read: it is already in the plugin's
+    # PREVIEW_ALLOWED_PREFIXES, whereas ~/.pm2/logs is not and must not be added — that
+    # prefix covers every PM2 service log on the host, which would make the plugin's
+    # file-preview endpoint a reader of all of them.
+    log_dir = Path.home() / ".claude" / "comms" / "artifacts" / "task-launches"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = log_dir / f"{target}-{task_id[:8]}.log"
     with open(log_file, "a") as lf:
         proc = subprocess.Popen(
             argv,

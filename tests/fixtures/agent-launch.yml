@@ -1,0 +1,61 @@
+# Agent launch policy — the single roster of how each agent's headless session starts.
+#
+# Read by BOTH consumers. Neither may keep its own copy:
+#   - scripts/task-dispatcher.py       (AGENT_PROJECT_DIRS + AGENT_RUN_AS were two
+#                                       literals here; now one loader)
+#   - cloudcli-plugin-task-queue       (src/server.ts held a second, drifted roster
+#                                       with no steward entry at all — vikunja#523)
+#
+# That drift is exactly what #523 is: the plugin's Start button could not launch
+# steward because the plugin's private copy of this roster was never updated. A file
+# both sides read is the fix; a second literal is the bug.
+#
+# ── Shape ──────────────────────────────────────────────────────────────────────
+#   <agent>:
+#     project_dir:  required. `~` expands to the invoking user's home. Must resolve
+#                   under ~/.claude/projects/.
+#     run_as_user:  optional. Present => the agent does NOT run as the caller. It is
+#                   launched via `sudo -n -u <run_as_user> <launcher>`.
+#     launcher:     required if and only if run_as_user is present. Absolute path
+#                   under /usr/local/sbin/forge/.
+#
+# ── Why the values are constrained, not free-form ──────────────────────────────
+# Both consumers pass these into a subprocess spawn. The loaders validate every field
+# against a closed set (see load_launch_policy() / loadLaunchPolicy()) and refuse the
+# whole file on any violation — a partially-honoured roster would silently launch an
+# agent the wrong way, which is the failure this file exists to prevent.
+#
+# A missing or malformed file is a hard error in both consumers. It must never
+# degrade to an empty roster: an empty roster makes `run_as_user` absent for every
+# agent, which is precisely how steward would get launched as ted.
+#
+# ── The backstop this file cannot weaken ───────────────────────────────────────
+# sudoers pins both the user and the launcher path:
+#     <sudoers rule redacted — sudo pins both the user and the launcher path>
+# So editing `launcher` or `run_as_user` here cannot widen what sudo will execute —
+# sudo refuses anything else. This file selects from what sudoers already permits;
+# it does not grant.
+
+sysadmin:
+  project_dir: ~/.claude/projects/sysadmin
+
+developer:
+  project_dir: ~/.claude/projects/developer
+
+research:
+  project_dir: ~/.claude/projects/research
+
+writer:
+  project_dir: ~/.claude/projects/writer
+
+security:
+  project_dir: ~/.claude/projects/security
+
+# steward is the only run-as agent. Its environment file is owned and readable only
+# by the user it runs as, so the launcher — running as that user — is the only thing
+# that can source it. Bypassing the launcher yields a session that looks like steward
+# in every log and holds none of steward's credentials (vikunja#404, #523).
+steward:
+  project_dir: ~/.claude/projects/steward
+  run_as_user: agent-steward
+  launcher: /usr/local/sbin/forge/run-steward.sh
