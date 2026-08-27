@@ -15,13 +15,19 @@ session that looks like steward in every log and holds none of steward's credent
 
 Hermetic: redirects HOME to a tmpdir BEFORE importing the dispatcher (module-level code
 resolves TASK_QUEUE_DIR and opens a log file under it), and validates against injected
-fixtures rather than the host's real directories — except for one test that loads the
-SHIPPED scripts/agent-launch.yml, which is the file the dispatcher will actually read.
+fixtures rather than the host's real directories.
+
+WHAT THIS TEST NO LONGER PROVES, AND WHO DOES. It used to load the SHIPPED roster, because
+the roster sat beside the dispatcher in host-forge/scripts. It no longer does. The live
+roster stays at ~/scripts/agent-launch.yml — the CloudCLI plugin hardcodes that path — and
+tests/fixtures/agent-launch.yml here is a COPY. So this file proves the loader and the
+validator are correct; it does NOT prove the live roster is well-formed, and the fixture
+can drift from it. Validating the live file is host-forge/scripts' job.
 """
 
 from __future__ import annotations
 
-import importlib.util
+import importlib
 import os
 import sys
 import tempfile
@@ -38,12 +44,20 @@ for _agent in ("developer", "security", "steward", "sysadmin", "writer", "resear
     (_HOME / ".claude" / "projects" / _agent).mkdir(parents=True)
 os.environ["HOME"] = str(_HOME)
 
-SCRIPTS_DIR = Path(__file__).resolve().parent.parent
-MODULE_PATH = SCRIPTS_DIR / "task-dispatcher.py"
-_spec = importlib.util.spec_from_file_location("task_dispatcher_lp", MODULE_PATH)
-td = importlib.util.module_from_spec(_spec)
-sys.modules["task_dispatcher_lp"] = td
-_spec.loader.exec_module(td)
+# Plant the roster at the DEFAULT location rather than setting AGENT_LAUNCH_POLICY. The
+# default is the thing under test: it must be $HOME-relative so that this package, which
+# deploys to a venv, and the CloudCLI plugin, which hardcodes ~/scripts/agent-launch.yml,
+# resolve to the same file. Overriding via env would route around exactly that.
+os.environ.pop("AGENT_LAUNCH_POLICY", None)
+REPO_ROOT = Path(__file__).resolve().parent.parent
+FIXTURE = REPO_ROOT / "tests" / "fixtures" / "agent-launch.yml"
+_DEFAULT_ROSTER = _HOME / "scripts" / "agent-launch.yml"
+_DEFAULT_ROSTER.parent.mkdir(parents=True)
+_DEFAULT_ROSTER.write_text(FIXTURE.read_text())
+
+# Import the INSTALLED package, not a loose file — see the note in
+# test_dispatcher_headless_chain.py. HOME and the default roster are already in place.
+td = importlib.import_module("task_dispatcher.cli")
 
 PROJECT_ROOT = _HOME / ".claude" / "projects"
 
@@ -63,7 +77,7 @@ def rejects(raw: object, label: str) -> None:
     except td.LaunchPolicyError:
         print(f"  ok   {label}")
         return
-    except Exception as e:  # noqa: BLE001 — a TypeError here is still a bug, not a pass
+    except Exception as e:
         print(f"  FAIL {label} (raised {type(e).__name__}, not LaunchPolicyError: {e})")
         FAILURES.append(label)
         return
@@ -85,24 +99,34 @@ STEWARD = {
 }
 
 
-# --- the shipped file --------------------------------------------------------
-print("\nthe shipped scripts/agent-launch.yml")
+# --- the default roster path -------------------------------------------------
+print("\nthe default roster path (~/scripts/agent-launch.yml)")
 
-SHIPPED = SCRIPTS_DIR / "agent-launch.yml"
-check(SHIPPED.is_file(), "exists beside task-dispatcher.py")
+check(FIXTURE.is_file(), "tests/fixtures/agent-launch.yml exists")
+
+# THE REGRESSION THIS PINS. If LAUNCH_POLICY_PATH ever goes back to resolving from
+# __file__, this fails: __file__ is under the installed package, nowhere near $HOME.
+# That regression would hard-fail every cron tick in production while the CloudCLI
+# plugin carried on reading the real roster — the two consumers silently disagreeing,
+# which is vikunja#523 all over again. $HOME dependence is the requirement here, not
+# a defect to be engineered away.
 check(
-    td.LAUNCH_POLICY_PATH.resolve() == SHIPPED.resolve(),
-    "is the file LAUNCH_POLICY_PATH points at (no $HOME dependence)",
+    td.LAUNCH_POLICY_PATH.resolve() == _DEFAULT_ROSTER.resolve(),
+    "LAUNCH_POLICY_PATH defaults to $HOME/scripts/agent-launch.yml, not to __file__",
+)
+check(
+    Path(__file__).resolve().parent.parent not in td.LAUNCH_POLICY_PATH.resolve().parents,
+    "the default does not resolve inside the package tree",
 )
 
-shipped_raw = yaml.safe_load(SHIPPED.read_text())
+shipped_raw = yaml.safe_load(FIXTURE.read_text())
 shipped = td.validate_launch_policy(shipped_raw, project_root=PROJECT_ROOT)
 
 # The exact roster the three literals used to spell, asserted as a set so a dropped
 # agent is a failure rather than a silently smaller queue.
 check(
     set(shipped) == {"sysadmin", "developer", "research", "writer", "security", "steward"},
-    "carries exactly the six agents the old literals did",
+    "the fixture carries exactly the six agents the old literals did",
 )
 check(
     [a for a, e in shipped.items() if e["run_as_user"]] == ["steward"],
@@ -111,7 +135,7 @@ check(
 check(
     shipped["steward"]["run_as_user"] == "agent-steward"
     and shipped["steward"]["launcher"] == "/usr/local/sbin/forge/run-steward.sh",
-    "steward's run-as pair matches the sudoers grant exactly",
+    "steward's run-as pair is the one sudoers permits",
 )
 # The plugin gained a steward entry it never had — that IS #523.
 check("steward" in shipped, "steward is present (the plugin's roster never had it — #523)")
@@ -161,7 +185,9 @@ rejects(good(x={"project_dir": ""}), "an empty project_dir")
 rejects({"developer": {}}, "a missing project_dir")
 rejects(good(x={"project_dir": 42}), "a non-string project_dir")
 # `~/.claude/projectsX` must not pass a naive startswith check.
-rejects(good(x={"project_dir": "~/.claude/projectsX/evil"}), "a sibling dir sharing the root's prefix")
+rejects(
+    good(x={"project_dir": "~/.claude/projectsX/evil"}), "a sibling dir sharing the root's prefix"
+)
 
 ok = td.validate_launch_policy(good(), project_root=PROJECT_ROOT)
 check(
@@ -182,13 +208,23 @@ rejects(
     "run_as_user without a launcher",
 )
 rejects(
-    good(x={"project_dir": "~/.claude/projects/steward", "launcher": "/usr/local/sbin/forge/run-steward.sh"}),
+    good(
+        x={
+            "project_dir": "~/.claude/projects/steward",
+            "launcher": "/usr/local/sbin/forge/run-steward.sh",
+        }
+    ),
     "a launcher without a run_as_user",
 )
 for bad_user in ("root", "ted", "agent-steward; rm -rf /", "AGENT-STEWARD", "agent_steward", ""):
     rejects(
-        good(x={"project_dir": "~/.claude/projects/steward", "run_as_user": bad_user,
-                "launcher": "/usr/local/sbin/forge/run-steward.sh"}),
+        good(
+            x={
+                "project_dir": "~/.claude/projects/steward",
+                "run_as_user": bad_user,
+                "launcher": "/usr/local/sbin/forge/run-steward.sh",
+            }
+        ),
         f"run_as_user {bad_user!r}",
     )
 for bad_launcher in (
@@ -198,8 +234,13 @@ for bad_launcher in (
     "/usr/local/sbin/forgery/run-steward.sh",
 ):
     rejects(
-        good(x={"project_dir": "~/.claude/projects/steward", "run_as_user": "agent-steward",
-                "launcher": bad_launcher}),
+        good(
+            x={
+                "project_dir": "~/.claude/projects/steward",
+                "run_as_user": "agent-steward",
+                "launcher": bad_launcher,
+            }
+        ),
         f"launcher {bad_launcher!r}",
     )
 
@@ -208,8 +249,13 @@ for bad_launcher in (
 # telling the operator to deploy it. Validating existence here would make an undeployed
 # launcher stop the dispatcher from importing at all — for every other agent too.
 shape_ok = td.validate_launch_policy(
-    good(x={"project_dir": "~/.claude/projects/steward", "run_as_user": "agent-steward",
-            "launcher": "/usr/local/sbin/forge/does-not-exist.sh"}),
+    good(
+        x={
+            "project_dir": "~/.claude/projects/steward",
+            "run_as_user": "agent-steward",
+            "launcher": "/usr/local/sbin/forge/does-not-exist.sh",
+        }
+    ),
     project_root=PROJECT_ROOT,
 )
 check(
@@ -249,9 +295,13 @@ check(
     "fixture: resolving it really does change the path (otherwise this test proves nothing)",
 )
 
-_sym_doc = {"steward": {"project_dir": str(_sym_root / "steward"),
-                        "run_as_user": "agent-steward",
-                        "launcher": "/usr/local/sbin/forge/run-steward.sh"}}
+_sym_doc = {
+    "steward": {
+        "project_dir": str(_sym_root / "steward"),
+        "run_as_user": "agent-steward",
+        "launcher": "/usr/local/sbin/forge/run-steward.sh",
+    }
+}
 try:
     _sym_policy = validate_or_none = td.validate_launch_policy(_sym_doc, project_root=_sym_root)
     check(True, "an entry under a symlinked root is accepted")

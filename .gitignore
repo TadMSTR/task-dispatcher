@@ -1,0 +1,34 @@
+# Secrets — never commit
+*.env
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*credentials*
+*secret*
+.secrets/
+
+# Core dumps — a core file from this process contains resolved bearer tokens and
+# API keys in memory. SC-02.
+core
+core.*
+*.core
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.coverage
+htmlcov/
+.pytest_cache/
+.ruff_cache/
+
+# Editors / OS
+.DS_Store
+*.swp
