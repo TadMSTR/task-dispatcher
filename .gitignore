@@ -1,0 +1,28 @@
+# Secrets — never commit
+*.env
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*credentials*
+*secret*
+.secrets/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.coverage
+htmlcov/
+.pytest_cache/
+.ruff_cache/
+
+# Editors / OS
+.DS_Store
+*.swp

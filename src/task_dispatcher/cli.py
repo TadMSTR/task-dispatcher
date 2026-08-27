@@ -10,29 +10,29 @@ Logic:
   3. Log all transitions to dispatcher.log
 """
 
-import glob
+import contextlib
 import json
 import logging
 import os
 import re
-import shutil
 import subprocess
 import sys
-import tempfile
-import uuid
-from datetime import datetime, timezone, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import httpx
 import yaml
 
-# agent-bus client — write path for Python scripts that cannot call MCP directly
-import sys as _sys
-_sys.path.insert(0, str(__import__('pathlib').Path.home() / "repos/agent-bus"))
+# agent-bus client — write path for code that cannot call MCP directly. Optional:
+# installed via the `bus` extra (pip install task-dispatcher[bus]). When it is not
+# installed, event logging degrades to a no-op rather than failing the tick.
 try:
     from agent_bus_client import log_event as bus_log
 except ImportError:
-    def bus_log(*a, **kw): pass  # no-op if client missing (safe degradation)
+
+    def bus_log(*a, **kw):
+        pass  # no-op if client missing (safe degradation)
+
 
 # --- Config ---
 TASK_QUEUE_DIR = Path.home() / ".claude" / "task-queue"
@@ -124,19 +124,22 @@ TEMPORAL_START_SCRIPT = Path.home() / "scripts" / "temporal-workflow-start.sh"
 # a session that looks like steward in every log and holds none of its credentials
 # (vikunja#404). Failing the tick loudly is strictly better than that.
 #
-# Why run-as exists at all: a run-as agent's environment file is owned and readable
-# only by the user it runs as, so the launcher is the only thing that can source it.
-# readable by the launching user. THE INVARIANT: load_agent_env() MUST
-# NOT be called for a run-as agent: as ted it would raise PermissionError on read_text()
-# and take down the whole dispatcher tick, not merely return an empty dict.
+# THE INVARIANT. An agent with run_as_user set must be launched only via its launcher.
+# load_agent_env() must never be called for such an agent: the launcher runs as that user
+# and is the only thing that can read its environment file. Reading it from this process
+# would raise PermissionError and take down the whole dispatcher tick, not merely return
+# an empty dict. (vikunja#404.)
 #
-# Resolved from this script's own directory, not from $HOME. The two ship together in
-# host-forge/scripts, and a $HOME-relative path breaks under any test that redirects HOME
-# (scripts/tests/test_dispatcher_headless_chain.py does exactly that). AGENT_LAUNCH_POLICY
-# overrides it for tests.
+# Resolved from $HOME, NOT from this file's own directory. The roster is shared with the
+# CloudCLI task-queue plugin, which hardcodes ~/scripts/agent-launch.yml (launch-policy.ts).
+# This package deploys to a venv outside ~/scripts, so resolving from __file__ would look
+# beside cli.py, find nothing, and hard-fail every tick — while the plugin kept reading the
+# real roster. Two consumers, one path, agreeing by construction. Do not reintroduce a
+# __file__-relative default. AGENT_LAUNCH_POLICY overrides it (tests set it, and the
+# crontab sets it explicitly so the resolution is visible at the call site rather than
+# implied). tests/fixtures/agent-launch.yml is a FIXTURE COPY, never the live roster.
 LAUNCH_POLICY_PATH = Path(
-    os.environ.get("AGENT_LAUNCH_POLICY")
-    or (Path(__file__).resolve().parent / "agent-launch.yml")
+    os.environ.get("AGENT_LAUNCH_POLICY") or (Path.home() / "scripts" / "agent-launch.yml")
 )
 
 # Closed sets. These are the constants that used to be the dict literals: a policy file
@@ -187,14 +190,18 @@ def validate_launch_policy(raw: object, project_root: Path | None = None) -> dic
 
         unknown = set(entry) - {"project_dir", "run_as_user", "launcher"}
         if unknown:
-            raise LaunchPolicyError(f"{LAUNCH_POLICY_PATH}: {agent}: unknown key(s) {sorted(unknown)}")
+            raise LaunchPolicyError(
+                f"{LAUNCH_POLICY_PATH}: {agent}: unknown key(s) {sorted(unknown)}"
+            )
 
         project_dir = entry.get("project_dir")
         if not isinstance(project_dir, str) or not project_dir:
             raise LaunchPolicyError(f"{LAUNCH_POLICY_PATH}: {agent}: project_dir is required")
         resolved = Path(project_dir).expanduser()
         if not resolved.is_absolute():
-            raise LaunchPolicyError(f"{LAUNCH_POLICY_PATH}: {agent}: project_dir must be absolute: {project_dir}")
+            raise LaunchPolicyError(
+                f"{LAUNCH_POLICY_PATH}: {agent}: project_dir must be absolute: {project_dir}"
+            )
         # Normalise `..` before the containment check; do not resolve symlinks, which
         # would depend on the dir existing (it may legitimately not, and the caller
         # reports that as a routing failure with a better message than this would).
@@ -212,14 +219,20 @@ def validate_launch_policy(raw: object, project_root: Path | None = None) -> dic
             )
         if run_as_user is not None:
             if not isinstance(run_as_user, str) or not _RUN_AS_USER_RE.match(run_as_user):
-                raise LaunchPolicyError(f"{LAUNCH_POLICY_PATH}: {agent}: invalid run_as_user {run_as_user!r}")
+                raise LaunchPolicyError(
+                    f"{LAUNCH_POLICY_PATH}: {agent}: invalid run_as_user {run_as_user!r}"
+                )
             if not isinstance(launcher, str) or not launcher.startswith(_LAUNCHER_DIR):
                 raise LaunchPolicyError(
-                    f"{LAUNCH_POLICY_PATH}: {agent}: launcher must be under {_LAUNCHER_DIR}: {launcher!r}"
+                    f"{LAUNCH_POLICY_PATH}: {agent}: launcher must be under "
+                    f"{_LAUNCHER_DIR}: {launcher!r}"
                 )
             # No `..` escape out of the launcher dir.
             if os.path.normpath(launcher) != launcher:
-                raise LaunchPolicyError(f"{LAUNCH_POLICY_PATH}: {agent}: launcher must be a normalised path: {launcher!r}")
+                raise LaunchPolicyError(
+                    f"{LAUNCH_POLICY_PATH}: {agent}: launcher must be a normalised "
+                    f"path: {launcher!r}"
+                )
 
         policy[agent] = {
             "project_dir": normalised,
@@ -264,7 +277,9 @@ logging.basicConfig(
     ],
 )
 log = logging.getLogger(__name__)
-logging.getLogger("httpx").setLevel(logging.WARNING)  # keep matrix_notify()'s own per-request lines out of dispatcher.log
+logging.getLogger("httpx").setLevel(
+    logging.WARNING
+)  # keep matrix_notify()'s own per-request lines out of dispatcher.log
 
 
 # --- Atomic YAML write ---
@@ -287,7 +302,7 @@ def load_yaml(path: Path) -> dict:
 
 
 def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 # --- History append ---
@@ -304,7 +319,7 @@ def is_eligible(task: dict) -> bool:
     next_retry = task.get("retry_policy", {}).get("next_retry_at")
     if next_retry is None:
         return True
-    return datetime.now(timezone.utc) >= datetime.fromisoformat(next_retry)
+    return datetime.now(UTC) >= datetime.fromisoformat(next_retry)
 
 
 # --- Routing failure handler with exponential backoff ---
@@ -330,10 +345,10 @@ def handle_routing_failure(path: Path, task: dict, reason: str) -> None:
     append_history(task, "routing-failed", "dispatcher", reason)
 
     if retry_count < max_retries:
-        backoff_seconds = RETRY_BASE_SECONDS * (2 ** retry_count)
+        backoff_seconds = RETRY_BASE_SECONDS * (2**retry_count)
         policy["retry_count"] = retry_count + 1
         policy["next_retry_at"] = (
-            datetime.now(timezone.utc) + timedelta(seconds=backoff_seconds)
+            datetime.now(UTC) + timedelta(seconds=backoff_seconds)
         ).isoformat()
         # FIX(TQMCP-1/MDISP-1): park in "routing-failed" not "submitted".
         # Previously reset to "submitted" caused the task to re-run the full
@@ -342,9 +357,13 @@ def handle_routing_failure(path: Path, task: dict, reason: str) -> None:
         # now handles retry routing directly without re-approval.
         task["status"] = "routing-failed"
         atomic_write(path, task)
-        bus_log("task.routing-failed", source="dispatcher",
-                summary=f"Routing failed (retry {retry_count + 1}/{max_retries}): {reason}",
-                target=task.get("target_agent"), artifact_path=str(path))
+        bus_log(
+            "task.routing-failed",
+            source="dispatcher",
+            summary=f"Routing failed (retry {retry_count + 1}/{max_retries}): {reason}",
+            target=task.get("target_agent"),
+            artifact_path=str(path),
+        )
         log.info(
             f"{path.name}: routing failed ({reason}); "
             f"retry {retry_count + 1}/{max_retries} in {backoff_seconds // 60}m"
@@ -352,9 +371,13 @@ def handle_routing_failure(path: Path, task: dict, reason: str) -> None:
     else:
         task["status"] = "failed"
         publish_nats("tasks.failed", {"task_id": task.get("id"), "summary": task.get("summary")})
-        bus_log("task.failed", source="dispatcher",
-                summary=f"Task failed (exhausted {max_retries} retries): {reason}",
-                target=task.get("target_agent"), artifact_path=str(path))
+        bus_log(
+            "task.failed",
+            source="dispatcher",
+            summary=f"Task failed (exhausted {max_retries} retries): {reason}",
+            target=task.get("target_agent"),
+            artifact_path=str(path),
+        )
         log.warning(f"{path.name}: exhausted {max_retries} retries: {reason}")
         move_to_dead_letter(path, task, reason)
 
@@ -386,7 +409,7 @@ def _parse_mcp_response(resp: httpx.Response, expected_id: int) -> dict:
     candidates = []
     for line in resp.text.splitlines():
         if line.startswith("data:"):
-            candidate = json.loads(line[len("data:"):].strip())
+            candidate = json.loads(line[len("data:") :].strip())
             if candidate.get("id") == expected_id:
                 return candidate
             candidates.append(candidate)
@@ -399,16 +422,20 @@ def matrix_notify(room: str, title: str, body: str) -> None:
     """Post a notification to a named Matrix room via matrix-mcp, verifying delivery."""
     try:
         with httpx.Client(timeout=10) as client:
-            init_resp = client.post(MATRIX_MCP_URL, headers=_MCP_HEADERS, json={
-                "jsonrpc": "2.0",
-                "method": "initialize",
-                "params": {
-                    "protocolVersion": "2025-06-18",
-                    "capabilities": {},
-                    "clientInfo": {"name": "task-dispatcher", "version": "1.0"},
+            init_resp = client.post(
+                MATRIX_MCP_URL,
+                headers=_MCP_HEADERS,
+                json={
+                    "jsonrpc": "2.0",
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-06-18",
+                        "capabilities": {},
+                        "clientInfo": {"name": "task-dispatcher", "version": "1.0"},
+                    },
+                    "id": 1,
                 },
-                "id": 1,
-            })
+            )
             session_id = init_resp.headers.get("mcp-session-id")
             init_body = _parse_mcp_response(init_resp, expected_id=1)
             if init_resp.status_code // 100 != 2 or init_body.get("error") or not session_id:
@@ -419,21 +446,29 @@ def matrix_notify(room: str, title: str, body: str) -> None:
                 return
 
             call_headers = {**_MCP_HEADERS, "mcp-session-id": session_id}
-            call_resp = client.post(MATRIX_MCP_URL, headers=call_headers, json={
-                "jsonrpc": "2.0",
-                "method": "tools/call",
-                "params": {
-                    "name": "send_matrix_message",
-                    "arguments": {
-                        "room_name": room,
-                        "message": f"**{title}**\n{body}",
+            call_resp = client.post(
+                MATRIX_MCP_URL,
+                headers=call_headers,
+                json={
+                    "jsonrpc": "2.0",
+                    "method": "tools/call",
+                    "params": {
+                        "name": "send_matrix_message",
+                        "arguments": {
+                            "room_name": room,
+                            "message": f"**{title}**\n{body}",
+                        },
                     },
+                    "id": 2,
                 },
-                "id": 2,
-            })
+            )
             call_body = _parse_mcp_response(call_resp, expected_id=2)
             tool_result = call_body.get("result", {})
-            if call_resp.status_code // 100 != 2 or call_body.get("error") or tool_result.get("isError"):
+            if (
+                call_resp.status_code // 100 != 2
+                or call_body.get("error")
+                or tool_result.get("isError")
+            ):
                 log.warning(
                     f"matrix_notify failed for #{room}: {title!r} "
                     f"(status={call_resp.status_code}, body={call_body})"
@@ -447,14 +482,12 @@ def matrix_notify(room: str, title: str, body: str) -> None:
 # --- NATS publish (fire-and-forget) ---
 def publish_nats(subject: str, payload: dict) -> None:
     """Fire-and-forget NATS publish — never blocks the dispatcher."""
-    try:
+    with contextlib.suppress(Exception):
         subprocess.run(
             ["nats", "pub", "--server", "nats://localhost:4222", subject, json.dumps(payload)],
             timeout=5,
             capture_output=True,
         )
-    except Exception:
-        pass
 
 
 # --- Per-agent .env loader (SMCP-28) ---
@@ -511,7 +544,7 @@ def anthropic_creds_usable(child_env: dict) -> bool:
         return False
     if not oauth.get("accessToken"):
         return False
-    now_ms = datetime.now(timezone.utc).timestamp() * 1000
+    now_ms = datetime.now(UTC).timestamp() * 1000
     return oauth.get("expiresAt", 0) > now_ms
 
 
@@ -520,7 +553,7 @@ def alert_auth_blocked(agent: str, task_id: str) -> None:
     try:
         if AUTH_ALERT_STAMP.exists():
             last = datetime.fromisoformat(AUTH_ALERT_STAMP.read_text().strip())
-            if (datetime.now(timezone.utc) - last).total_seconds() < AUTH_ALERT_DEBOUNCE_SEC:
+            if (datetime.now(UTC) - last).total_seconds() < AUTH_ALERT_DEBOUNCE_SEC:
                 return
     except Exception:
         pass
@@ -531,10 +564,8 @@ def alert_auth_blocked(agent: str, task_id: str) -> None:
         f"Run `claude /login` to restore headless agents. "
         f"Latest blocked task: {task_id} (agent: {agent}).",
     )
-    try:
+    with contextlib.suppress(Exception):
         AUTH_ALERT_STAMP.write_text(now_iso())
-    except Exception:
-        pass
 
 
 # --- Workflow mode propagation ---
@@ -572,21 +603,22 @@ def launch_agent_headless(task: dict) -> None:
         handle_routing_failure(
             Path(TASK_QUEUE_DIR / f"{task.get('id', 'unknown')}.yml"),
             task,
-            f"Unknown agent for headless launch: {target!r}"
+            f"Unknown agent for headless launch: {target!r}",
         )
         return
     if not project_dir.is_dir():
         handle_routing_failure(
             Path(TASK_QUEUE_DIR / f"{task.get('id', 'unknown')}.yml"),
             task,
-            f"Project dir missing: {project_dir}"
+            f"Project dir missing: {project_dir}",
         )
         return
     task_id = task.get("id", "unknown")
-    if not re.fullmatch(r'[0-9a-f\-]{36}', task_id):
+    if not re.fullmatch(r"[0-9a-f\-]{36}", task_id):
         task_id = "invalid-id"
     # SECURITY[resolved]: summary removed from prompt to prevent prompt injection.
-    # Agent discovers task content via task-queue tools using task_id. Audit: 2026-05-29/forge-build-workflow-infra-2026-05.
+    # Agent discovers task content via task-queue tools using task_id.
+    # Audit: 2026-05-29/forge-build-workflow-infra-2026-05.
     workflow_mode = task.get("workflow_mode", "semi-auto")
     # PROPAGATION SITE 1 of 3 — the env var the launched agent reads and passes back to
     # submit_task. Downgraded, not copied: see child_workflow_mode(). The task's OWN mode
@@ -611,15 +643,15 @@ def launch_agent_headless(task: dict) -> None:
     # bearer token fails silently as a 401 deep inside the launched session
     # instead of here. Catch it before spawning a session doomed to have no
     # scoped-mcp tools.
-    prompt = (f"You have a pending task (id={task_id}). "
-              f"Check your task queue and proceed.")
+    prompt = f"You have a pending task (id={task_id}). Check your task queue and proceed."
 
     if run_as is None:
         if not child_env.get("SCOPED_MCP_BEARER_TOKEN"):
             handle_routing_failure(
                 TASK_QUEUE_DIR / f"{task.get('id', 'unknown')}.yml",
                 task,
-                f"SCOPED_MCP_BEARER_TOKEN unresolved for agent '{target}' — refusing headless launch"
+                f"SCOPED_MCP_BEARER_TOKEN unresolved for agent '{target}' — "
+                f"refusing headless launch",
             )
             return
         # SMCP-29 auth guard: don't launch a session that will just print
@@ -629,7 +661,8 @@ def launch_agent_headless(task: dict) -> None:
             handle_routing_failure(
                 TASK_QUEUE_DIR / f"{task.get('id', 'unknown')}.yml",
                 task,
-                f"No usable Anthropic credential (OAuth expired / no ANTHROPIC_API_KEY) — refusing headless launch for '{target}'"
+                f"No usable Anthropic credential (OAuth expired / no "
+                f"ANTHROPIC_API_KEY) — refusing headless launch for '{target}'",
             )
             return
         argv = ["claude", "-p", "--dangerously-skip-permissions", prompt]
@@ -653,7 +686,7 @@ def launch_agent_headless(task: dict) -> None:
                 TASK_QUEUE_DIR / f"{task.get('id', 'unknown')}.yml",
                 task,
                 f"Launcher missing or not executable for run-as agent '{target}': {launcher} "
-                f"— deploy it with forge-scripts-deploy.sh"
+                f"— deploy it with forge-scripts-deploy.sh",
             )
             return
         # sudo resets the environment, so FORGE_WORKFLOW_MODE cannot be passed
@@ -666,8 +699,17 @@ def launch_agent_headless(task: dict) -> None:
         # downgrade — passing the parent mode here would leave the one run-as agent
         # (steward, which is precisely the agent #533 is about) as the only one whose
         # children did not inherit correctly.
-        argv = ["sudo", "-n", "-u", run_user, launcher,
-                "--workflow-mode", inherited_mode, "--", prompt]
+        argv = [
+            "sudo",
+            "-n",
+            "-u",
+            run_user,
+            launcher,
+            "--workflow-mode",
+            inherited_mode,
+            "--",
+            prompt,
+        ]
 
     # One launch-log destination, shared with the CloudCLI task-queue plugin
     # (task-queue-plugin-repair-2026-08 Phase 3). This used to be
@@ -712,46 +754,49 @@ def launch_temporal_workflow(path: Path, task: dict) -> bool:
     workflow_type = payload.get("workflow_type", "BuildPipelineWorkflow")
     if workflow_type not in ALLOWED_WORKFLOW_TYPES:
         handle_routing_failure(
-            path, task,
-            f"Unknown workflow_type: {workflow_type!r} (allowed: {ALLOWED_WORKFLOW_TYPES})"
+            path,
+            task,
+            f"Unknown workflow_type: {workflow_type!r} (allowed: {ALLOWED_WORKFLOW_TYPES})",
         )
         return False
     task_id = task.get("id", "unknown")
-    if not re.fullmatch(r'[0-9a-f\-]{36}', task_id):
+    if not re.fullmatch(r"[0-9a-f\-]{36}", task_id):
         task_id = "invalid-id"
     plan_name = payload.get("plan_name", "")
-    if not re.fullmatch(r'[a-z0-9][a-z0-9\-]*', plan_name):
+    if not re.fullmatch(r"[a-z0-9][a-z0-9\-]*", plan_name):
         handle_routing_failure(
-            path, task,
-            f"Invalid plan_name for workflow submission: {plan_name!r}"
+            path, task, f"Invalid plan_name for workflow submission: {plan_name!r}"
         )
         return False
     workflow_id = f"{plan_name}-{task_id[:8]}"
-    input_json = json.dumps({
-        "plan_name": plan_name,
-        **{k: v for k, v in payload.items()
-           if k not in ("workflow_type", "plan_name", "task_token")}
-    })
+    input_json = json.dumps(
+        {
+            "plan_name": plan_name,
+            **{
+                k: v
+                for k, v in payload.items()
+                if k not in ("workflow_type", "plan_name", "task_token")
+            },
+        }
+    )
     log_file = Path.home() / ".pm2" / "logs" / f"temporal-start-{task_id[:8]}.log"
     try:
         with open(log_file, "a") as lf:
             result = subprocess.run(
                 [str(TEMPORAL_START_SCRIPT), workflow_type, workflow_id, input_json],
-                stdout=lf, stderr=lf, timeout=30
+                stdout=lf,
+                stderr=lf,
+                timeout=30,
             )
         if result.returncode != 0:
             handle_routing_failure(
-                path, task,
-                f"temporal-workflow-start.sh exited {result.returncode}"
+                path, task, f"temporal-workflow-start.sh exited {result.returncode}"
             )
             return False
         log.info(f"Temporal workflow started: {workflow_type} id={workflow_id} task={task_id[:8]}")
         return True
     except subprocess.TimeoutExpired:
-        handle_routing_failure(
-            path, task,
-            "temporal-workflow-start.sh timed out (30s)"
-        )
+        handle_routing_failure(path, task, "temporal-workflow-start.sh timed out (30s)")
         return False
 
 
@@ -850,19 +895,21 @@ def process_submitted(manifests: dict) -> None:
         task_type = task.get("task_type")
         if task_type not in VALID_TASK_TYPES | DISPATCHER_ONLY_TASK_TYPES:
             handle_routing_failure(
-                path, task,
+                path,
+                task,
                 f"Unknown task_type {task_type!r} — not in task-queue-mcp's vocabulary "
-                f"({sorted(VALID_TASK_TYPES)}). Queue file written outside submit_task?"
+                f"({sorted(VALID_TASK_TYPES)}). Queue file written outside submit_task?",
             )
             continue
         submitted_mode = task.get("workflow_mode", "semi-auto")
         if submitted_mode not in VALID_WORKFLOW_MODES:
             handle_routing_failure(
-                path, task,
+                path,
+                task,
                 f"Unknown workflow_mode {submitted_mode!r} — not in task-queue-mcp's "
                 f"vocabulary ({sorted(VALID_WORKFLOW_MODES)}). Refusing to guess: "
                 f"treating it as semi-auto would silently gate an auto chain, and as auto "
-                f"would silently launch an ungated session."
+                f"would silently launch an ungated session.",
             )
             continue
 
@@ -876,13 +923,18 @@ def process_submitted(manifests: dict) -> None:
             task["result"]["output"] = task.get("payload", {}).get("description")
             task["result"]["completed_by"] = f"dispatcher ({task_type})"
             task["result"]["completed_at"] = now_iso()
-            append_history(task, "completed", "dispatcher",
-                           "Notification delivered — no session required")
+            append_history(
+                task, "completed", "dispatcher", "Notification delivered — no session required"
+            )
             atomic_write(path, task)
             log.info(f"{path.name}: → completed ({task_type}, no launch)")
-            bus_log("task.completed", source="dispatcher",
-                    summary=f"Notification delivered: {task.get('summary', path.stem)}",
-                    target=task.get("target_agent", ""), artifact_path=str(path))
+            bus_log(
+                "task.completed",
+                source="dispatcher",
+                summary=f"Notification delivered: {task.get('summary', path.stem)}",
+                target=task.get("target_agent", ""),
+                artifact_path=str(path),
+            )
             # The room name is the ONE value here that is not just rendered — it selects
             # a destination. This branch returns before the routing block, so unlike the
             # semi-auto notify below, `target_agent` has NOT been through find_agent() or
@@ -905,12 +957,15 @@ def process_submitted(manifests: dict) -> None:
             continue
 
         log.info(f"Processing submitted task: {path.name}")
-        publish_nats("tasks.submitted", {
-            "task_id": task.get("id"),
-            "summary": task.get("summary"),
-            "target_agent": task.get("target_agent"),
-            "risk_level": task.get("risk_level", "low"),
-        })
+        publish_nats(
+            "tasks.submitted",
+            {
+                "task_id": task.get("id"),
+                "summary": task.get("summary"),
+                "target_agent": task.get("target_agent"),
+                "risk_level": task.get("risk_level", "low"),
+            },
+        )
         target = task.get("target_agent", "auto")
 
         # Resolve auto-routing
@@ -991,48 +1046,63 @@ def process_submitted(manifests: dict) -> None:
 
         if needs_approval:
             task["status"] = "pending-approval"
-            append_history(task, "pending-approval", "dispatcher",
-                           f"Needs approval: {approval_reason}")
+            append_history(
+                task, "pending-approval", "dispatcher", f"Needs approval: {approval_reason}"
+            )
             atomic_write(path, task)
-            publish_nats("tasks.approval-requested", {
-                "task_id": task.get("id"),
-                "target_agent": target_agent,
-                "risk_level": risk,
-            })
-            bus_log("task.dispatched", source="dispatcher",
-                    summary=f"Dispatched for approval: {task.get('summary', path.stem)}",
-                    target=target_agent, artifact_path=str(path))
+            publish_nats(
+                "tasks.approval-requested",
+                {
+                    "task_id": task.get("id"),
+                    "target_agent": target_agent,
+                    "risk_level": risk,
+                },
+            )
+            bus_log(
+                "task.dispatched",
+                source="dispatcher",
+                summary=f"Dispatched for approval: {task.get('summary', path.stem)}",
+                target=target_agent,
+                artifact_path=str(path),
+            )
             log.info(f"{path.name}: → pending-approval (risk={risk}, max_auto={max_auto})")
             matrix_notify(
                 "approvals",
                 f"[APPROVAL NEEDED] {task.get('summary', path.stem)}",
-                f"Source: {task.get('source_agent')} | Type: {task.get('task_type')} | Risk: {risk} | Agent: {target_agent}\n"
+                f"Source: {task.get('source_agent')} | Type: {task.get('task_type')} "
+                f"| Risk: {risk} | Agent: {target_agent}\n"
                 f"`task-approve {task.get('id', path.stem)}`",
             )
         else:
             task["status"] = "approved"
-            append_history(task, "approved", "dispatcher",
-                           f"Auto-approved: {approval_reason}")
+            append_history(task, "approved", "dispatcher", f"Auto-approved: {approval_reason}")
             atomic_write(path, task)
-            publish_nats("tasks.approved", {
-                "task_id": task.get("id"),
-                "target_agent": target_agent,
-                "summary": task.get("summary"),
-            })
+            publish_nats(
+                "tasks.approved",
+                {
+                    "task_id": task.get("id"),
+                    "target_agent": target_agent,
+                    "summary": task.get("summary"),
+                },
+            )
             if task.get("task_type") == "workflow":
                 if launch_temporal_workflow(path, task):
                     task["status"] = "in-progress"
-                    append_history(task, "in-progress", "dispatcher",
-                                   "Temporal workflow submitted")
+                    append_history(task, "in-progress", "dispatcher", "Temporal workflow submitted")
                     atomic_write(path, task)
-                    bus_log("task.workflow_started", source="dispatcher",
-                            summary=f"Temporal workflow started: {task.get('summary', path.stem)}",
-                            target=target_agent, artifact_path=str(path))
+                    bus_log(
+                        "task.workflow_started",
+                        source="dispatcher",
+                        summary=f"Temporal workflow started: {task.get('summary', path.stem)}",
+                        target=target_agent,
+                        artifact_path=str(path),
+                    )
                     log.info(f"{path.name}: → in-progress (temporal workflow)")
                     matrix_notify(
                         "announcements",
                         f"[temporal] {task.get('summary', path.stem)}",
-                        f"Workflow: {task.get('payload', {}).get('workflow_type', 'BuildPipelineWorkflow')}"
+                        f"Workflow: "
+                        f"{task.get('payload', {}).get('workflow_type', 'BuildPipelineWorkflow')}"
                         f" | plan: {task.get('payload', {}).get('plan_name', '?')}",
                     )
                 continue
@@ -1049,27 +1119,43 @@ def process_submitted(manifests: dict) -> None:
                 )
                 build_name = (
                     Path(request_path_str).parent.name
-                    if request_path_str else
-                    next(iter(re.findall(r'audit-requests/([a-zA-Z0-9_\-]+)', payload.get("description", ""))), "unknown")
+                    if request_path_str
+                    else next(
+                        iter(
+                            re.findall(
+                                r"audit-requests/([a-zA-Z0-9_\-]+)", payload.get("description", "")
+                            )
+                        ),
+                        "unknown",
+                    )
                 )
-                # SECURITY[resolved]: reject "unknown" build_name to prevent silent non-functional audit launches.
+                # SECURITY[resolved]: reject "unknown" build_name to prevent silent
+                # non-functional audit launches.
                 # Audit: 2026-05-29/forge-build-workflow-infra-2026-05.
-                if build_name == "unknown" or not re.fullmatch(r'[a-zA-Z0-9_\-]+', build_name):
-                    handle_routing_failure(path, task, f"Invalid or missing build_name in payload: {build_name!r}")
+                if build_name == "unknown" or not re.fullmatch(r"[a-zA-Z0-9_\-]+", build_name):
+                    handle_routing_failure(
+                        path, task, f"Invalid or missing build_name in payload: {build_name!r}"
+                    )
                     continue
                 audit_root = (Path.home() / ".claude/comms/artifacts/audit-requests").resolve()
-                request_path = Path(request_path_str).expanduser().resolve() if request_path_str else (
-                    audit_root / build_name / "request.md"
+                request_path = (
+                    Path(request_path_str).expanduser().resolve()
+                    if request_path_str
+                    else (audit_root / build_name / "request.md")
                 )
                 try:
                     request_path.relative_to(audit_root)
                 except ValueError:
-                    handle_routing_failure(path, task, f"request_path outside audit-requests: {request_path}")
+                    handle_routing_failure(
+                        path, task, f"request_path outside audit-requests: {request_path}"
+                    )
                     continue
                 # SECURITY[resolved]: verify request_path exists on disk before launching.
                 # Audit: 2026-05-29/forge-build-workflow-infra-2026-05.
                 if not request_path.exists():
-                    handle_routing_failure(path, task, f"request_path does not exist: {request_path}")
+                    handle_routing_failure(
+                        path, task, f"request_path does not exist: {request_path}"
+                    )
                     continue
                 security_project_dir = Path.home() / ".claude" / "projects" / "security"
                 audit_log = Path.home() / ".pm2" / "logs" / f"security-audit-{build_name}.log"
@@ -1077,11 +1163,21 @@ def process_submitted(manifests: dict) -> None:
                 audit_env = dict(os.environ)
                 audit_env.update(load_agent_env("security"))
                 if not audit_env.get("SCOPED_MCP_BEARER_TOKEN"):
-                    handle_routing_failure(path, task, "SCOPED_MCP_BEARER_TOKEN unresolved for agent 'security' — refusing headless audit launch")
+                    handle_routing_failure(
+                        path,
+                        task,
+                        "SCOPED_MCP_BEARER_TOKEN unresolved for agent 'security' — "
+                        "refusing headless audit launch",
+                    )
                     continue
                 if not anthropic_creds_usable(audit_env):  # SMCP-29 auth guard
                     alert_auth_blocked("security", task.get("id", "unknown"))
-                    handle_routing_failure(path, task, "No usable Anthropic credential (OAuth expired / no ANTHROPIC_API_KEY) — refusing headless audit launch")
+                    handle_routing_failure(
+                        path,
+                        task,
+                        "No usable Anthropic credential (OAuth expired / no "
+                        "ANTHROPIC_API_KEY) — refusing headless audit launch",
+                    )
                     continue
                 # Name the task in the prompt. Headlessly this is the only way the security
                 # agent learns which queue entry to claim and close — it has no session-start
@@ -1090,21 +1186,27 @@ def process_submitted(manifests: dict) -> None:
                 # than reaching the prompt. Still no `summary` — that was deliberately
                 # removed as a prompt-injection vector.
                 audit_task_id = task.get("id", "unknown")
-                if not re.fullmatch(r'[0-9a-f\-]{36}', audit_task_id):
+                if not re.fullmatch(r"[0-9a-f\-]{36}", audit_task_id):
                     audit_task_id = "invalid-id"
                 with open(audit_log, "a") as audit_log_fh:
                     proc = subprocess.Popen(
-                        ["claude", "-p",
-                         "--dangerously-skip-permissions",
-                         f"Run security audit for build: {build_name}. "
-                         f"Task ID: {audit_task_id}. "
-                         f"Request at: {request_path}"],
+                        [
+                            "claude",
+                            "-p",
+                            "--dangerously-skip-permissions",
+                            f"Run security audit for build: {build_name}. "
+                            f"Task ID: {audit_task_id}. "
+                            f"Request at: {request_path}",
+                        ],
                         cwd=str(security_project_dir),
                         stdout=audit_log_fh,
                         stderr=audit_log_fh,
                         env=audit_env,
                     )
-                log.info(f"{path.name}: headless audit launched for {build_name} (pid={proc.pid}) log={audit_log}")
+                log.info(
+                    f"{path.name}: headless audit launched for {build_name} "
+                    f"(pid={proc.pid}) log={audit_log}"
+                )
             else:
                 workflow_mode = task.get("workflow_mode", "semi-auto")
                 # DO NOT rewrite this as `!= "semi-auto"`. It reads like a tidy-up and it
@@ -1122,12 +1224,12 @@ def process_submitted(manifests: dict) -> None:
                 else:
                     # semi-auto mode (default): queue for operator pickup, notify agent room
                     log.info(
-                        f"{path.name}: workflow_mode={workflow_mode} — "
-                        f"queued for operator pickup"
+                        f"{path.name}: workflow_mode={workflow_mode} — queued for operator pickup"
                     )
                     task_id = task.get("id", path.stem)
-                    # SECURITY[accepted]: summary interpolated into Matrix notification title — Markdown injection possible
-                    # but not HTML/JSON injection. Trust model: internal agents not adversarial. Pre-existing pattern.
+                    # SECURITY[accepted]: summary interpolated into Matrix notification
+                    # title — Markdown injection possible but not HTML/JSON injection.
+                    # Trust model: internal agents not adversarial. Pre-existing pattern.
                     # Audit: 2026-06-08/workflow-qol-2026-06 INFO-1.
                     summary = task.get("summary", path.stem)
                     source = task.get("source_agent", "unknown")
@@ -1135,23 +1237,28 @@ def process_submitted(manifests: dict) -> None:
                         target_agent,
                         f"[task ready] {summary}",
                         f"Task ID: {task_id}\nFrom: {source} | Risk: {risk}\n"
-                        f'Resume: Check task queue (id={task_id}) and run shared-build-review.',
+                        f"Resume: Check task queue (id={task_id}) and run shared-build-review.",
                     )
-            bus_log("task.approved", source="dispatcher",
-                    summary=task.get("summary", path.stem),
-                    target=target_agent, artifact_path=str(path))
+            bus_log(
+                "task.approved",
+                source="dispatcher",
+                summary=task.get("summary", path.stem),
+                target=target_agent,
+                artifact_path=str(path),
+            )
             log.info(f"{path.name}: → approved (auto)")
             matrix_notify(
                 "announcements",
                 f"[auto-approved] {task.get('summary', path.stem)}",
-                f"Agent: {target_agent} | Risk: {risk} | Mode: {task.get('workflow_mode', 'semi-auto')}",
+                f"Agent: {target_agent} | Risk: {risk} | "
+                f"Mode: {task.get('workflow_mode', 'semi-auto')}",
             )
 
 
 # --- Phase 3: Archive terminal tasks past TTL ---
 def archive_expired() -> None:
     ARCHIVE_DIR.mkdir(exist_ok=True)
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     for path in sorted(TASK_QUEUE_DIR.glob("*.yml")):
         if path.name.startswith("."):
             continue
@@ -1168,7 +1275,7 @@ def archive_expired() -> None:
         try:
             created = datetime.fromisoformat(str(created_str))
             if created.tzinfo is None:
-                created = created.replace(tzinfo=timezone.utc)
+                created = created.replace(tzinfo=UTC)
         except (ValueError, TypeError):
             continue
 
@@ -1176,8 +1283,9 @@ def archive_expired() -> None:
         if age_days >= ttl_days:
             dest = ARCHIVE_DIR / path.name
             path.rename(dest)
-            log.info(f"Archived {path.name} (age={age_days}d, ttl={ttl_days}d, status={task['status']})")
-
+            log.info(
+                f"Archived {path.name} (age={age_days}d, ttl={ttl_days}d, status={task['status']})"
+            )
 
 
 # --- Phase 1b: Retry routing-failed tasks (FIX: TQMCP-1/MDISP-1) ---
@@ -1226,17 +1334,19 @@ def process_routing_failed(manifests: dict) -> None:
         retry_type = task.get("task_type")
         if retry_type not in VALID_TASK_TYPES | DISPATCHER_ONLY_TASK_TYPES:
             handle_routing_failure(
-                path, task,
+                path,
+                task,
                 f"Unknown task_type {retry_type!r} (routing-failed retry) — not in "
-                f"task-queue-mcp's vocabulary ({sorted(VALID_TASK_TYPES)})"
+                f"task-queue-mcp's vocabulary ({sorted(VALID_TASK_TYPES)})",
             )
             continue
         retry_mode = task.get("workflow_mode", "semi-auto")
         if retry_mode not in VALID_WORKFLOW_MODES:
             handle_routing_failure(
-                path, task,
+                path,
+                task,
                 f"Unknown workflow_mode {retry_mode!r} (routing-failed retry) — not in "
-                f"task-queue-mcp's vocabulary ({sorted(VALID_WORKFLOW_MODES)})"
+                f"task-queue-mcp's vocabulary ({sorted(VALID_WORKFLOW_MODES)})",
             )
             continue
         if retry_type in SELF_TERMINAL_TASK_TYPES:
@@ -1245,8 +1355,12 @@ def process_routing_failed(manifests: dict) -> None:
             task["result"]["output"] = task.get("payload", {}).get("description")
             task["result"]["completed_by"] = f"dispatcher ({retry_type})"
             task["result"]["completed_at"] = now_iso()
-            append_history(task, "completed", "dispatcher",
-                           "Notification delivered — no session required (routing-failed retry)")
+            append_history(
+                task,
+                "completed",
+                "dispatcher",
+                "Notification delivered — no session required (routing-failed retry)",
+            )
             atomic_write(path, task)
             log.info(f"{path.name}: → completed ({retry_type}, no launch, routing-failed retry)")
             continue
@@ -1258,8 +1372,9 @@ def process_routing_failed(manifests: dict) -> None:
             resolved = find_agent(task, manifests)
             if resolved is None:
                 handle_routing_failure(
-                    path, task,
-                    f"No agent found for task_type={task.get('task_type')} (routing-failed retry)"
+                    path,
+                    task,
+                    f"No agent found for task_type={task.get('task_type')} (routing-failed retry)",
                 )
                 continue
             task["target_agent"] = resolved
@@ -1268,8 +1383,12 @@ def process_routing_failed(manifests: dict) -> None:
         if task.get("task_type") == "workflow":
             if launch_temporal_workflow(path, task):
                 task["status"] = "in-progress"
-                append_history(task, "in-progress", "dispatcher",
-                               "Temporal workflow submitted (routing-failed retry)")
+                append_history(
+                    task,
+                    "in-progress",
+                    "dispatcher",
+                    "Temporal workflow submitted (routing-failed retry)",
+                )
                 atomic_write(path, task)
                 log.info(f"{path.name}: → in-progress (temporal, routing-failed retry)")
             continue
@@ -1281,20 +1400,33 @@ def process_routing_failed(manifests: dict) -> None:
             )
             build_name = (
                 Path(request_path_str).parent.name
-                if request_path_str else
-                next(iter(re.findall(r'audit-requests/([a-zA-Z0-9_\-]+)', payload.get("description", ""))), "unknown")
+                if request_path_str
+                else next(
+                    iter(
+                        re.findall(
+                            r"audit-requests/([a-zA-Z0-9_\-]+)", payload.get("description", "")
+                        )
+                    ),
+                    "unknown",
+                )
             )
-            if build_name == "unknown" or not re.fullmatch(r'[a-zA-Z0-9_\-]+', build_name):
-                handle_routing_failure(path, task, f"Invalid or missing build_name in payload: {build_name!r}")
+            if build_name == "unknown" or not re.fullmatch(r"[a-zA-Z0-9_\-]+", build_name):
+                handle_routing_failure(
+                    path, task, f"Invalid or missing build_name in payload: {build_name!r}"
+                )
                 continue
             audit_root = (Path.home() / ".claude/comms/artifacts/audit-requests").resolve()
-            request_path = Path(request_path_str).expanduser().resolve() if request_path_str else (
-                audit_root / build_name / "request.md"
+            request_path = (
+                Path(request_path_str).expanduser().resolve()
+                if request_path_str
+                else (audit_root / build_name / "request.md")
             )
             try:
                 request_path.relative_to(audit_root)
             except ValueError:
-                handle_routing_failure(path, task, f"request_path outside audit-requests: {request_path}")
+                handle_routing_failure(
+                    path, task, f"request_path outside audit-requests: {request_path}"
+                )
                 continue
             if not request_path.exists():
                 handle_routing_failure(path, task, f"request_path does not exist: {request_path}")
@@ -1305,18 +1437,30 @@ def process_routing_failed(manifests: dict) -> None:
             audit_env = dict(os.environ)
             audit_env.update(load_agent_env("security"))
             if not audit_env.get("SCOPED_MCP_BEARER_TOKEN"):
-                handle_routing_failure(path, task, "SCOPED_MCP_BEARER_TOKEN unresolved for agent 'security' — refusing headless audit launch")
+                handle_routing_failure(
+                    path,
+                    task,
+                    "SCOPED_MCP_BEARER_TOKEN unresolved for agent 'security' — "
+                    "refusing headless audit launch",
+                )
                 continue
             if not anthropic_creds_usable(audit_env):  # SMCP-29 auth guard
                 alert_auth_blocked("security", task.get("id", "unknown"))
-                handle_routing_failure(path, task, "No usable Anthropic credential (OAuth expired / no ANTHROPIC_API_KEY) — refusing headless audit launch")
+                handle_routing_failure(
+                    path,
+                    task,
+                    "No usable Anthropic credential (OAuth expired / no "
+                    "ANTHROPIC_API_KEY) — refusing headless audit launch",
+                )
                 continue
             with open(audit_log, "a") as audit_log_fh:
                 proc = subprocess.Popen(
-                    ["claude", "-p",
-                     "--dangerously-skip-permissions",
-                     f"Run security audit for build: {build_name}. "
-                     f"Request at: {request_path}"],
+                    [
+                        "claude",
+                        "-p",
+                        "--dangerously-skip-permissions",
+                        f"Run security audit for build: {build_name}. Request at: {request_path}",
+                    ],
                     cwd=str(security_project_dir),
                     stdout=audit_log_fh,
                     stderr=audit_log_fh,
@@ -1325,7 +1469,10 @@ def process_routing_failed(manifests: dict) -> None:
             task["status"] = "approved"
             append_history(task, "approved", "dispatcher", "Routing retry succeeded")
             atomic_write(path, task)
-            log.info(f"{path.name}: headless audit launched for {build_name} (pid={proc.pid}) — routing-failed retry")
+            log.info(
+                f"{path.name}: headless audit launched for {build_name} "
+                f"(pid={proc.pid}) — routing-failed retry"
+            )
             continue
 
         # Generic task: launch headless or queue for operator pickup.
@@ -1353,6 +1500,10 @@ def process_routing_failed(manifests: dict) -> None:
 
 # --- Main ---
 def main():
+    # NOTE: --version is NOT handled here. It is answered in task_dispatcher._console
+    # before this module is imported, because importing this module loads the roster and
+    # raises when it cannot. See the docstring on _console() for why that ordering
+    # matters. By the time main() runs, the roster has already loaded successfully.
     log.info("=== task-dispatcher run start ===")
     manifests = load_manifests()
     log.info(f"Loaded {len(manifests)} agent manifests: {list(manifests.keys())}")
@@ -1362,7 +1513,8 @@ def main():
     archive_expired()
 
     log.info("=== task-dispatcher run complete ===")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

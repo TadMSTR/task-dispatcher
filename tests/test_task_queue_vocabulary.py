@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Assert task-dispatcher.py's task-queue vocabulary equals task-queue-mcp's.
+Assert task_dispatcher/cli.py's task-queue vocabulary equals task-queue-mcp's.
 
 WHY THIS EXISTS (vikunja#324)
 
@@ -33,7 +33,7 @@ make the network work or to pin a vendored copy deliberately.
 CONSEQUENCE WORTH KNOWING: this tracks task-queue-mcp's `main`. A vocabulary change
 merged there turns this repo's CI red on the next push. That is the alarm, not a
 malfunction — the dispatcher is genuinely out of date at that moment. Update the
-block in task-dispatcher.py and it goes green.
+block in src/task_dispatcher/cli.py and it goes green.
 """
 
 from __future__ import annotations
@@ -72,7 +72,7 @@ if not re.fullmatch(r"[A-Za-z0-9._][A-Za-z0-9._/-]*", UPSTREAM_REF) or ".." in U
 UPSTREAM_URL = (
     f"https://raw.githubusercontent.com/TadMSTR/task-queue-mcp/{UPSTREAM_REF}/src/tools/queue.py"
 )
-DISPATCHER = Path(__file__).resolve().parent.parent / "task-dispatcher.py"
+DISPATCHER = Path(__file__).resolve().parent.parent / "src" / "task_dispatcher" / "cli.py"
 
 # Every set both sides must agree on, dispatcher name → MCP name. They are not all
 # spelled the same: the dispatcher has called it TERMINAL_STATES since before the MCP
@@ -113,8 +113,10 @@ def literal_sets(source: str, origin: str) -> dict[str, set]:
         if isinstance(value, set) and all(isinstance(v, str) for v in value):
             found[target.id] = value
     if not found:
-        print(f"FATAL: no set literals parsed from {origin} — the extraction is broken, "
-              f"not the vocabulary. Failing rather than reporting a vacuous pass.")
+        print(
+            f"FATAL: no set literals parsed from {origin} — the extraction is broken, "
+            f"not the vocabulary. Failing rather than reporting a vacuous pass."
+        )
         sys.exit(2)
     return found
 
@@ -127,12 +129,14 @@ def fetch_upstream() -> str:
                     UPSTREAM_URL, resp.status, "unexpected status", resp.headers, None
                 )
             return resp.read().decode("utf-8")
-    except Exception as exc:  # noqa: BLE001 — every failure mode here is a hard failure
+    except Exception as exc:
         print(f"FATAL: could not read the vocabulary source of truth at {UPSTREAM_URL}")
         print(f"       {type(exc).__name__}: {exc}")
-        print("       This is a hard failure on purpose — see the module docstring. A "
-              "vocabulary check that skips when it cannot read the upstream reports the "
-              "same result whether or not the two sides agree.")
+        print(
+            "       This is a hard failure on purpose — see the module docstring. A "
+            "vocabulary check that skips when it cannot read the upstream reports the "
+            "same result whether or not the two sides agree."
+        )
         sys.exit(2)
 
 
@@ -140,18 +144,20 @@ def main() -> int:
     print("task queue vocabulary parity (dispatcher ↔ task-queue-mcp)")
     print(f"  upstream: {UPSTREAM_URL}")
     if UPSTREAM_REF != "main":
-        print(f"  NOTE: comparing against ref {UPSTREAM_REF!r}, NOT main. This is a "
-              f"pre-merge check and does not prove parity with what is deployed.")
+        print(
+            f"  NOTE: comparing against ref {UPSTREAM_REF!r}, NOT main. This is a "
+            f"pre-merge check and does not prove parity with what is deployed."
+        )
 
     mcp = literal_sets(fetch_upstream(), "task-queue-mcp/src/tools/queue.py")
-    disp = literal_sets(DISPATCHER.read_text(), "task-dispatcher.py")
+    disp = literal_sets(DISPATCHER.read_text(), "src/task_dispatcher/cli.py")
 
     for disp_name, mcp_name in sorted(SHARED_VOCABULARY.items()):
         if mcp_name not in mcp:
             check(False, f"{mcp_name} is missing from task-queue-mcp — renamed upstream?")
             continue
         if disp_name not in disp:
-            check(False, f"{disp_name} is missing from task-dispatcher.py")
+            check(False, f"{disp_name} is missing from src/task_dispatcher/cli.py")
             continue
         ours, theirs = disp[disp_name], mcp[mcp_name]
         if ours == theirs:
@@ -172,8 +178,10 @@ def main() -> int:
         for f in FAILURES:
             print(f"  - {f}")
         print()
-        print("Fix by editing the vocabulary block in scripts/task-dispatcher.py to match "
-              "task-queue-mcp. Do not edit this test to make it pass.")
+        print(
+            "Fix by editing the vocabulary block in src/task_dispatcher/cli.py to match "
+            "task-queue-mcp. Do not edit this test to make it pass."
+        )
         return 1
     print("vocabulary is in sync")
     return 0

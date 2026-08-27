@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Tests for task-dispatcher.py's headless-chain behaviour
+Tests for task_dispatcher/cli.py's headless-chain behaviour
 (task-queue-headless-chain-2026-08 — vikunja#507, #533, #324).
 
 Two properties, and neither is provable by testing child_workflow_mode() alone:
@@ -22,7 +22,7 @@ touches the real queue.
 
 from __future__ import annotations
 
-import importlib.util
+import importlib
 import os
 import sys
 import tempfile
@@ -40,11 +40,20 @@ for _agent in ("developer", "security", "steward", "sysadmin", "writer", "resear
     (_HOME / ".claude" / "projects" / _agent).mkdir(parents=True)
 os.environ["HOME"] = str(_HOME)
 
-MODULE_PATH = Path(__file__).resolve().parent.parent / "task-dispatcher.py"
-_spec = importlib.util.spec_from_file_location("task_dispatcher", MODULE_PATH)
-td = importlib.util.module_from_spec(_spec)
-sys.modules["task_dispatcher"] = td
-_spec.loader.exec_module(td)
+# The dispatcher resolves its roster from $HOME/scripts/agent-launch.yml at import time
+# and refuses to degrade to {}, so the redirected HOME needs one. Use the repo's fixture
+# copy — this exercises the real default resolution rather than the env override.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+(_HOME / "scripts").mkdir(parents=True)
+(_HOME / "scripts" / "agent-launch.yml").write_text(
+    (_REPO_ROOT / "tests" / "fixtures" / "agent-launch.yml").read_text()
+)
+
+# Import the INSTALLED package (pip install -e .), not a loose file. The deployed
+# artifact is a package on a venv path; loading cli.py by path would test a shape that
+# is never what runs. HOME is already redirected above, and module-level code in cli
+# reads it at import time, so this import must stay below that assignment.
+td = importlib.import_module("task_dispatcher.cli")
 
 # Neutralise every outbound channel. Popen is captured rather than stubbed away: the
 # tests need to assert on what WOULD have been launched, and on the fact that some
@@ -115,7 +124,11 @@ def write_task(**kw) -> Path:
             "description": kw.pop("description", "test description"),
             "context_refs": [],
             "priority": "normal",
-            **({"originating_task_id": kw["originating_task_id"]} if "originating_task_id" in kw else {}),
+            **(
+                {"originating_task_id": kw["originating_task_id"]}
+                if "originating_task_id" in kw
+                else {}
+            ),
         },
         "result": {"output": None, "completed_by": None, "completed_at": None},
         "history": [],
@@ -162,7 +175,9 @@ def test_site_1_env_var() -> None:
     print("\npropagation site 1 — FORGE_WORKFLOW_MODE")
 
     reset()
-    td.launch_agent_headless(read(write_task(target_agent="developer", workflow_mode="manual-then-auto")))
+    td.launch_agent_headless(
+        read(write_task(target_agent="developer", workflow_mode="manual-then-auto"))
+    )
     check(launched_mode() == "auto", "manual-then-auto parent launches child with auto")
 
     reset()
@@ -185,12 +200,16 @@ def test_site_2_run_as_launcher_flag() -> None:
     td.os.access = lambda p, mode: True
     try:
         reset()
-        td.launch_agent_headless(read(write_task(target_agent="steward", workflow_mode="manual-then-auto")))
+        td.launch_agent_headless(
+            read(write_task(target_agent="steward", workflow_mode="manual-then-auto"))
+        )
         check(LAUNCHES and LAUNCHES[0]["argv"][0] == "sudo", "steward goes through the run-as path")
         check(launched_mode() == "auto", "manual-then-auto reaches the launcher as auto")
 
         reset()
-        td.launch_agent_headless(read(write_task(target_agent="steward", workflow_mode="semi-auto")))
+        td.launch_agent_headless(
+            read(write_task(target_agent="steward", workflow_mode="semi-auto"))
+        )
         check(launched_mode() == "semi-auto", "semi-auto reaches the launcher unchanged")
     finally:
         td.os.access = real_access
@@ -204,29 +223,50 @@ def test_site_3_originating_task_inheritance() -> None:
     print("\npropagation site 3 — originating_task_id inheritance")
 
     reset()
-    parent = write_task(source_agent="ted", target_agent="steward",
-                        workflow_mode="manual-then-auto", status="approved")
-    child = write_task(source_agent="steward", target_agent="security",
-                       workflow_mode="semi-auto",
-                       originating_task_id=read(parent)["id"])
+    parent = write_task(
+        source_agent="ted",
+        target_agent="steward",
+        workflow_mode="manual-then-auto",
+        status="approved",
+    )
+    child = write_task(
+        source_agent="steward",
+        target_agent="security",
+        workflow_mode="semi-auto",
+        originating_task_id=read(parent)["id"],
+    )
     td.process_submitted(MANIFESTS)
-    check(read(child)["workflow_mode"] == "auto",
-          "child of a manual-then-auto parent is rewritten to auto")
-    check(read(parent)["workflow_mode"] == "manual-then-auto",
-          "the parent keeps its own mode verbatim")
+    check(
+        read(child)["workflow_mode"] == "auto",
+        "child of a manual-then-auto parent is rewritten to auto",
+    )
+    check(
+        read(parent)["workflow_mode"] == "manual-then-auto",
+        "the parent keeps its own mode verbatim",
+    )
 
     reset()
     parent = write_task(target_agent="steward", workflow_mode="semi-auto", status="approved")
-    child = write_task(source_agent="steward", target_agent="security",
-                       workflow_mode="semi-auto", originating_task_id=read(parent)["id"])
+    child = write_task(
+        source_agent="steward",
+        target_agent="security",
+        workflow_mode="semi-auto",
+        originating_task_id=read(parent)["id"],
+    )
     td.process_submitted(MANIFESTS)
-    check(read(child)["workflow_mode"] == "semi-auto",
-          "REGRESSION GUARD: a semi-auto parent still yields semi-auto children")
+    check(
+        read(child)["workflow_mode"] == "semi-auto",
+        "REGRESSION GUARD: a semi-auto parent still yields semi-auto children",
+    )
 
     reset()
     parent = write_task(target_agent="steward", workflow_mode="auto", status="approved")
-    child = write_task(source_agent="steward", target_agent="security",
-                       workflow_mode="semi-auto", originating_task_id=read(parent)["id"])
+    child = write_task(
+        source_agent="steward",
+        target_agent="security",
+        workflow_mode="semi-auto",
+        originating_task_id=read(parent)["id"],
+    )
     td.process_submitted(MANIFESTS)
     check(read(child)["workflow_mode"] == "auto", "an auto parent still yields auto children")
 
@@ -245,15 +285,21 @@ def test_manual_then_auto_does_not_auto_launch() -> None:
     reset()
     path = write_task(target_agent="developer", workflow_mode="auto")
     td.process_submitted(MANIFESTS)
-    check(len(LAUNCHES) == 1, "CONTRAST: plain auto does launch, so the check above means something")
+    check(
+        len(LAUNCHES) == 1, "CONTRAST: plain auto does launch, so the check above means something"
+    )
 
 
 def test_notify_is_never_launched() -> None:
     print("\nnotify never launches (vikunja#507)")
 
     reset()
-    path = write_task(target_agent="steward", task_type="notify", workflow_mode="auto",
-                      description="verdict: approve")
+    path = write_task(
+        target_agent="steward",
+        task_type="notify",
+        workflow_mode="auto",
+        description="verdict: approve",
+    )
     td.process_submitted(MANIFESTS)
     check(LAUNCHES == [], "no session launched even in auto mode")
     task = read(path)
@@ -264,8 +310,9 @@ def test_notify_is_never_launched() -> None:
 
     # Same in the retry pass: a guard only on the first pass is not a guard.
     reset()
-    path = write_task(target_agent="steward", task_type="notify", workflow_mode="auto",
-                      status="routing-failed")
+    path = write_task(
+        target_agent="steward", task_type="notify", workflow_mode="auto", status="routing-failed"
+    )
     td.process_routing_failed(MANIFESTS)
     check(LAUNCHES == [], "routing-failed retry does not launch it either")
     check(read(path)["status"] == "completed", "routing-failed retry closes it")
@@ -295,8 +342,7 @@ def test_unknown_vocabulary_fails_loudly() -> None:
     reset()
     path = write_task(target_agent="developer", workflow_mode="manual", status="routing-failed")
     td.process_routing_failed(MANIFESTS)
-    check(read(path)["status"] == "routing-failed",
-          "the retry pass is not a way around the guard")
+    check(read(path)["status"] == "routing-failed", "the retry pass is not a way around the guard")
 
     # `workflow` is not in VALID_TASK_TYPES and never was — it is written directly by
     # temporal-workflow-start.sh. The guard must not dead-letter it.
@@ -309,14 +355,19 @@ def test_unknown_vocabulary_fails_loudly() -> None:
 
 def test_vocabulary_is_internally_consistent() -> None:
     print("\nvocabulary")
-    check(td.VALID_WORKFLOW_MODES == {"semi-auto", "auto", "manual-then-auto"},
-          "workflow modes are exactly the three")
-    check(td.SELF_TERMINAL_TASK_TYPES <= td.VALID_TASK_TYPES,
-          "every self-terminal type is a real task type")
+    check(
+        td.VALID_WORKFLOW_MODES == {"semi-auto", "auto", "manual-then-auto"},
+        "workflow modes are exactly the three",
+    )
+    check(
+        td.SELF_TERMINAL_TASK_TYPES <= td.VALID_TASK_TYPES,
+        "every self-terminal type is a real task type",
+    )
     check(td.TERMINAL_STATES is td.TERMINAL_STATUSES, "the alias is the same object")
     check(td.TERMINAL_STATUSES <= td.VALID_STATUSES, "terminal statuses are real statuses")
-    check("manual" not in td.VALID_WORKFLOW_MODES,
-          "`manual` is the launcher's word, not the queue's")
+    check(
+        "manual" not in td.VALID_WORKFLOW_MODES, "`manual` is the launcher's word, not the queue's"
+    )
 
 
 def main() -> int:

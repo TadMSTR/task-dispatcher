@@ -1,3 +1,14 @@
+# ┌──────────────────────────────────────────────────────────────────────────────┐
+# │ TEST FIXTURE — NOT THE LIVE ROSTER.                                          │
+# │                                                                              │
+# │ The roster this dispatcher actually reads is ~/scripts/agent-launch.yml, and │
+# │ it lives in host-forge/scripts because the CloudCLI task-queue plugin reads  │
+# │ the same path. This copy exists only so the tests have something to validate │
+# │ against. Editing it changes NOTHING about how any agent launches.            │
+# │                                                                              │
+# │ It can drift from the live file. That is a known limit of these tests: they  │
+# │ prove the loader and validator are correct, not that the live roster is.     │
+# └──────────────────────────────────────────────────────────────────────────────┘
 # Agent launch policy — the single roster of how each agent's headless session starts.
 #
 # Read by BOTH consumers. Neither may keep its own copy:
@@ -30,11 +41,9 @@
 # agent, which is precisely how steward would get launched as ted.
 #
 # ── The backstop this file cannot weaken ───────────────────────────────────────
-# sudoers pins both the user and the launcher path:
-#     <sudoers rule redacted — sudo pins both the user and the launcher path>
-# So editing `launcher` or `run_as_user` here cannot widen what sudo will execute —
-# sudo refuses anything else. This file selects from what sudoers already permits;
-# it does not grant.
+# sudoers pins both the user and the launcher path, so editing `launcher` or
+# `run_as_user` here cannot widen what sudo will execute — sudo refuses anything else.
+# This file selects from what sudo already permits; it does not grant.
 
 sysadmin:
   project_dir: ~/.claude/projects/sysadmin

@@ -1,0 +1,36 @@
+# gitleaks config for task-dispatcher.
+#
+# Baseline rules plus the credential NAMES this codebase legitimately mentions. The
+# dispatcher resolves SCOPED_MCP_BEARER_TOKEN and ANTHROPIC_API_KEY from per-agent
+# environment files at runtime; it never contains a value for either, and the tests
+# assert it refuses to launch when one is unresolved. Allowlisting the names keeps the
+# scan useful — a scanner that always fires gets ignored, which is how a real leak ships.
+
+[extend]
+useDefault = true
+
+# Deliberately matches the CLASS of internal hostname, not specific ones. Naming the
+# operator's actual domains in a public config file would itself be the disclosure this
+# rule exists to prevent. Host-side scanning can extend this with a private config.
+[[rules]]
+id = "internal-hostname"
+description = "Internal or private-network hostname"
+regex = '''(?i)\bhttps?://[a-z0-9.-]+\.(?:local|internal|lan|home|corp|intranet)\b'''
+tags = ["topology"]
+
+[[rules]]
+id = "rfc1918-address"
+description = "Private network address"
+regex = '''\b(?:10\.\d{1,3}|192\.168|172\.(?:1[6-9]|2\d|3[01]))\.\d{1,3}\.\d{1,3}\b'''
+tags = ["topology"]
+
+[allowlist]
+description = "Credential variable NAMES (never values) and loopback endpoints"
+regexes = [
+  '''SCOPED_MCP_BEARER_TOKEN''',
+  '''ANTHROPIC_API_KEY''',
+  '''ANTHROPIC_AUTH_TOKEN''',
+  '''CLAUDE_CODE_OAUTH_TOKEN''',
+  '''TASK_QUEUE_API_SECRET''',
+  '''127\.0\.0\.1''',
+]

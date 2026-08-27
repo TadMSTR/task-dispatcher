@@ -1,0 +1,44 @@
+[project]
+name = "task-dispatcher"
+version = "1.0.0"
+description = "Forge task dispatcher — the launch-control plane for the agent fleet"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+    "httpx>=0.28,<0.29",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+# agent-bus is the event-log write path for code that cannot call MCP directly. It is
+# optional on purpose: the dispatcher degrades to a no-op logger without it (see cli.py),
+# and it is not published to PyPI, so a hard dependency would make this package
+# uninstallable anywhere but forge.
+bus = ["agent-bus-client"]
+dev = ["ruff==0.16.0", "coverage>=7.0"]
+
+[project.scripts]
+task-dispatcher = "task_dispatcher:_console"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["B", "SIM"]
+
+[tool.coverage.run]
+source = ["task_dispatcher"]
+
+[tool.coverage.report]
+show_missing = true
