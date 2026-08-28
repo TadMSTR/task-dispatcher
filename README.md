@@ -74,18 +74,59 @@ launcher path, so the roster selects from what is already permitted and cannot w
 
 ## Tests
 
-Standalone scripts, not a pytest suite — each exits non-zero on failure:
+Two harnesses, deliberately. Most tests are pytest; six predate it and remain standalone
+scripts with their own `check()` harness, each exiting non-zero on failure.
 
 ```bash
-python tests/test_agent_launch_policy.py       # loader + validator closed sets
-python tests/test_dispatcher_headless_chain.py # launch decisions, nothing spawned
-python tests/test_version_no_roster.py         # --version without a roster
-python tests/test_task_queue_vocabulary.py     # parity with task-queue-mcp (needs network)
+pytest                                          # the unit suite — 207 tests
+
+python tests/test_agent_launch_policy.py        # loader + validator closed sets
+python tests/test_dispatcher_headless_chain.py  # launch decisions, nothing spawned
+python tests/test_version_no_roster.py          # --version without a roster
+python tests/test_gitleaks_gate.py              # the leak gate fires (needs gitleaks)
+python tests/test_task_queue_vocabulary.py      # parity with task-queue-mcp (needs network)
+python tests/test_bus_emitter_live.py           # the bus emitter is real (needs [bus])
 ```
+
+The six are not pytest tests and are excluded from collection (`conftest.py`'s
+`collect_ignore`). Each redirects `$HOME` and imports the dispatcher at module scope with a
+setup specific to what it pins, so importing them under pytest would run their checks at
+collection time against a `$HOME` they did not set up. They keep one CI step each, which is
+also what keeps a failure attributable to a single file.
+
+`tests/test_ci_wiring.py` is what holds that split together: it asserts every
+`tests/test_*.py` is either collected by pytest or named in `collect_ignore` **and** run by
+its own named CI job. Without it, moving a file into `collect_ignore` is a one-line way to
+stop running it while every check stays green.
 
 The vocabulary check has no "no network, skip" path on purpose. A check that quietly
 passes when it could not read the upstream is indistinguishable from one that verified
-something.
+something. The same applies to the gitleaks and bus-emitter gates.
+
+### Coverage
+
+CI enforces a floor of 94%. CI measures 95.19%; a local run measures 94.86% — the small
+gap is environmental and expected, so do not read it as a regression. The floor is a
+ratchet, not a target: raise it when the measured value rises, never lower it to make a
+commit go green.
+
+```bash
+coverage run -p -m pytest -q
+for t in tests/test_agent_launch_policy.py \
+         tests/test_dispatcher_headless_chain.py \
+         tests/test_version_no_roster.py; do
+  coverage run -p --source=task_dispatcher "$t" > /dev/null
+done
+coverage combine && coverage report --fail-under=94
+```
+
+**Both passes are required.** `pytest` alone measures ~90%; the standalone scripts carry the
+remaining ~5 points. Collapsing this to a single `pytest --cov` invocation drops the number
+below the floor and fails for a reason that looks like a regression but is not one.
+
+The three test files not listed above are excluded from measurement because this job does
+not provide what they need (a `gitleaks` binary, the network, the `bus` extra), and none of
+them contributes coverage anyway — each runs the dispatcher in a subprocess or not at all.
 
 ## License
 
