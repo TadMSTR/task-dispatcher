@@ -22,6 +22,7 @@ that forgets to record still cannot send anything.
 from __future__ import annotations
 
 import os
+import subprocess
 import tempfile
 from pathlib import Path
 
@@ -62,6 +63,20 @@ collect_ignore = [
     "test_task_queue_vocabulary.py",
     "test_bus_emitter_live.py",
 ]
+
+
+# `td.subprocess` IS the stdlib subprocess module — the dispatcher does `import subprocess`,
+# it does not hold a private copy. So patching td.subprocess.Popen patches it for the WHOLE
+# process, including any test that wants to run a real child. Captured here before anything
+# stubs it, and handed back by the `real_popen` fixture.
+_REAL_POPEN = subprocess.Popen
+# Same reasoning for the dispatcher's own outbound helpers: `isolate` replaces them for
+# every test, so the one file that tests their real implementations has to get them back.
+# Restoring by name is deliberate — `monkeypatch.undo()` would work, but it reverts the
+# WHOLE fixture, putting TASK_QUEUE_DIR back on the shared home and silently un-isolating
+# the test that called it.
+_REAL_MATRIX_NOTIFY = td.matrix_notify
+_REAL_PUBLISH_NATS = td.publish_nats
 
 
 class FakeProc:
@@ -110,6 +125,28 @@ def isolate(tmp_path, monkeypatch):
 def queue(isolate):
     """The isolated task-queue directory."""
     return isolate
+
+
+@pytest.fixture
+def real_popen(isolate, monkeypatch):
+    """Undo `isolate`'s Popen stub for a test that must run a real child process.
+
+    Depends on `isolate` so it is torn down in the right order and, more importantly, so
+    it always runs AFTER the stub is installed rather than racing it.
+    """
+    monkeypatch.setattr(td.subprocess, "Popen", _REAL_POPEN)
+
+
+@pytest.fixture
+def real_matrix_notify(isolate, monkeypatch):
+    """Restore the real matrix_notify. Its transport must still be stubbed by the test."""
+    monkeypatch.setattr(td, "matrix_notify", _REAL_MATRIX_NOTIFY)
+
+
+@pytest.fixture
+def real_publish_nats(isolate, monkeypatch):
+    """Restore the real publish_nats. Its subprocess.run must still be stubbed."""
+    monkeypatch.setattr(td, "publish_nats", _REAL_PUBLISH_NATS)
 
 
 @pytest.fixture
