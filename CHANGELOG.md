@@ -5,6 +5,97 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2026-08-28
+
+Repairs the agent-bus emitter that v1.0.0 silently killed, stops the dispatcher writing
+41 MB of duplicated unrotated log text, and puts a floor under coverage in CI.
+
+Tracker: vikunja#550; also the code half of vikunja#552.
+
+### Fixed
+
+- **The agent-bus event stream was dead for the entire life of v1.0.0.** The extraction
+  correctly removed a hardcoded `sys.path.insert(0, ~/repos/personal/agent-bus)`, and the
+  `bus` extra meant to replace it asked for `agent-bus-client` — a distribution that does
+  not exist anywhere. The real name is `agent-bus`. Because `cli.py` catches `ImportError`
+  and degrades to a no-op logger, nothing failed, nothing warned, and every event type the
+  dispatcher emits stopped reaching the signed audit trail at 18:32 EDT on 2026-08-27.
+  The dispatcher ran clean and logged clean the whole time.
+
+  The extra now points at `agent-bus @ git+https://github.com/TadMSTR/agent-bus`, pinned by
+  commit SHA rather than by the `v0.3.1` tag it points at: tags are mutable on GitHub and
+  this installs into a root-owned venv.
+
+  Requires agent-bus ≥ v0.3.1, which is what made the client installable without the
+  server's `fastmcp` / `cryptography` / `nats-py` dependencies.
+
+- **Two log sinks, both unrotated, with byte-identical tails.** `logging.basicConfig`
+  installed a `FileHandler` on `~/.claude/task-queue/dispatcher.log` *and* a
+  `StreamHandler`, while cron already redirects stdout to
+  `~/.pm2/logs/task-dispatcher-out.log`. Both files had reached 20.6 MB. The `FileHandler`
+  is gone, making cron's redirect the single sink — chosen over the reverse because that
+  path is the one logrotate bounds under vikunja#552.
+
+  **This moves the dispatcher log.** `~/.claude/task-queue/dispatcher.log` stops being
+  written; the live log is `~/.pm2/logs/task-dispatcher-out.log`. Nothing reads the old
+  path at runtime — verified across `~/repos`, `~/scripts`, `~/.claude/skills` and
+  `~/.claude/manifests` — but documentation referring to it is now stale.
+
+- Roughly 63% of log lines were a 2-minute heartbeat. `=== task-dispatcher run start ===`
+  and `Loaded N agent manifests: [...]` are now DEBUG. The manifest list is also sorted;
+  it was emitted in dict order, which defeats `uniq` and would defeat log-based dedup.
+
+  `=== task-dispatcher run complete ===` **stays at INFO, with its exact wording**, and
+  carries a comment saying so. vikunja#479 may key a Loki `absent_over_time` cron-liveness
+  alert on that string, and demoting it would silence the alert rather than fire it.
+
+### Added
+
+- **`tests/test_bus_emitter_live.py`** — the point of this release. It asserts the emitter
+  is *wired*, not merely that the code imports: that `cli.bus_log.__module__` is
+  `agent_bus_client` rather than the `except ImportError` stub, that calling it writes
+  hash-chained records to the cross-agent log, and that nothing lands in the session log.
+
+  The `try/except ImportError` fallback is deliberately **kept**. A cron job should not die
+  because an optional logging client is missing. What was missing is any assertion that the
+  non-degraded path is the one in production — this is the third configured-but-dead
+  emitter on forge (vikunja#444, #436, #550), and the failure mode is always that success
+  is reported by the absence of an error.
+
+  No skip path: if the extra is not installed the test fails, as `test_gitleaks_gate.py`
+  and `test_task_queue_vocabulary.py` do. A skip would restore the original defect one
+  level up — the suite would go green on exactly the configuration the test exists to
+  reject.
+
+  It also re-derives the emitted event types from `cli.py`'s AST and fails if they disagree
+  with its own list, in either direction. That check found on its first run that the
+  dispatcher emits **six** event types, not the five that vikunja#550, the build plan and
+  the v1.0.0 notes all counted — `task.workflow_started`, from the Temporal branch of
+  `process_submitted()`, had been missed by every previous enumeration and was absent from
+  agent-bus's `CROSS_AGENT_EVENTS` (fixed in agent-bus v0.3.1; the spelling inconsistency
+  is tracked as vikunja#553).
+
+- CI `bus-emitter` job — installs `.[dev,bus]` and runs the above. Separate from `test`
+  because it is the only job installing from a `git+https` ref, so it is the only one that
+  can go red for a network reason rather than a defect in the commit.
+
+- CI `coverage` job — `coverage run -p` per test, `combine`, then
+  `coverage report --fail-under=46`. Coverage was configured in `pyproject.toml` and
+  measured by nobody, so it drifted unobserved. The floor is the measured value of what
+  this release ships, not an aspirational one; raising it is vikunja#551's job.
+
+  46 rather than the 47 the build plan specified — the same measurement. The plan read
+  `coverage report` at precision 0, where 46.56% displays as `47`; deleting the now-unused
+  `LOG_FILE` constant removed a *covered* statement and took it to 46.47%. Nothing
+  regressed, a rounding boundary was crossed. `precision = 2` is now set so the next
+  ratchet cannot hide half a point inside rounding.
+
+### Changed
+
+- Module docstring no longer claims transitions are logged to `dispatcher.log`.
+- `LOG_FILE` removed — nothing wrote to it after the handler change, and a constant naming
+  a file that is never written is worse than no constant.
+
 ## [1.0.0] - 2026-08-27
 
 First release as a standalone package. Previously a single file in a heterogeneous

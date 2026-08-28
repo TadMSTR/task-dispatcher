@@ -7,7 +7,8 @@ Logic:
   1. Process submitted tasks: route to agent, auto-approve or set pending-approval
      - Exponential backoff retry on routing failures (default 3 retries: 5m, 10m, 20m)
   2. Archive terminal tasks past ttl_days
-  3. Log all transitions to dispatcher.log
+  3. Log all transitions to stdout, which cron redirects to
+     ~/.pm2/logs/task-dispatcher-out.log
 """
 
 import contextlib
@@ -39,7 +40,6 @@ TASK_QUEUE_DIR = Path.home() / ".claude" / "task-queue"
 ARCHIVE_DIR = TASK_QUEUE_DIR / "archive"
 DEAD_LETTER_DIR = TASK_QUEUE_DIR / "dead-letters"
 MANIFEST_DIR = Path.home() / ".claude" / "manifests"
-LOG_FILE = TASK_QUEUE_DIR / "dispatcher.log"
 MATRIX_MCP_URL = "http://127.0.0.1:8487/mcp"
 
 # IV-02: the exact 8-4-4-4-12 UUID form, not a loose 36-character hex/dash run. The loose
@@ -275,18 +275,25 @@ AGENT_RUN_AS = {
 }
 
 # --- Logging ---
+# ONE handler. There were two — a FileHandler on ~/.claude/task-queue/dispatcher.log and
+# this StreamHandler — and cron already redirects stdout to
+# ~/.pm2/logs/task-dispatcher-out.log. That produced two 20.6 MB files with byte-identical
+# tails, neither rotating, both still growing.
+#
+# The StreamHandler is the one kept, so cron's redirect is the single sink. That puts the
+# file under ~/.pm2/logs/ where the logrotate config from vikunja#552 bounds it; a file at
+# the old path would be outside anything that rotates. Checked before removing: nothing
+# outside this module reads dispatcher.log at runtime — a grep across ~/repos, ~/scripts,
+# ~/.claude/skills and ~/.claude/manifests returns only documentation references.
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
-    handlers=[
-        logging.FileHandler(LOG_FILE),
-        logging.StreamHandler(sys.stdout),
-    ],
+    handlers=[logging.StreamHandler(sys.stdout)],
 )
 log = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(
     logging.WARNING
-)  # keep matrix_notify()'s own per-request lines out of dispatcher.log
+)  # keep matrix_notify()'s own per-request lines out of the dispatcher log
 
 
 # --- Atomic YAML write ---
@@ -1511,14 +1518,23 @@ def main():
     # before this module is imported, because importing this module loads the roster and
     # raises when it cannot. See the docstring on _console() for why that ordering
     # matters. By the time main() runs, the roster has already loaded successfully.
-    log.info("=== task-dispatcher run start ===")
+    # DEBUG, not INFO. This runs every 2 minutes; these two lines were ~63% of a 20 MB
+    # log that nothing rotated. The `run complete` line below stays at INFO on purpose —
+    # see the comment there.
+    log.debug("=== task-dispatcher run start ===")
     manifests = load_manifests()
-    log.info(f"Loaded {len(manifests)} agent manifests: {list(manifests.keys())}")
+    # Sorted: dict order here is roster-file order, which is arbitrary and unstable across
+    # edits. Unsorted it defeats `uniq` and would defeat log-based dedup in Loki too.
+    log.debug(f"Loaded {len(manifests)} agent manifests: {sorted(manifests)}")
 
     process_submitted(manifests)
     process_routing_failed(manifests)
     archive_expired()
 
+    # KEEP THIS AT INFO AND KEEP THE WORDING. vikunja#479 (generic cron liveness for all
+    # 39 forge cron jobs) may key a Loki `absent_over_time` alert on exactly this string.
+    # Demoting it or rewording it silences that alert rather than firing it — the failure
+    # mode is a liveness check that reports healthy forever.
     log.info("=== task-dispatcher run complete ===")
     return 0
 
