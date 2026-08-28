@@ -105,15 +105,37 @@ jobs:
         run: pip install -e ".[dev]"
 
       # `coverage run -p` per test, then combine. These are standalone scripts, not a
-      # pytest suite, so there is no single process to measure. The bus emitter test is
-      # deliberately NOT included: it needs the git+https extra, and coupling the floor to
-      # a network install would make the gate flaky in the one direction that matters —
-      # a spurious red teaches people to ignore it.
+      # pytest suite, so there is no single process to measure.
+      #
+      # THE GLOB IS DELIBERATE, and so is each exclusion. A new test file is measured
+      # automatically — that is the point of a coverage gate, and an explicit allowlist
+      # would silently stop counting the moment someone added a file and forgot the
+      # second step. The three names below are excluded because this job deliberately
+      # does not provide what they need, NOT because they are inconvenient:
+      #
+      #   test_gitleaks_gate.py       needs the gitleaks binary, installed only in
+      #                               `secret-scan`. This exclusion is not theoretical —
+      #                               it is what made this job's first run red.
+      #   test_task_queue_vocabulary  reads task-queue-mcp's vocabulary over the network;
+      #                               it lives in its own job precisely so an upstream
+      #                               change is not confusable with a defect here.
+      #   test_bus_emitter_live.py    needs the git+https `bus` extra. Coupling the floor
+      #                               to a network install makes the gate flaky in the one
+      #                               direction that matters — a spurious red teaches
+      #                               people to ignore it.
+      #
+      # None of the three contributes coverage anyway: each runs the dispatcher in a
+      # subprocess or not at all, so `coverage combine` reports "skipped" for them. The
+      # floor is identical with and without. They are excluded so the job cannot fail for
+      # a reason that is not about coverage.
       - name: Measure
         run: |
           for t in tests/test_*.py; do
             case "$t" in
-              *test_bus_emitter_live.py) continue ;;
+              *test_gitleaks_gate.py|*test_task_queue_vocabulary.py|*test_bus_emitter_live.py)
+                echo "--- $t (excluded — see comment above)"
+                continue
+                ;;
             esac
             echo "--- $t"
             coverage run -p --source=task_dispatcher "$t" > /dev/null
