@@ -883,6 +883,164 @@ def find_agent(task: dict, manifests: dict) -> str | None:
 
 
 # --- Phase 1: Process submitted tasks ---
+# --- Shared dispatch steps ---
+#
+# Lifted out of process_submitted and process_routing_failed. The first two had two call
+# sites each; request_approval has one, and was extracted so it can be exercised without
+# driving a 156-statement function to reach it.
+
+
+def request_approval(
+    path: Path,
+    task: dict,
+    risk: str,
+    max_auto: str,
+    approval_reason: str,
+    target_agent: str,
+) -> None:
+    """Park a task in pending-approval and tell the operator it is waiting.
+
+    The order is load-bearing: the queue file is written before anything announces the
+    state. A crash between the two leaves a task an operator can still find, rather than
+    an approval request pointing at a task still on disk as `submitted`.
+    """
+    task["status"] = "pending-approval"
+    append_history(task, "pending-approval", "dispatcher", f"Needs approval: {approval_reason}")
+    atomic_write(path, task)
+    publish_nats(
+        "tasks.approval-requested",
+        {
+            "task_id": task.get("id"),
+            "target_agent": target_agent,
+            "risk_level": risk,
+        },
+    )
+    bus_log(
+        "task.dispatched",
+        source="dispatcher",
+        summary=f"Dispatched for approval: {task.get('summary', path.stem)}",
+        target=target_agent,
+        artifact_path=str(path),
+    )
+    log.info(f"{path.name}: → pending-approval (risk={risk}, max_auto={max_auto})")
+    matrix_notify(
+        "approvals",
+        f"[APPROVAL NEEDED] {task.get('summary', path.stem)}",
+        f"Source: {task.get('source_agent')} | Type: {task.get('task_type')} "
+        f"| Risk: {risk} | Agent: {target_agent}\n"
+        f"`task-approve {task.get('id', path.stem)}`",
+    )
+
+
+def approve_and_write(path: Path, task: dict, note: str) -> None:
+    """Mark a task approved, record why in its history, and persist it."""
+    task["status"] = "approved"
+    append_history(task, "approved", "dispatcher", note)
+    atomic_write(path, task)
+
+
+def launch_security_audit(path: Path, task: dict, *, retry: bool = False) -> bool:
+    """Resolve an audit request and launch the security agent headlessly against it.
+
+    Returns True if a session was launched. Returns False when the request could not be
+    validated — in that case handle_routing_failure has already parked the task, and the
+    caller must `continue` rather than fall through to its success tail.
+
+    THIS BLOCK WAS DUPLICATED across process_submitted and process_routing_failed, and it
+    had drifted. Both copies carried the build_name charset check and the
+    relative_to(audit_root) containment check. Only the process_submitted copy carried the
+    TASK_ID_RE guard and passed `Task ID:` in the prompt — so an audit reached by the
+    routing-failed retry path launched with no task id at all, leaving the security agent
+    no way to learn which queue entry to claim and close. Headlessly there is no
+    session-start sweep to fall back on and build_name does not identify a task, so that
+    session had no route to closing its own work. Unifying the two copies fixes it.
+    `retry` now varies the log line and nothing else.
+
+    Still no `summary` in the prompt — that was deliberately removed as a prompt-injection
+    vector, and a malformed id degrades to a literal rather than reaching the prompt.
+    """
+    payload = task.get("payload", {})
+    request_path_str = payload.get("request", "") or next(
+        (r for r in (payload.get("context_refs") or []) if "audit-requests" in r), ""
+    )
+    build_name = (
+        Path(request_path_str).parent.name
+        if request_path_str
+        else next(
+            iter(re.findall(r"audit-requests/([a-zA-Z0-9_\-]+)", payload.get("description", ""))),
+            "unknown",
+        )
+    )
+    # SECURITY[resolved]: reject "unknown" build_name to prevent silent non-functional
+    # audit launches. Audit: 2026-05-29/forge-build-workflow-infra-2026-05.
+    if build_name == "unknown" or not re.fullmatch(r"[a-zA-Z0-9_\-]+", build_name):
+        handle_routing_failure(
+            path, task, f"Invalid or missing build_name in payload: {build_name!r}"
+        )
+        return False
+    audit_root = (Path.home() / ".claude/comms/artifacts/audit-requests").resolve()
+    request_path = (
+        Path(request_path_str).expanduser().resolve()
+        if request_path_str
+        else (audit_root / build_name / "request.md")
+    )
+    # Containment: a payload-supplied `request` path is attacker-adjacent input, and
+    # resolve() has already followed any symlink, so this compares real paths.
+    try:
+        request_path.relative_to(audit_root)
+    except ValueError:
+        handle_routing_failure(path, task, f"request_path outside audit-requests: {request_path}")
+        return False
+    # SECURITY[resolved]: verify request_path exists on disk before launching.
+    # Audit: 2026-05-29/forge-build-workflow-infra-2026-05.
+    if not request_path.exists():
+        handle_routing_failure(path, task, f"request_path does not exist: {request_path}")
+        return False
+    security_project_dir = Path.home() / ".claude" / "projects" / "security"
+    audit_log = Path.home() / ".pm2" / "logs" / f"security-audit-{build_name}.log"
+    # SMCP-28: layer in security agent's .env (SCOPED_MCP_BEARER_TOKEN etc.)
+    audit_env = dict(os.environ)
+    audit_env.update(load_agent_env("security"))
+    if not audit_env.get("SCOPED_MCP_BEARER_TOKEN"):
+        handle_routing_failure(
+            path,
+            task,
+            "SCOPED_MCP_BEARER_TOKEN unresolved for agent 'security' — "
+            "refusing headless audit launch",
+        )
+        return False
+    if not anthropic_creds_usable(audit_env):  # SMCP-29 auth guard
+        alert_auth_blocked("security", task.get("id", "unknown"))
+        handle_routing_failure(
+            path,
+            task,
+            "No usable Anthropic credential (OAuth expired / no "
+            "ANTHROPIC_API_KEY) — refusing headless audit launch",
+        )
+        return False
+    audit_task_id = task.get("id", "unknown")
+    if not TASK_ID_RE.fullmatch(audit_task_id):
+        audit_task_id = "invalid-id"
+    with open(audit_log, "a") as audit_log_fh:
+        proc = subprocess.Popen(
+            [
+                "claude",
+                "-p",
+                "--dangerously-skip-permissions",
+                f"Run security audit for build: {build_name}. "
+                f"Task ID: {audit_task_id}. "
+                f"Request at: {request_path}",
+            ],
+            cwd=str(security_project_dir),
+            stdout=audit_log_fh,
+            stderr=audit_log_fh,
+            env=audit_env,
+        )
+    suffix = "— routing-failed retry" if retry else f"log={audit_log}"
+    log.info(f"{path.name}: headless audit launched for {build_name} (pid={proc.pid}) {suffix}")
+    return True
+
+
 def process_submitted(manifests: dict) -> None:
     for path in sorted(TASK_QUEUE_DIR.glob("*.yml")):
         if path.name.startswith("."):
@@ -1059,34 +1217,7 @@ def process_submitted(manifests: dict) -> None:
         log.info(f"{path.name}: approval={needs_approval} — {approval_reason}")
 
         if needs_approval:
-            task["status"] = "pending-approval"
-            append_history(
-                task, "pending-approval", "dispatcher", f"Needs approval: {approval_reason}"
-            )
-            atomic_write(path, task)
-            publish_nats(
-                "tasks.approval-requested",
-                {
-                    "task_id": task.get("id"),
-                    "target_agent": target_agent,
-                    "risk_level": risk,
-                },
-            )
-            bus_log(
-                "task.dispatched",
-                source="dispatcher",
-                summary=f"Dispatched for approval: {task.get('summary', path.stem)}",
-                target=target_agent,
-                artifact_path=str(path),
-            )
-            log.info(f"{path.name}: → pending-approval (risk={risk}, max_auto={max_auto})")
-            matrix_notify(
-                "approvals",
-                f"[APPROVAL NEEDED] {task.get('summary', path.stem)}",
-                f"Source: {task.get('source_agent')} | Type: {task.get('task_type')} "
-                f"| Risk: {risk} | Agent: {target_agent}\n"
-                f"`task-approve {task.get('id', path.stem)}`",
-            )
+            request_approval(path, task, risk, max_auto, approval_reason, target_agent)
         else:
             task["status"] = "approved"
             append_history(task, "approved", "dispatcher", f"Auto-approved: {approval_reason}")
@@ -1127,100 +1258,8 @@ def process_submitted(manifests: dict) -> None:
             # would stall every build at the same point. Recorded here because it reads
             # like an oversight and has been questioned more than once.
             elif task.get("task_type") == "audit" and target_agent == "security":
-                payload = task.get("payload", {})
-                request_path_str = payload.get("request", "") or next(
-                    (r for r in (payload.get("context_refs") or []) if "audit-requests" in r), ""
-                )
-                build_name = (
-                    Path(request_path_str).parent.name
-                    if request_path_str
-                    else next(
-                        iter(
-                            re.findall(
-                                r"audit-requests/([a-zA-Z0-9_\-]+)", payload.get("description", "")
-                            )
-                        ),
-                        "unknown",
-                    )
-                )
-                # SECURITY[resolved]: reject "unknown" build_name to prevent silent
-                # non-functional audit launches.
-                # Audit: 2026-05-29/forge-build-workflow-infra-2026-05.
-                if build_name == "unknown" or not re.fullmatch(r"[a-zA-Z0-9_\-]+", build_name):
-                    handle_routing_failure(
-                        path, task, f"Invalid or missing build_name in payload: {build_name!r}"
-                    )
+                if not launch_security_audit(path, task):
                     continue
-                audit_root = (Path.home() / ".claude/comms/artifacts/audit-requests").resolve()
-                request_path = (
-                    Path(request_path_str).expanduser().resolve()
-                    if request_path_str
-                    else (audit_root / build_name / "request.md")
-                )
-                try:
-                    request_path.relative_to(audit_root)
-                except ValueError:
-                    handle_routing_failure(
-                        path, task, f"request_path outside audit-requests: {request_path}"
-                    )
-                    continue
-                # SECURITY[resolved]: verify request_path exists on disk before launching.
-                # Audit: 2026-05-29/forge-build-workflow-infra-2026-05.
-                if not request_path.exists():
-                    handle_routing_failure(
-                        path, task, f"request_path does not exist: {request_path}"
-                    )
-                    continue
-                security_project_dir = Path.home() / ".claude" / "projects" / "security"
-                audit_log = Path.home() / ".pm2" / "logs" / f"security-audit-{build_name}.log"
-                # SMCP-28: layer in security agent's .env (SCOPED_MCP_BEARER_TOKEN etc.)
-                audit_env = dict(os.environ)
-                audit_env.update(load_agent_env("security"))
-                if not audit_env.get("SCOPED_MCP_BEARER_TOKEN"):
-                    handle_routing_failure(
-                        path,
-                        task,
-                        "SCOPED_MCP_BEARER_TOKEN unresolved for agent 'security' — "
-                        "refusing headless audit launch",
-                    )
-                    continue
-                if not anthropic_creds_usable(audit_env):  # SMCP-29 auth guard
-                    alert_auth_blocked("security", task.get("id", "unknown"))
-                    handle_routing_failure(
-                        path,
-                        task,
-                        "No usable Anthropic credential (OAuth expired / no "
-                        "ANTHROPIC_API_KEY) — refusing headless audit launch",
-                    )
-                    continue
-                # Name the task in the prompt. Headlessly this is the only way the security
-                # agent learns which queue entry to claim and close — it has no session-start
-                # sweep to fall back on, and build_name alone does not identify a task. Same
-                # guard as launch_agent_headless: a malformed id degrades to a literal rather
-                # than reaching the prompt. Still no `summary` — that was deliberately
-                # removed as a prompt-injection vector.
-                audit_task_id = task.get("id", "unknown")
-                if not TASK_ID_RE.fullmatch(audit_task_id):
-                    audit_task_id = "invalid-id"
-                with open(audit_log, "a") as audit_log_fh:
-                    proc = subprocess.Popen(
-                        [
-                            "claude",
-                            "-p",
-                            "--dangerously-skip-permissions",
-                            f"Run security audit for build: {build_name}. "
-                            f"Task ID: {audit_task_id}. "
-                            f"Request at: {request_path}",
-                        ],
-                        cwd=str(security_project_dir),
-                        stdout=audit_log_fh,
-                        stderr=audit_log_fh,
-                        env=audit_env,
-                    )
-                log.info(
-                    f"{path.name}: headless audit launched for {build_name} "
-                    f"(pid={proc.pid}) log={audit_log}"
-                )
             else:
                 workflow_mode = task.get("workflow_mode", "semi-auto")
                 # DO NOT rewrite this as `!= "semi-auto"`. It reads like a tidy-up and it
@@ -1408,85 +1447,9 @@ def process_routing_failed(manifests: dict) -> None:
             continue
 
         if task.get("task_type") == "audit" and target_agent == "security":
-            payload = task.get("payload", {})
-            request_path_str = payload.get("request", "") or next(
-                (r for r in (payload.get("context_refs") or []) if "audit-requests" in r), ""
-            )
-            build_name = (
-                Path(request_path_str).parent.name
-                if request_path_str
-                else next(
-                    iter(
-                        re.findall(
-                            r"audit-requests/([a-zA-Z0-9_\-]+)", payload.get("description", "")
-                        )
-                    ),
-                    "unknown",
-                )
-            )
-            if build_name == "unknown" or not re.fullmatch(r"[a-zA-Z0-9_\-]+", build_name):
-                handle_routing_failure(
-                    path, task, f"Invalid or missing build_name in payload: {build_name!r}"
-                )
+            if not launch_security_audit(path, task, retry=True):
                 continue
-            audit_root = (Path.home() / ".claude/comms/artifacts/audit-requests").resolve()
-            request_path = (
-                Path(request_path_str).expanduser().resolve()
-                if request_path_str
-                else (audit_root / build_name / "request.md")
-            )
-            try:
-                request_path.relative_to(audit_root)
-            except ValueError:
-                handle_routing_failure(
-                    path, task, f"request_path outside audit-requests: {request_path}"
-                )
-                continue
-            if not request_path.exists():
-                handle_routing_failure(path, task, f"request_path does not exist: {request_path}")
-                continue
-            security_project_dir = Path.home() / ".claude" / "projects" / "security"
-            audit_log = Path.home() / ".pm2" / "logs" / f"security-audit-{build_name}.log"
-            # SMCP-28: layer in security agent's .env (SCOPED_MCP_BEARER_TOKEN etc.)
-            audit_env = dict(os.environ)
-            audit_env.update(load_agent_env("security"))
-            if not audit_env.get("SCOPED_MCP_BEARER_TOKEN"):
-                handle_routing_failure(
-                    path,
-                    task,
-                    "SCOPED_MCP_BEARER_TOKEN unresolved for agent 'security' — "
-                    "refusing headless audit launch",
-                )
-                continue
-            if not anthropic_creds_usable(audit_env):  # SMCP-29 auth guard
-                alert_auth_blocked("security", task.get("id", "unknown"))
-                handle_routing_failure(
-                    path,
-                    task,
-                    "No usable Anthropic credential (OAuth expired / no "
-                    "ANTHROPIC_API_KEY) — refusing headless audit launch",
-                )
-                continue
-            with open(audit_log, "a") as audit_log_fh:
-                proc = subprocess.Popen(
-                    [
-                        "claude",
-                        "-p",
-                        "--dangerously-skip-permissions",
-                        f"Run security audit for build: {build_name}. Request at: {request_path}",
-                    ],
-                    cwd=str(security_project_dir),
-                    stdout=audit_log_fh,
-                    stderr=audit_log_fh,
-                    env=audit_env,
-                )
-            task["status"] = "approved"
-            append_history(task, "approved", "dispatcher", "Routing retry succeeded")
-            atomic_write(path, task)
-            log.info(
-                f"{path.name}: headless audit launched for {build_name} "
-                f"(pid={proc.pid}) — routing-failed retry"
-            )
+            approve_and_write(path, task, "Routing retry succeeded")
             continue
 
         # Generic task: launch headless or queue for operator pickup.
@@ -1506,9 +1469,7 @@ def process_routing_failed(manifests: dict) -> None:
                 f"Task ID: {task_id}\nFrom: {source} | Risk: {risk}\n"
                 f"Resume: Check task queue (id={task_id}) and run shared-build-review.",
             )
-        task["status"] = "approved"
-        append_history(task, "approved", "dispatcher", "Routing retry succeeded")
-        atomic_write(path, task)
+        approve_and_write(path, task, "Routing retry succeeded")
         log.info(f"{path.name}: → approved (routing-failed retry, workflow_mode={workflow_mode})")
 
 

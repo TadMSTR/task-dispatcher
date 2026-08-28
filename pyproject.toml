@@ -1,6 +1,6 @@
 [project]
 name = "task-dispatcher"
-version = "1.1.0"
+version = "1.2.0"
 description = "Forge task dispatcher — the launch-control plane for the agent fleet"
 requires-python = ">=3.11"
 license = { text = "MIT" }
@@ -26,7 +26,7 @@ dependencies = [
 bus = [
     "agent-bus @ git+https://github.com/TadMSTR/agent-bus@3a2254533012ae08443952a4bcfee3fc5e044a12",
 ]
-dev = ["ruff==0.16.0", "coverage>=7.0"]
+dev = ["ruff==0.16.0", "coverage>=7.0", "pytest>=8.0", "pytest-cov>=5.0"]
 
 [project.scripts]
 task-dispatcher = "task_dispatcher:_console"
@@ -47,6 +47,13 @@ select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**/*.py" = ["B", "SIM"]
+
+# The pytest suite covers the units. It does NOT cover the six standalone scripts in
+# tests/ — those predate it, each redirects $HOME and runs its own check() harness at
+# import, and each is still its own CI step so a failure stays attributable to one file.
+# conftest.py's collect_ignore keeps pytest from importing them; ci.yml keeps running them.
+[tool.pytest.ini_options]
+testpaths = ["tests"]
 
 [tool.coverage.run]
 source = ["task_dispatcher"]
