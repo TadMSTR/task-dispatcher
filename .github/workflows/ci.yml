@@ -33,10 +33,24 @@ jobs:
       - name: Ruff format check
         run: ruff format --check .
 
-      # Each test is its own step. These are standalone scripts with their own check()
-      # harness, not a pytest suite, and they exit non-zero on failure. Running them in
-      # one step would let an early failure mask the ones after it — and a multi-command
-      # step that stops at the first failure reports "the suite ran" when it did not.
+      # The pytest suite. One step, because pytest reports EVERY failure in the run
+      # rather than stopping at the first — which is the property the per-file steps
+      # below exist to provide, and the reason those cannot simply be folded in here.
+      - name: unit tests
+        run: pytest
+
+      # Each of the three below is its own step. These are standalone scripts with their
+      # own check() harness, not pytest tests, and they exit non-zero on failure. Running
+      # them in one step would let an early failure mask the ones after it — and a
+      # multi-command step that stops at the first failure reports "the suite ran" when it
+      # did not.
+      #
+      # They are NOT being migrated to pytest. Each redirects $HOME and imports the
+      # dispatcher at module scope with a setup specific to what it pins, and the value of
+      # rewriting 1,182 lines of working, carefully-commented tests is zero coverage and a
+      # non-zero chance of losing an assertion. conftest.py's collect_ignore keeps pytest
+      # from importing them; tests/test_ci_wiring.py asserts each one is still named here,
+      # so moving a file into collect_ignore cannot silently stop running it.
       - name: agent launch policy
         run: python tests/test_agent_launch_policy.py
 
@@ -80,17 +94,18 @@ jobs:
       - name: bus emitter is live
         run: python tests/test_bus_emitter_live.py
 
-  # Coverage is a floor, not a report. It was configured in pyproject.toml and measured by
-  # nobody, so it drifted unobserved. The number here is the MEASURED value of what this
-  # build ships — deliberately not an aspirational one, because a floor above the current
-  # value makes this build red for reasons that have nothing to do with it. Raising it to
-  # 80 is vikunja#551's job, and that build re-measures against whatever this one ships.
+  # Coverage is a floor, not a report. It was configured in pyproject.toml and measured
+  # by nobody, so it drifted unobserved.
   #
-  # 46, not the 47 the build plan specified. Both are the same measurement: the plan read
-  # `coverage report` at precision 0, where 46.56% displays as "47". This build then
-  # dropped it to 46.47% by deleting the now-unused LOG_FILE constant — removing a COVERED
-  # statement lowers the ratio. Nothing regressed; a rounding boundary was crossed. That is
-  # also why `precision = 2` is now set in pyproject.toml.
+  # 94, and the number is the MEASURED value of what this build ships (94.86%), not an
+  # aspirational one — same rule as when this job was added at 46. The build plan asked
+  # for 80; 80 would pass today while allowing fifteen points of silent regression, which
+  # is the failure mode a floor exists to prevent. It is a ratchet: raise it when the
+  # measured value rises, and never lower it to make a commit go green.
+  #
+  # `precision = 2` in pyproject.toml is what makes this safe to set close to the measured
+  # value. At precision 0 a real regression of half a point hides inside a rounding
+  # boundary — this repo has already crossed one (46.56% displaying as "47").
   coverage:
     runs-on: ubuntu-latest
     steps:
@@ -104,14 +119,22 @@ jobs:
       - name: Install dependencies
         run: pip install -e ".[dev]"
 
-      # `coverage run -p` per test, then combine. These are standalone scripts, not a
-      # pytest suite, so there is no single process to measure.
+      # Two measured passes, combined. The pytest suite runs as one process; the three
+      # standalone scripts each run as their own, because that is what they are.
       #
-      # THE GLOB IS DELIBERATE, and so is each exclusion. A new test file is measured
-      # automatically — that is the point of a coverage gate, and an explicit allowlist
-      # would silently stop counting the moment someone added a file and forgot the
-      # second step. The three names below are excluded because this job deliberately
-      # does not provide what they need, NOT because they are inconvenient:
+      # THE PYTEST STEP NEEDS NO ALLOWLIST — a new pytest file is collected, and therefore
+      # measured, automatically. That was the point of the glob this replaces, and it is
+      # preserved rather than lost.
+      #
+      # The three names below are spelled out instead of globbed because they are now a
+      # closed and shrinking set, and because a glob over tests/ would also match the
+      # pytest files and run each as a bare script: that exits 0 having executed no
+      # assertions and contributes no coverage, which looks identical to success.
+      # tests/test_ci_wiring.py asserts this list stays in step with conftest's
+      # collect_ignore, so a file cannot end up in neither.
+      #
+      # Three test files are measured by NEITHER pass, and each exclusion is because this
+      # job deliberately does not provide what they need:
       #
       #   test_gitleaks_gate.py       needs the gitleaks binary, installed only in
       #                               `secret-scan`. This exclusion is not theoretical —
@@ -125,27 +148,24 @@ jobs:
       #                               people to ignore it.
       #
       # None of the three contributes coverage anyway: each runs the dispatcher in a
-      # subprocess or not at all, so `coverage combine` reports "skipped" for them. The
-      # floor is identical with and without. They are excluded so the job cannot fail for
-      # a reason that is not about coverage.
-      - name: Measure
+      # subprocess or not at all. They are excluded so the job cannot fail for a reason
+      # that is not about coverage.
+      - name: Measure the pytest suite
+        run: coverage run -p -m pytest -q
+
+      - name: Measure the standalone scripts
         run: |
-          for t in tests/test_*.py; do
-            case "$t" in
-              *test_gitleaks_gate.py|*test_task_queue_vocabulary.py|*test_bus_emitter_live.py)
-                echo "--- $t (excluded — see comment above)"
-                continue
-                ;;
-            esac
+          for t in tests/test_agent_launch_policy.py \
+                   tests/test_dispatcher_headless_chain.py \
+                   tests/test_version_no_roster.py; do
+            test -f "$t" || { echo "::error::$t is named in ci.yml but does not exist"; exit 1; }
             echo "--- $t"
             coverage run -p --source=task_dispatcher "$t" > /dev/null
           done
           coverage combine
 
-      # --fail-under is the whole point of the job. `coverage report` alone exits 0 no
-      # matter what it prints, which is how a coverage step ends up decorative.
       - name: Report and enforce the floor
-        run: coverage report --fail-under=46
+        run: coverage report --fail-under=94
 
   # Secret scanning ran only on the developer's workstation before this. The config
   # shipped; nothing in CI executed it, so the repo had a leak gate in name only — on a

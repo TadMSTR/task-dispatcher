@@ -5,6 +5,64 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-08-28
+
+Deduplicates the audit-launch block that had drifted between the two dispatch functions,
+and takes test coverage from 46.47% to 94.86% with the CI floor ratcheted to match.
+
+Tracker: vikunja#551.
+
+### Fixed
+
+- **An audit relaunched by the routing-failed retry path had no task id in its prompt.**
+  `process_submitted` and `process_routing_failed` carried the same 19-statement
+  audit-launch block, and it had drifted: only the `process_submitted` copy validated the
+  task id against `TASK_ID_RE` and passed `Task ID:` in the prompt. Headlessly there is no
+  session-start sweep to fall back on and `build_name` does not identify a queue entry, so
+  a security agent launched by the retry path had no route to claiming or closing its own
+  work. The two copies are now one function and both call sites pass the id.
+
+  The build plan recorded the copies as differing by one comment and one line wrap. They
+  differed by that and by this.
+
+### Changed
+
+- **Three blocks extracted from the two dispatch functions**, with no other behaviour
+  change. `launch_security_audit()` (two call sites), `approve_and_write()` (two),
+  `request_approval()` (one — extracted for testability, not for duplication). The
+  `relative_to(audit_root)` traversal-containment check now exists once instead of twice.
+  All six pre-existing test files pass unmodified, which is the check that an extraction
+  did not quietly change something.
+
+- **CI coverage floor raised from 46 to 94.** The measured value of what this release
+  ships is 94.86%. The build plan asked for 80; 80 would pass today while permitting
+  fifteen points of silent regression, so the floor follows this repo's existing rule that
+  it is the measured value and a ratchet.
+
+- **New tests are pytest; the six standalone scripts stay standalone.** Each of those
+  redirects `$HOME` and imports the dispatcher at module scope with a setup specific to
+  what it pins, and rewriting 1,182 lines of working tests buys no coverage. They keep
+  their own CI steps so a failure stays attributable to one file.
+
+### Added
+
+- **Test coverage 46.47% -> 94.86%** (`cli.py` 46.90% -> 94.75%; `__init__.py` and
+  `__main__.py` both 0-or-partial -> 100%). 207 tests across ten new pytest files, covering
+  the surface that only runs when something goes wrong: the whole retry and re-dispatch
+  path, TTL archival, dead-lettering, Matrix notification, the Temporal launch, the auth
+  guard, both launchers' refusal branches, and a full `main()` tick.
+
+  `tests/test_security_audit.py` is the suite the traversal-containment check never had —
+  it was uncovered in both copies, so "the existing tests still pass" was never evidence
+  the extraction preserved it. Mutation-verified: 12/12 injected defects caught, including
+  `resolve()` -> `os.path.normpath`, which reads as a simplification and is caught only by
+  the symlink case.
+
+- **`tests/test_ci_wiring.py`** — asserts every test file is either collected by pytest or
+  named in `conftest.collect_ignore`, and that each ignored script is run by its specific
+  CI job. Adding a test file was a two-step operation here and the second step is easy to
+  forget; a pytest file listed in `collect_ignore` is run by nothing while CI stays green.
+
 ## [1.1.0] - 2026-08-28
 
 Repairs the agent-bus emitter that v1.0.0 silently killed, stops the dispatcher writing
