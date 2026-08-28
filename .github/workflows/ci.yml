@@ -46,6 +46,107 @@ jobs:
       - name: --version without a roster
         run: python tests/test_version_no_roster.py
 
+  # SEPARATE JOB, because it is the only one that installs from a git+https ref and so
+  # the only one that can go red for a network or upstream reason rather than for a
+  # defect in this commit. Folding it into `test` would make a GitHub outage look like a
+  # broken emitter.
+  #
+  # This is the job that would have caught vikunja#550. The `bus` extra named a
+  # distribution that does not exist, so it never resolved; cli.py catches ImportError and
+  # degrades to a no-op logger, and six event types went missing from the signed audit
+  # trail for the whole life of v1.0.0 with every check green. Installing the extra is not
+  # enough on its own — the test asserts the import actually bound the real client and
+  # that calling it writes a chained record.
+  bus-emitter:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.13"
+
+      - name: Install with the bus extra
+        run: pip install -e ".[dev,bus]"
+
+      # Proves the extra resolved to the real distribution before the test runs, so a
+      # failure below is about wiring rather than about installation.
+      - name: The extra resolved
+        run: |
+          pip show agent-bus
+          python -c "import agent_bus_client; print(agent_bus_client.__file__)"
+
+      - name: bus emitter is live
+        run: python tests/test_bus_emitter_live.py
+
+  # Coverage is a floor, not a report. It was configured in pyproject.toml and measured by
+  # nobody, so it drifted unobserved. The number here is the MEASURED value of what this
+  # build ships — deliberately not an aspirational one, because a floor above the current
+  # value makes this build red for reasons that have nothing to do with it. Raising it to
+  # 80 is vikunja#551's job, and that build re-measures against whatever this one ships.
+  #
+  # 46, not the 47 the build plan specified. Both are the same measurement: the plan read
+  # `coverage report` at precision 0, where 46.56% displays as "47". This build then
+  # dropped it to 46.47% by deleting the now-unused LOG_FILE constant — removing a COVERED
+  # statement lowers the ratio. Nothing regressed; a rounding boundary was crossed. That is
+  # also why `precision = 2` is now set in pyproject.toml.
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: pip install -e ".[dev]"
+
+      # `coverage run -p` per test, then combine. These are standalone scripts, not a
+      # pytest suite, so there is no single process to measure.
+      #
+      # THE GLOB IS DELIBERATE, and so is each exclusion. A new test file is measured
+      # automatically — that is the point of a coverage gate, and an explicit allowlist
+      # would silently stop counting the moment someone added a file and forgot the
+      # second step. The three names below are excluded because this job deliberately
+      # does not provide what they need, NOT because they are inconvenient:
+      #
+      #   test_gitleaks_gate.py       needs the gitleaks binary, installed only in
+      #                               `secret-scan`. This exclusion is not theoretical —
+      #                               it is what made this job's first run red.
+      #   test_task_queue_vocabulary  reads task-queue-mcp's vocabulary over the network;
+      #                               it lives in its own job precisely so an upstream
+      #                               change is not confusable with a defect here.
+      #   test_bus_emitter_live.py    needs the git+https `bus` extra. Coupling the floor
+      #                               to a network install makes the gate flaky in the one
+      #                               direction that matters — a spurious red teaches
+      #                               people to ignore it.
+      #
+      # None of the three contributes coverage anyway: each runs the dispatcher in a
+      # subprocess or not at all, so `coverage combine` reports "skipped" for them. The
+      # floor is identical with and without. They are excluded so the job cannot fail for
+      # a reason that is not about coverage.
+      - name: Measure
+        run: |
+          for t in tests/test_*.py; do
+            case "$t" in
+              *test_gitleaks_gate.py|*test_task_queue_vocabulary.py|*test_bus_emitter_live.py)
+                echo "--- $t (excluded — see comment above)"
+                continue
+                ;;
+            esac
+            echo "--- $t"
+            coverage run -p --source=task_dispatcher "$t" > /dev/null
+          done
+          coverage combine
+
+      # --fail-under is the whole point of the job. `coverage report` alone exits 0 no
+      # matter what it prints, which is how a coverage step ends up decorative.
+      - name: Report and enforce the floor
+        run: coverage report --fail-under=46
+
   # Secret scanning ran only on the developer's workstation before this. The config
   # shipped; nothing in CI executed it, so the repo had a leak gate in name only — on a
   # public remote. This job runs the scan over full history AND asserts the gate still

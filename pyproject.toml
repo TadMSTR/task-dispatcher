@@ -1,6 +1,6 @@
 [project]
 name = "task-dispatcher"
-version = "1.0.0"
+version = "1.1.0"
 description = "Forge task dispatcher — the launch-control plane for the agent fleet"
 requires-python = ">=3.11"
 license = { text = "MIT" }
@@ -10,11 +10,22 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# agent-bus is the event-log write path for code that cannot call MCP directly. It is
-# optional on purpose: the dispatcher degrades to a no-op logger without it (see cli.py),
-# and it is not published to PyPI, so a hard dependency would make this package
-# uninstallable anywhere but forge.
-bus = ["agent-bus-client"]
+# agent-bus is the event-log write path for code that cannot call MCP directly. Optional
+# on purpose: the dispatcher degrades to a no-op logger without it (see cli.py), and it is
+# not on PyPI, so a hard dependency would make this package uninstallable wherever the VCS
+# ref is unreachable — a private CI runner, an air-gapped host.
+#
+# THE NAME WAS WRONG UNTIL v1.1.0. This asked for `agent-bus-client`, which is not a
+# distribution that exists anywhere; the real name is `agent-bus`. So the extra could never
+# resolve, and because cli.py catches ImportError and degrades silently, nothing ever said
+# so. Five event types went missing from the signed audit trail for the whole life of
+# v1.0.0. tests/test_bus_emitter_live.py is what makes a repeat loud.
+#
+# Pinned by commit SHA, not by the `v0.3.1` tag it points at: git tags are mutable on
+# GitHub, and this installs into a root-owned venv on forge.
+bus = [
+    "agent-bus @ git+https://github.com/TadMSTR/agent-bus@3a2254533012ae08443952a4bcfee3fc5e044a12",
+]
 dev = ["ruff==0.16.0", "coverage>=7.0"]
 
 [project.scripts]
@@ -42,3 +53,8 @@ source = ["task_dispatcher"]
 
 [tool.coverage.report]
 show_missing = true
+# Two decimals because the CI floor is a ratchet and the next build (vikunja#551) raises
+# it. At precision 0 the reported number rounds, so a real regression of half a point can
+# hide inside a rounding boundary — and a real improvement of half a point cannot be
+# claimed. This build hit exactly that: 46.56% displayed as "47".
+precision = 2

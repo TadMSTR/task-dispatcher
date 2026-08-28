@@ -74,6 +74,56 @@ with tempfile.TemporaryDirectory() as tmp:
         "raises LaunchPolicyError rather than degrading to an empty roster",
     )
 
+# --- version parity -------------------------------------------------------------------
+# The two spellings of the version can drift, and --version is the surface that answers
+# "what is actually installed in /opt/venvs/task-dispatcher" (vikunja#535 gap 4). A
+# --version that reports 1.0.0 while the deployed package is 1.1.0 does not merely fail to
+# help — it actively asserts the wrong answer to the one question it exists for, and the
+# drift check reports agreement with whatever it is compared against.
+#
+# pyproject.toml is read as TEXT, not via importlib.metadata. Metadata reflects what is
+# *installed*, which under an editable install is whatever was there at `pip install -e`
+# time — so a metadata-based check compares __init__.py against a stale copy of itself and
+# passes while the source disagrees.
+print("\npyproject.toml and __version__ agree")
+
+pyproject = (REPO_ROOT / "pyproject.toml").read_text()
+declared = None
+for line in pyproject.splitlines():
+    if line.startswith("version = "):
+        declared = line.split("=", 1)[1].strip().strip('"')
+        break
+
+check(declared is not None, "pyproject.toml declares a version")
+
+module_version = None
+for line in (REPO_ROOT / "src" / "task_dispatcher" / "__init__.py").read_text().splitlines():
+    if line.startswith("__version__ = "):
+        module_version = line.split("=", 1)[1].strip().strip('"')
+        break
+
+check(module_version is not None, "__init__.py declares __version__")
+check(
+    declared == module_version,
+    f"they match (pyproject={declared!r}, __version__={module_version!r})",
+)
+
+# And the version --version actually prints is that one, not a third thing.
+with tempfile.TemporaryDirectory() as tmp:
+    env = dict(os.environ, HOME=tmp, PYTHONPATH=str(REPO_ROOT / "src"))
+    env.pop("AGENT_LAUNCH_POLICY", None)
+    r = subprocess.run(
+        [sys.executable, "-m", "task_dispatcher", "--version"],
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=tmp,
+    )
+    check(
+        r.stdout.strip() == f"task-dispatcher {declared}",
+        f"--version prints it (got {r.stdout.strip()!r}, expected 'task-dispatcher {declared}')",
+    )
+
 print()
 if FAILURES:
     print(f"{len(FAILURES)} check(s) FAILED:")
