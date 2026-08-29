@@ -157,7 +157,7 @@ def test_int_env_survives_a_typo(dispatcher, monkeypatch):
 
 
 def test_n_plus_2_auto_tasks_against_a_cap_of_n(
-    dispatcher, launches, live_pids, monkeypatch, write_task
+    dispatcher, launches, live_pids, launchable, monkeypatch, write_task
 ):
     """The plan's own verification, as a test.
 
@@ -182,7 +182,7 @@ def test_n_plus_2_auto_tasks_against_a_cap_of_n(
 
 
 def test_a_held_task_is_untouched_not_annotated(
-    dispatcher, launches, live_pids, monkeypatch, write_task
+    dispatcher, launches, live_pids, launchable, monkeypatch, write_task
 ):
     """No new status, and no history entry either.
 
@@ -202,7 +202,9 @@ def test_a_held_task_is_untouched_not_annotated(
     assert path.read_bytes() == before
 
 
-def test_a_semi_auto_task_is_never_held(dispatcher, launches, live_pids, monkeypatch, write_task):
+def test_a_semi_auto_task_is_never_held(
+    dispatcher, launches, live_pids, launchable, monkeypatch, write_task
+):
     """The cap counts sessions. An operator-pickup task starts none, so it must not queue
     behind one."""
     monkeypatch.setattr(dispatcher, "MAX_CONCURRENT_RUNS", 1)
@@ -216,7 +218,7 @@ def test_a_semi_auto_task_is_never_held(dispatcher, launches, live_pids, monkeyp
 
 
 def test_an_auth_outage_holds_launches_at_submitted(
-    dispatcher, launches, live_pids, monkeypatch, write_task
+    dispatcher, launches, live_pids, launchable, monkeypatch, write_task
 ):
     """alert_auth_blocked() debounced the alert but not the attempt, so a dead OAuth sent
     every queued task to routing-failed with a backoff. Holding costs nothing."""
@@ -230,7 +232,7 @@ def test_an_auth_outage_holds_launches_at_submitted(
 
 
 def test_a_stale_auth_stamp_does_not_hold_launches(
-    dispatcher, launches, live_pids, monkeypatch, write_task
+    dispatcher, launches, live_pids, launchable, monkeypatch, write_task
 ):
     monkeypatch.setattr(dispatcher, "AUTH_ALERT_DEBOUNCE_SEC", 1)
     dispatcher.AUTH_ALERT_STAMP.write_text("2020-01-01T00:00:00+00:00")
@@ -421,7 +423,7 @@ def test_a_tick_reaps_before_it_dispatches(dispatcher, monkeypatch):
 
 
 def test_a_dead_runs_record_holds_no_slot_through_a_whole_tick(
-    dispatcher, launches, live_pids, monkeypatch, write_task
+    dispatcher, launches, live_pids, launchable, monkeypatch, write_task
 ):
     """An open record for a dead process must not gate the next launch, at any point.
 

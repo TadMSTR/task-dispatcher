@@ -22,7 +22,7 @@ import pytest
 # --- load_agent_env ----------------------------------------------------------------
 
 
-def test_load_agent_env_returns_empty_when_the_file_is_absent(dispatcher):
+def test_load_agent_env_returns_empty_when_the_file_is_absent(dispatcher, real_load_agent_env):
     """/opt/appdata/agents/<agent>/.env does not exist for every agent, and must not raise."""
     assert dispatcher.load_agent_env("no-such-agent-xyz") == {}
 
@@ -42,39 +42,51 @@ def _parse(dispatcher, monkeypatch, tmp_path, content: str) -> dict:
     return dispatcher.load_agent_env("security")
 
 
-def test_load_agent_env_parses_key_value_lines(dispatcher, monkeypatch, tmp_path):
+def test_load_agent_env_parses_key_value_lines(
+    dispatcher, monkeypatch, tmp_path, real_load_agent_env
+):
     got = _parse(dispatcher, monkeypatch, tmp_path, "SCOPED_MCP_BEARER_TOKEN=abc\nOTHER=1\n")
 
     assert got == {"SCOPED_MCP_BEARER_TOKEN": "abc", "OTHER": "1"}
 
 
-def test_load_agent_env_strips_quotes_and_whitespace(dispatcher, monkeypatch, tmp_path):
+def test_load_agent_env_strips_quotes_and_whitespace(
+    dispatcher, monkeypatch, tmp_path, real_load_agent_env
+):
     """run-scoped-mcp-http.sh writes both quoted and bare forms; both must parse the same."""
     got = _parse(dispatcher, monkeypatch, tmp_path, "  A=\"dq\"  \nB='sq'\nC= bare \n")
 
     assert got == {"A": "dq", "B": "sq", "C": "bare"}
 
 
-def test_load_agent_env_skips_comments_and_blanks(dispatcher, monkeypatch, tmp_path):
+def test_load_agent_env_skips_comments_and_blanks(
+    dispatcher, monkeypatch, tmp_path, real_load_agent_env
+):
     got = _parse(dispatcher, monkeypatch, tmp_path, "# a comment\n\n   \nA=1\n")
 
     assert got == {"A": "1"}
 
 
-def test_load_agent_env_skips_lines_with_no_equals(dispatcher, monkeypatch, tmp_path):
+def test_load_agent_env_skips_lines_with_no_equals(
+    dispatcher, monkeypatch, tmp_path, real_load_agent_env
+):
     got = _parse(dispatcher, monkeypatch, tmp_path, "export A\nB=2\n")
 
     assert got == {"B": "2"}
 
 
-def test_load_agent_env_keeps_equals_signs_inside_the_value(dispatcher, monkeypatch, tmp_path):
+def test_load_agent_env_keeps_equals_signs_inside_the_value(
+    dispatcher, monkeypatch, tmp_path, real_load_agent_env
+):
     """partition, not split. Base64 and JWT values contain `=` and would be truncated."""
     got = _parse(dispatcher, monkeypatch, tmp_path, "TOKEN=aGVsbG8=\n")
 
     assert got == {"TOKEN": "aGVsbG8="}
 
 
-def test_load_agent_env_ignores_an_empty_key(dispatcher, monkeypatch, tmp_path):
+def test_load_agent_env_ignores_an_empty_key(
+    dispatcher, monkeypatch, tmp_path, real_load_agent_env
+):
     got = _parse(dispatcher, monkeypatch, tmp_path, "=orphan\nA=1\n")
 
     assert got == {"A": "1"}

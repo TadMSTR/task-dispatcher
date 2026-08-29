@@ -48,7 +48,9 @@ def _logs(dispatcher):
 # --- The filename convention -------------------------------------------------
 
 
-def test_the_record_is_a_sibling_of_the_log_not_a_replacement(dispatcher, launches, task):
+def test_the_record_is_a_sibling_of_the_log_not_a_replacement(
+    dispatcher, launches, launchable, task
+):
     """The `.log` name is load-bearing in two other repos; the record takes the same stem.
 
     The plugin's parseLaunchLogName() and the task-launches retention job (vikunja#545)
@@ -74,7 +76,7 @@ def test_launch_log_name_is_the_only_producer(dispatcher):
 # --- What the record carries -------------------------------------------------
 
 
-def test_a_launch_records_the_pid_and_the_task_it_serves(dispatcher, launches, task):
+def test_a_launch_records_the_pid_and_the_task_it_serves(dispatcher, launches, launchable, task):
     _, t = task
     dispatcher.launch_agent_headless(t)
     rec = json.loads((dispatcher.LAUNCH_DIR / "developer-00000001.json").read_text())
@@ -89,7 +91,7 @@ def test_a_launch_records_the_pid_and_the_task_it_serves(dispatcher, launches, t
     assert rec["exit_code"] is None
 
 
-def test_the_child_is_told_which_run_it_is(dispatcher, launches, task):
+def test_the_child_is_told_which_run_it_is(dispatcher, launches, launchable, task):
     """FORGE_RUN_ID/FORGE_TASK_ID are what make a Langfuse trace joinable to a task."""
     _, t = task
     dispatcher.launch_agent_headless(t)
@@ -101,7 +103,7 @@ def test_the_child_is_told_which_run_it_is(dispatcher, launches, task):
     assert env["FORGE_WORKFLOW_MODE"] == "auto"
 
 
-def test_the_run_id_in_the_env_is_the_one_in_the_record(dispatcher, launches, task):
+def test_the_run_id_in_the_env_is_the_one_in_the_record(dispatcher, launches, launchable, task):
     """The env is built BEFORE Popen and the record written after; they must still agree.
 
     A regression that minted the id inside write_run_record would leave the session
@@ -284,7 +286,7 @@ def test_a_missing_launch_directory_is_an_empty_list(dispatcher):
 
 
 @pytest.fixture
-def steward_launch(dispatcher, monkeypatch, tmp_path, launches):
+def steward_launch(dispatcher, monkeypatch, tmp_path, launches, launchable):
     """A steward launch with a fake launcher whose contents the test controls."""
     launcher = tmp_path / "run-steward.sh"
 
@@ -333,7 +335,7 @@ def test_a_run_as_launch_still_records_its_user_and_launcher(steward_launch, dis
     assert rec["agent"] == "steward"
 
 
-def test_a_direct_launch_records_no_run_as_user(dispatcher, launches, write_task):
+def test_a_direct_launch_records_no_run_as_user(dispatcher, launches, launchable, write_task):
     _, t = write_task(target_agent="developer", workflow_mode="auto")
     dispatcher.launch_agent_headless(t)
     rec = json.loads((dispatcher.LAUNCH_DIR / "developer-00000001.json").read_text())
@@ -372,7 +374,7 @@ def test_read_env_file_missing_is_empty(dispatcher, tmp_path):
     assert dispatcher.read_env_file(tmp_path / "nope.env") == {}
 
 
-def test_load_agent_env_still_uses_it(dispatcher, monkeypatch, tmp_path):
+def test_load_agent_env_still_uses_it(dispatcher, monkeypatch, tmp_path, real_load_agent_env):
     """One parser, two callers — the refactor must not have left load_agent_env behind."""
     seen = []
     monkeypatch.setattr(dispatcher, "read_env_file", lambda p: seen.append(p) or {"K": "V"})
@@ -387,7 +389,9 @@ def test_load_agent_env_still_uses_it(dispatcher, monkeypatch, tmp_path):
 # one run record, it stops every other task in the same pass.
 
 
-def test_a_failed_record_write_does_not_stop_the_launch(dispatcher, monkeypatch, launches, task):
+def test_a_failed_record_write_does_not_stop_the_launch(
+    dispatcher, monkeypatch, launches, launchable, task
+):
     """The session is already running by the time the record is written.
 
     Raising here would abort process_submitted mid-pass, after the child was spawned —
