@@ -77,6 +77,12 @@ _REAL_POPEN = subprocess.Popen
 # the test that called it.
 _REAL_MATRIX_NOTIFY = td.matrix_notify
 _REAL_PUBLISH_NATS = td.publish_nats
+# pid_alive() reads /proc, i.e. the HOST's process table. Left real, every test that
+# writes a run record would count as live-or-not depending on whether this machine
+# happens to have a process at the stub's pid right now — the concurrency cap would pass
+# or fail by coincidence. /proc is host state in exactly the sense the network is, so it
+# is cut here for the same reason, and handed back by `real_pid_alive`.
+_REAL_PID_ALIVE = td.pid_alive
 
 
 class FakeProc:
@@ -109,6 +115,12 @@ def isolate(tmp_path, monkeypatch):
     monkeypatch.setattr(td, "ARCHIVE_DIR", queue / "archive")
     monkeypatch.setattr(td, "DEAD_LETTER_DIR", queue / "dead-letters")
     monkeypatch.setattr(td, "AUTH_ALERT_STAMP", queue / ".auth-alert-stamp")
+    # Run records. Without this every launch test writes into the module-scope $HOME and
+    # the records outlive the test — which would silently make the concurrency cap the
+    # NEXT test measures depend on how many launches ran before it.
+    launches_dir = tmp_path / "task-launches"
+    launches_dir.mkdir()
+    monkeypatch.setattr(td, "LAUNCH_DIR", launches_dir)
     manifests = tmp_path / "manifests"
     manifests.mkdir()
     monkeypatch.setattr(td, "MANIFEST_DIR", manifests)
@@ -118,6 +130,7 @@ def isolate(tmp_path, monkeypatch):
     monkeypatch.setattr(td, "publish_nats", lambda *a, **k: None)
     monkeypatch.setattr(td, "bus_log", lambda *a, **k: None)
     monkeypatch.setattr(td.subprocess, "Popen", lambda *a, **k: FakeProc())
+    monkeypatch.setattr(td, "pid_alive", lambda pid, start_ticks=None: False)
     return queue
 
 
@@ -135,6 +148,20 @@ def real_popen(isolate, monkeypatch):
     it always runs AFTER the stub is installed rather than racing it.
     """
     monkeypatch.setattr(td.subprocess, "Popen", _REAL_POPEN)
+
+
+@pytest.fixture
+def live_pids(isolate, monkeypatch):
+    """Declare which pids are alive. Returns the mutable set the stub consults."""
+    alive: set[int] = set()
+    monkeypatch.setattr(td, "pid_alive", lambda pid, start_ticks=None: pid in alive)
+    return alive
+
+
+@pytest.fixture
+def real_pid_alive(isolate, monkeypatch):
+    """Restore the real pid_alive, for the tests that are about /proc itself."""
+    monkeypatch.setattr(td, "pid_alive", _REAL_PID_ALIVE)
 
 
 @pytest.fixture

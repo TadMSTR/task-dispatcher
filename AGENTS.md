@@ -26,6 +26,7 @@ are runtime dependencies that no packaging metadata expresses, so they are recor
 |---|---|
 | `~/scripts/agent-launch.yml` | The live agent roster. Read at import. Also read by the CloudCLI task-queue plugin, which hardcodes this path. |
 | `~/scripts/temporal-workflow-start.sh` | Invoked by path, not imported. Survives independently of this package. |
+| `/usr/local/sbin/forge/run-steward.sh` | The run-as launcher, named by the roster. Deployed from `host-forge/scripts` by a root script, so it can lag this package. `launcher_accepts()` probes the deployed file for `--run-id` rather than assuming the two are in step. |
 
 **Do not vendor the roster into this repository as the live file.** It has two consumers,
 and giving each its own copy is a bug this project has already shipped once: the plugin's
@@ -51,6 +52,22 @@ caller instead — correct-looking in every log, holding none of the right crede
 **An agent with `run_as_user` set is launched only through its `launcher`.**
 `load_agent_env()` must never be called for such an agent: the launcher runs as that user
 and is the only thing that can read its environment file.
+
+**A reaped run never gets an invented exit code.** `_close_record()` leaves `exit_code`
+null and writes `reaped: "pid-gone"`. The dispatcher does not outlive the session it
+starts, so for a dispatcher launch the code is genuinely unrecoverable — there is no
+`waitpid()` and no surviving `/proc` entry. Defaulting it to zero would make every
+crashed session read as a clean one, which is the failure this run record was added to
+expose.
+
+**A task denied a launch slot stays `submitted`.** No new status. The gate therefore has
+to run *before* the approval is written, which is why `launch_kind()` exists and is called
+from both the gate and the dispatch branch — two copies of "will this launch?" drifting
+apart is the same class of bug as the vocabulary drift the tests here already guard.
+
+**The sweep goes through the control API, never through `atomic_write()`.** See the third
+invariant in README.md. `control_api_update()` returning False must leave the task
+untouched; there is no fallback and adding one would undo the point.
 
 **`--version` is answered in `_console()`, before `cli` is imported.** Because importing
 `cli` loads the roster and raises when it cannot, and `--version` is the deploy

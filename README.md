@@ -18,8 +18,67 @@ Every two minutes it:
    which owns the schema, and CI asserts they have not drifted.
 3. Applies the approval rules for the task's `workflow_mode` (`auto`, `semi-auto`,
    `manual-then-auto`) and risk level.
-4. Launches the target agent headlessly, or notifies and waits for a human.
-5. Archives expired tasks and retries ones whose routing failed.
+4. Reaps the previous tick's launches: a run whose process is gone is stamped ended, and
+   if its task is still `in-progress` it is swept to `failed` through the control API's
+   operator route.
+5. Launches the target agent headlessly — subject to the concurrency caps — or notifies
+   and waits for a human.
+6. Archives expired tasks and retries ones whose routing failed.
+
+## Run records
+
+Every launch writes `~/.claude/comms/artifacts/task-launches/<agent>-<task8>.json` beside
+the log it already wrote. It is a sibling, never a replacement: the `<agent>-<task8>.log`
+name is parsed by the CloudCLI task-queue plugin and matched by the launch-log retention
+job, and both would silently stop matching if it moved.
+
+```json
+{
+  "run_id": "…", "task_id": "…", "agent": "developer",
+  "launched_by": "dispatcher", "run_as_user": null, "launcher": null,
+  "workflow_mode": "auto", "started": "…", "pid": 12345,
+  "pid_start_ticks": 990312, "ended": null, "exit_code": null,
+  "log_path": "…/developer-8fb669e5.log"
+}
+```
+
+`run_id` and `task_id` also reach the session as `FORGE_RUN_ID` and `FORGE_TASK_ID`,
+which is what lets a Langfuse trace be joined back to the task that paid for it. For the
+one run-as agent, `sudo` scrubs the environment, so they travel as `--run-id`/`--task-id`
+flags instead — and only if the *deployed* launcher is found to accept them, because it
+refuses unknown options outright and the two artefacts deploy separately.
+
+**`exit_code` is null for a dispatcher launch, and that is not a gap to fill.** A cron
+tick spawns a detached child and exits, so the child is reparented and its status is
+reaped by init: there is no `waitpid()` to call and no `/proc` entry left to read. The
+record says `reaped: "pid-gone"` and leaves the code null. A fabricated zero would be a
+counter reporting success for something nobody observed succeed. The CloudCLI plugin,
+which is a long-lived process and *can* observe its own children exit, records a real
+code for the runs it starts.
+
+`pid_start_ticks` is field 22 of `/proc/<pid>/stat`, recorded so a recycled pid cannot
+keep a finished run counted as live — a concurrency cap that has silently stopped issuing
+launches looks exactly like a quiet queue.
+
+## Backpressure
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `DISPATCHER_MAX_CONCURRENT_RUNS` | `4` | Live sessions across all agents |
+| `DISPATCHER_MAX_RUNS_PER_AGENT` | `1` | Live sessions for one agent |
+| `DISPATCHER_MAX_RUN_SECONDS` | `21600` | After this a live run's slot is released |
+
+Non-positive means unlimited, for all three.
+
+A task that cannot get a slot **stays `submitted`** and is re-read from scratch next tick.
+There is deliberately no "queued" or "throttled" status: a status is a vocabulary shared
+with task-queue-mcp and the CloudCLI plugin's parity gate, and adding one on a single side
+is the drift class this dispatcher's vocabulary tests exist to catch.
+
+`DISPATCHER_MAX_RUN_SECONDS` frees the slot and does nothing else — it does not end the
+session and does not touch the task. Sweeping the task of an agent that is demonstrably
+still working would fabricate a failure, and would strand the work as well: `completed` is
+only reachable from `in-progress`, so that agent's own close would then be refused.
 
 ## Install
 
@@ -48,6 +107,10 @@ roster and fails loudly without one — see below.
 | `SCOPED_MCP_BEARER_TOKEN` | — | Resolved per-agent at launch; never stored here |
 | `ANTHROPIC_API_KEY` / `CLAUDE_CODE_OAUTH_TOKEN` | — | Checked for usability before launching |
 | `TASK_QUEUE_MCP_REF` | `main` | Test-only: the ref the vocabulary check compares against |
+| `TASK_QUEUE_API` | `http://127.0.0.1:8485` | task-queue-mcp's control API, used for the sweep |
+| `TASK_QUEUE_API_SECRET` | — | Read from `~/.secrets/task-queue-mcp.env` or `forge.env` if unset |
+
+See [Backpressure](#backpressure) for the three concurrency variables.
 
 ## The agent roster
 
@@ -59,7 +122,7 @@ hardcodes that path, and two copies of one roster is a bug this project has alre
 `tests/fixtures/agent-launch.yml` is a fixture. It is not the live roster and editing it
 changes nothing about how any agent launches.
 
-## Two invariants worth knowing before changing anything
+## Three invariants worth knowing before changing anything
 
 **A missing or malformed roster is a hard error.** It must never degrade to an empty
 mapping. An empty roster silently drops `run_as_user` for every agent, which means an
@@ -71,6 +134,13 @@ Failing the tick loudly is strictly better.
 dispatcher must never read that agent's environment file itself; the launcher runs as
 that user and is the only thing that can. `sudo` independently pins both the user and the
 launcher path, so the roster selects from what is already permitted and cannot widen it.
+
+**A stuck task is only ever closed through the operator route.** The sweep posts to
+`/tasks/{id}/update` with `on_behalf_of`, which records `actor: operator` alongside the
+agent's name. This dispatcher holds `atomic_write()` and could set `status: failed`
+itself in one line — and that is exactly the dishonest close the route was built to
+replace, because in history it is indistinguishable from the agent having quietly closed
+its own work. Without the shared secret the sweep does nothing at all.
 
 ## Tests
 
@@ -105,10 +175,10 @@ something. The same applies to the gitleaks and bus-emitter gates.
 
 ### Coverage
 
-CI enforces a floor of 94%. CI measures 95.19%; a local run measures 94.86% — the small
-gap is environmental and expected, so do not read it as a regression. The floor is a
-ratchet, not a target: raise it when the measured value rises, never lower it to make a
-commit go green.
+CI enforces a floor of 96%. A local run measures 96.64%; CI has historically measured
+about 0.3 points higher, and that gap is environmental and expected — do not read it as a
+regression. The floor is a ratchet, not a target: raise it when the measured value rises,
+never lower it to make a commit go green.
 
 ```bash
 coverage run -p -m pytest -q
@@ -117,11 +187,11 @@ for t in tests/test_agent_launch_policy.py \
          tests/test_version_no_roster.py; do
   coverage run -p --source=task_dispatcher "$t" > /dev/null
 done
-coverage combine && coverage report --fail-under=94
+coverage combine && coverage report --fail-under=96
 ```
 
-**Both passes are required.** `pytest` alone measures ~90%; the standalone scripts carry the
-remaining ~5 points. Collapsing this to a single `pytest --cov` invocation drops the number
+**Both passes are required.** `pytest` alone measures 93.28%; the standalone scripts carry
+the remaining ~3 points. Collapsing this to a single `pytest --cov` invocation drops the number
 below the floor and fails for a reason that looks like a regression but is not one.
 
 The three test files not listed above are excluded from measurement because this job does
