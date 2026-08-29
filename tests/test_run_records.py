@@ -450,3 +450,21 @@ def test_naive_timestamps_are_read_as_utc(dispatcher, live_pids, monkeypatch):
 
     dispatcher.AUTH_ALERT_STAMP.write_text("2020-01-01T00:00:00")
     assert dispatcher.auth_outage_active() is False
+
+
+def test_a_symlinked_record_is_skipped(dispatcher, live_pids, tmp_path):
+    """A record's fields reach a task's history note through the sweep.
+
+    So a symlink planted in the launch directory would put an arbitrary file's contents in
+    front of an operator. The plugin's list route had exactly this hole, and a real
+    ~/.secrets/forge.env symlink was planted there to prove it — this is the same rule on
+    the writer's side.
+    """
+    real = _write_record(dispatcher)
+    payload = tmp_path / "elsewhere.json"
+    payload.write_text(json.dumps({"task_id": "cccccccc-dddd-4eee-8fff-000000000000"}))
+    (dispatcher.LAUNCH_DIR / "developer-cccccccc.json").symlink_to(payload)
+
+    found = [p for p, _ in dispatcher.iter_run_records()]
+
+    assert found == [real]

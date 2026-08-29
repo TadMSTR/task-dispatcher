@@ -828,6 +828,13 @@ def iter_run_records() -> list[tuple[Path, dict]]:
         return []
     out = []
     for path in names:
+        # Regular files only, and is_symlink() rather than is_file(), which follows the
+        # link. A record's contents reach a task's history note through the sweep, so a
+        # symlink planted here would put an arbitrary file's first fields in front of an
+        # operator. The plugin's reader had exactly this hole and a real ~/.secrets
+        # symlink was planted in this directory to prove it.
+        if path.is_symlink() or not path.is_file():
+            continue
         record = read_run_record(path)
         if record is not None:
             out.append((path, record))
