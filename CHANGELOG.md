@@ -65,6 +65,14 @@ Build plan `agent-workflow-interop-2026-08`, Phase 5.2–5.5. Tickets vikunja#56
   motivated this changed what a spawn's cwd would be long before it changed any
   accept/reject answer.
 
+- **The agent-bus dependency pin moves to `945ea2d` = `v0.4.0`**, which is where
+  `AGENT_BUS_STRICT_VOCAB` and the JetStream publish live. Required rather than
+  cosmetic: the new bus-vocabulary gate checks this dispatcher's emitted types against
+  that release's vocabulary, and under `enforce` an undeclared type is rejected outright
+  instead of warned about. Still pinned by SHA — tags are mutable on GitHub and this
+  installs into a root-owned venv — with the tag named in a `pyproject.toml` comment,
+  because nobody can read a version out of a bare SHA.
+
 - **The dead-letter and archive directory names are now gated** in
   `test_task_queue_vocabulary.py`. `task-dispatcher` writes
   `~/.claude/task-queue/dead-letters/` and task-queue-mcp reads it, through two

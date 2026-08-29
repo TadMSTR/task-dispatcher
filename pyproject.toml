@@ -21,10 +21,16 @@ dependencies = [
 # so. Five event types went missing from the signed audit trail for the whole life of
 # v1.0.0. tests/test_bus_emitter_live.py is what makes a repeat loud.
 #
-# Pinned by commit SHA, not by the `v0.3.1` tag it points at: git tags are mutable on
-# GitHub, and this installs into a root-owned venv on forge.
+# Pinned by commit SHA, not by the tag it points at: git tags are mutable on GitHub, and
+# this installs into a root-owned venv on forge. THE TAG IS NAMED IN THIS COMMENT because
+# nobody can read a version out of a bare SHA — keep the two in step when bumping.
+#
+# 945ea2d is exactly `v0.4.0`, which is where AGENT_BUS_STRICT_VOCAB and the JetStream
+# publish live. The bump is required, not cosmetic: tests/test_bus_vocabulary.py gates
+# this dispatcher's emitted event types against that release's vocabulary, and under
+# AGENT_BUS_STRICT_VOCAB=enforce an undeclared type is rejected rather than warned about.
 bus = [
-    "agent-bus @ git+https://github.com/TadMSTR/agent-bus@3a2254533012ae08443952a4bcfee3fc5e044a12",
+    "agent-bus @ git+https://github.com/TadMSTR/agent-bus@945ea2ded4a0c9285407690a51af7f5b3e0deb3e",
 ]
 dev = ["ruff==0.16.0", "coverage>=7.0", "pytest>=8.0", "pytest-cov>=5.0"]
 
