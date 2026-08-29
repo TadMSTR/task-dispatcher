@@ -198,14 +198,19 @@ def test_exhausted_retries_dead_letter_the_task(dispatcher, queue, write_task, n
     assert [r for r, _, _ in notifications] == ["alerts"]
 
 
-def test_exhausted_retries_emit_task_failed_not_routing_failed(dispatcher, write_task, bus, nats):
-    """The distinction an alert keys on: routing-failed comes back, failed does not."""
+def test_exhausted_retries_emit_task_failed_not_routing_failed(dispatcher, write_task, bus):
+    """The distinction an alert keys on: routing-failed comes back, failed does not.
+
+    This used to assert the same thing twice, once per emitter — the bus event and the
+    `tasks.failed` NATS publish. publish_nats is gone (plan 5.4: no stream captured
+    `tasks.*`, and nothing in the tree subscribed), so the property is asserted once, on
+    the channel that has a consumer.
+    """
     path, task = write_task(retry_policy={"retry_count": 3, "max_retries": 3})
 
     dispatcher.handle_routing_failure(path, task, "reason")
 
     assert [e for e, _ in bus] == ["task.failed"]
-    assert [s for s, _ in nats] == ["tasks.failed"]
 
 
 def test_exhausted_retries_do_not_schedule_another_attempt(dispatcher, queue, write_task):

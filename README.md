@@ -106,7 +106,8 @@ roster and fails loudly without one — see below.
 | `AGENT_LAUNCH_POLICY` | `~/scripts/agent-launch.yml` | The agent roster |
 | `SCOPED_MCP_BEARER_TOKEN` | — | Resolved per-agent at launch; never stored here |
 | `ANTHROPIC_API_KEY` / `CLAUDE_CODE_OAUTH_TOKEN` | — | Checked for usability before launching |
-| `TASK_QUEUE_MCP_REF` | `main` | Test-only: the ref the vocabulary check compares against |
+| `TASK_QUEUE_MCP_REF` | `main` | Test-only: the ref the queue-vocabulary check compares against |
+| `AGENT_BUS_REF` | `main` | Test-only: the ref the bus-vocabulary check compares against |
 | `TASK_QUEUE_API` | `http://127.0.0.1:8485` | task-queue-mcp's control API, used for the sweep |
 | `TASK_QUEUE_API_SECRET` | — | Read from `~/.secrets/task-queue-mcp.env` or `forge.env` if unset |
 
@@ -144,21 +145,23 @@ its own work. Without the shared secret the sweep does nothing at all.
 
 ## Tests
 
-Two harnesses, deliberately. Most tests are pytest; six predate it and remain standalone
-scripts with their own `check()` harness, each exiting non-zero on failure.
+Two harnesses, deliberately. Most tests are pytest; seven predate it or need their own
+process, and remain standalone scripts with their own `check()` harness, each exiting
+non-zero on failure.
 
 ```bash
-pytest                                          # the unit suite — 207 tests
+pytest                                          # the unit suite — 293 tests
 
-python tests/test_agent_launch_policy.py        # loader + validator closed sets
+python tests/test_agent_launch_policy.py        # loader + validator + shared corpus
 python tests/test_dispatcher_headless_chain.py  # launch decisions, nothing spawned
 python tests/test_version_no_roster.py          # --version without a roster
 python tests/test_gitleaks_gate.py              # the leak gate fires (needs gitleaks)
 python tests/test_task_queue_vocabulary.py      # parity with task-queue-mcp (needs network)
+python tests/test_bus_vocabulary.py             # parity with agent-bus (needs network)
 python tests/test_bus_emitter_live.py           # the bus emitter is real (needs [bus])
 ```
 
-The six are not pytest tests and are excluded from collection (`conftest.py`'s
+The seven are not pytest tests and are excluded from collection (`conftest.py`'s
 `collect_ignore`). Each redirects `$HOME` and imports the dispatcher at module scope with a
 setup specific to what it pins, so importing them under pytest would run their checks at
 collection time against a `$HOME` they did not set up. They keep one CI step each, which is
@@ -169,13 +172,30 @@ also what keeps a failure attributable to a single file.
 its own named CI job. Without it, moving a file into `collect_ignore` is a one-line way to
 stop running it while every check stays green.
 
-The vocabulary check has no "no network, skip" path on purpose. A check that quietly
-passes when it could not read the upstream is indistinguishable from one that verified
-something. The same applies to the gitleaks and bus-emitter gates.
+### The three parity gates
+
+| Gate | Upstream | What drifts without it |
+|---|---|---|
+| `test_task_queue_vocabulary.py` | task-queue-mcp `main` | Statuses, task types, workflow modes — and the `dead-letters`/`archive` directory names, where this dispatcher is the writer and the MCP is the reader |
+| `test_bus_vocabulary.py` | agent-bus `main` | Event types. `task.workflow_started` was emitted here for months while undeclared upstream; under `AGENT_BUS_STRICT_VOCAB=enforce` that is now a rejection, not a warning |
+| `tests/fixtures/launch-policy-corpus.json` | consumed by the CloudCLI plugin from **this** repo's `main` | The two independent launch-policy validators. They have already disagreed once — Python called `.resolve()` on the project root while the TypeScript side did a plain join, and on forge that made the dispatcher module fail to import on every tick |
+
+None of them has a "no network, skip" path, on purpose. A check that quietly passes when
+it could not read the upstream is indistinguishable from one that verified something. The
+same applies to the gitleaks and bus-emitter gates.
+
+Each of the first two lives in its own CI job. They read different upstreams, and sharing
+a job would mean an agent-bus change and a task-queue-mcp change produce the same red —
+with the first failure preventing the second from running at all.
+
+The corpus compares **resolved values**, not just accept/reject verdicts. The `.resolve()`
+divergence changed what a spawn's `cwd` would be long before it changed any verdict, so a
+verdict-only comparison would have reported the two implementations in agreement
+throughout.
 
 ### Coverage
 
-CI enforces a floor of 96%. A local run measures 96.64%; CI has historically measured
+CI enforces a floor of 96%. A local run measures 96.63%; CI has historically measured
 about 0.3 points higher, and that gap is environmental and expected — do not read it as a
 regression. The floor is a ratchet, not a target: raise it when the measured value rises,
 never lower it to make a commit go green.

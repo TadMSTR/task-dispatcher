@@ -1,0 +1,296 @@
+{
+  "$schema_notes": [
+    "SHARED ACCEPT/REJECT CORPUS FOR THE AGENT LAUNCH POLICY VALIDATOR.",
+    "",
+    "Two independent implementations validate ~/scripts/agent-launch.yml:",
+    "  - task_dispatcher.cli.validate_launch_policy()          (Python, this repo)",
+    "  - cloudcli-plugin-task-queue src/launch-policy.ts       (TypeScript)",
+    "",
+    "The TS file carries a comment saying the Python side 'must keep computing this the",
+    "same way'. That is a comment where a test should be, and the two have already",
+    "disagreed once: Python called .resolve() on the project root while TypeScript did a",
+    "plain join, so with a symlink anywhere on the path Python rejected entries the",
+    "plugin accepted. On forge that did not merely reject an entry — LAUNCH_POLICY is",
+    "built at import, so it made the dispatcher module fail to import on every tick.",
+    "",
+    "THIS FILE IS THE CONTRACT. Both suites load it and must agree, case for case, on",
+    "both the verdict AND the resolved values. Verdict alone is not enough: the .resolve()",
+    "divergence above changed what a spawn's cwd would be long before it changed any",
+    "accept/reject answer.",
+    "",
+    "OWNED BY task-dispatcher, CONSUMED BY THE PLUGIN over raw.githubusercontent.com at",
+    "`main` — the same direction and mechanism as the task-queue vocabulary gate, so",
+    "there is one pattern in this fleet rather than two. A change here turns the plugin's",
+    "CI red on its next push; that is the alarm, not a malfunction.",
+    "",
+    "{HOME} is substituted by each side with ITS OWN test home before validating, and in",
+    "the expected values too. It is a token rather than a literal path because Python",
+    "expands `~` against the ambient $HOME while the TypeScript side expands it against a",
+    "`home` argument — so a hardcoded path would make the two incomparable for exactly",
+    "the `~` cases that most need covering.",
+    "",
+    "Adding a case here is how you pin a behaviour in both languages at once. Do not",
+    "delete a case to make a side pass; make the sides agree."
+  ],
+  "version": 1,
+  "cases": [
+    {
+      "name": "minimal-valid-agent",
+      "why": "The ordinary entry. If this fails, nothing else here means anything.",
+      "policy": { "developer": { "project_dir": "{HOME}/.claude/projects/developer" } },
+      "expect": "accept",
+      "resolved": {
+        "developer": {
+          "project_dir": "{HOME}/.claude/projects/developer",
+          "run_as_user": null,
+          "launcher": null
+        }
+      }
+    },
+    {
+      "name": "run-as-agent-with-launcher",
+      "why": "The steward shape. run_as_user and launcher travel together into a sudo argv.",
+      "policy": {
+        "steward": {
+          "project_dir": "{HOME}/.claude/projects/steward",
+          "run_as_user": "agent-steward",
+          "launcher": "/usr/local/sbin/forge/run-steward.sh"
+        }
+      },
+      "expect": "accept",
+      "resolved": {
+        "steward": {
+          "project_dir": "{HOME}/.claude/projects/steward",
+          "run_as_user": "agent-steward",
+          "launcher": "/usr/local/sbin/forge/run-steward.sh"
+        }
+      }
+    },
+    {
+      "name": "tilde-expands-to-an-absolute-path",
+      "why": "The live roster is written with `~`. Both sides must expand it, not reject it.",
+      "policy": { "writer": { "project_dir": "~/.claude/projects/writer" } },
+      "expect": "accept",
+      "resolved": {
+        "writer": {
+          "project_dir": "{HOME}/.claude/projects/writer",
+          "run_as_user": null,
+          "launcher": null
+        }
+      }
+    },
+    {
+      "name": "dotdot-inside-the-root-is-normalised-not-rejected",
+      "why": "`..` that stays under the root is legal; the containment check must run AFTER normalisation on both sides, or one of them compares an unnormalised path.",
+      "policy": { "writer": { "project_dir": "{HOME}/.claude/projects/other/../writer" } },
+      "expect": "accept",
+      "resolved": {
+        "writer": {
+          "project_dir": "{HOME}/.claude/projects/writer",
+          "run_as_user": null,
+          "launcher": null
+        }
+      }
+    },
+    {
+      "name": "trailing-slash-normalises-away",
+      "why": "The resolved value becomes a spawn's cwd. Python's os.path.normpath strips a trailing separator and Node's path.normalize does NOT, so without this case the two sides silently produce different strings for the same input — the .resolve() divergence in a second costume.",
+      "policy": { "writer": { "project_dir": "{HOME}/.claude/projects/writer/" } },
+      "expect": "accept",
+      "resolved": {
+        "writer": {
+          "project_dir": "{HOME}/.claude/projects/writer",
+          "run_as_user": null,
+          "launcher": null
+        }
+      }
+    },
+    {
+      "name": "project-dir-equal-to-the-root-is-accepted",
+      "why": "The boundary of the containment check. A strict `is a descendant of` test rejects it; both sides intend to allow it.",
+      "policy": { "writer": { "project_dir": "{HOME}/.claude/projects" } },
+      "expect": "accept",
+      "resolved": {
+        "writer": {
+          "project_dir": "{HOME}/.claude/projects",
+          "run_as_user": null,
+          "launcher": null
+        }
+      }
+    },
+    {
+      "name": "sibling-directory-sharing-a-name-prefix-is-rejected",
+      "why": "The containment check must be segment-wise, not a string prefix. `projects-evil` starts with `projects` and is not under it.",
+      "policy": { "writer": { "project_dir": "{HOME}/.claude/projects-evil/writer" } },
+      "expect": "reject"
+    },
+    {
+      "name": "dotdot-escaping-the-root-is-rejected",
+      "why": "The traversal this validator exists for: the value reaches a subprocess cwd.",
+      "policy": { "writer": { "project_dir": "{HOME}/.claude/projects/../../etc" } },
+      "expect": "reject"
+    },
+    {
+      "name": "project-dir-outside-the-root-is-rejected",
+      "policy": { "writer": { "project_dir": "/etc/passwd" } },
+      "expect": "reject"
+    },
+    {
+      "name": "relative-project-dir-is-rejected",
+      "why": "A relative cwd would resolve against whatever the launching process happened to be in.",
+      "policy": { "writer": { "project_dir": "projects/writer" } },
+      "expect": "reject"
+    },
+    {
+      "name": "missing-project-dir-is-rejected",
+      "policy": { "writer": { "run_as_user": "agent-writer" } },
+      "expect": "reject"
+    },
+    {
+      "name": "empty-project-dir-is-rejected",
+      "policy": { "writer": { "project_dir": "" } },
+      "expect": "reject"
+    },
+    {
+      "name": "unknown-key-rejects-the-whole-document",
+      "why": "An unrecognised key is a typo'd one. Ignoring it means honouring a roster whose author believes it says something it does not.",
+      "policy": {
+        "writer": { "project_dir": "{HOME}/.claude/projects/writer", "launchr": "/usr/local/sbin/forge/run.sh" }
+      },
+      "expect": "reject"
+    },
+    {
+      "name": "run-as-user-without-a-launcher-is-rejected",
+      "why": "Half a run-as entry is how an agent gets launched as the caller while every log says otherwise (vikunja#404).",
+      "policy": {
+        "steward": { "project_dir": "{HOME}/.claude/projects/steward", "run_as_user": "agent-steward" }
+      },
+      "expect": "reject"
+    },
+    {
+      "name": "launcher-without-a-run-as-user-is-rejected",
+      "policy": {
+        "steward": {
+          "project_dir": "{HOME}/.claude/projects/steward",
+          "launcher": "/usr/local/sbin/forge/run-steward.sh"
+        }
+      },
+      "expect": "reject"
+    },
+    {
+      "name": "run-as-user-outside-the-agent-prefix-is-rejected",
+      "policy": {
+        "steward": {
+          "project_dir": "{HOME}/.claude/projects/steward",
+          "run_as_user": "root",
+          "launcher": "/usr/local/sbin/forge/run-steward.sh"
+        }
+      },
+      "expect": "reject"
+    },
+    {
+      "name": "launcher-outside-the-launcher-dir-is-rejected",
+      "policy": {
+        "steward": {
+          "project_dir": "{HOME}/.claude/projects/steward",
+          "run_as_user": "agent-steward",
+          "launcher": "/tmp/run-steward.sh"
+        }
+      },
+      "expect": "reject"
+    },
+    {
+      "name": "launcher-dir-prefix-trap-is-rejected",
+      "why": "`/usr/local/sbin/forgery/` shares a prefix with `/usr/local/sbin/forge/` and is a different directory. The trailing separator in the constant is what closes this.",
+      "policy": {
+        "steward": {
+          "project_dir": "{HOME}/.claude/projects/steward",
+          "run_as_user": "agent-steward",
+          "launcher": "/usr/local/sbin/forgery/run-steward.sh"
+        }
+      },
+      "expect": "reject"
+    },
+    {
+      "name": "launcher-with-dotdot-is-rejected",
+      "why": "sudoers pins the path, so this cannot widen what sudo runs — but a roster that reads as one thing and resolves to another must not validate.",
+      "policy": {
+        "steward": {
+          "project_dir": "{HOME}/.claude/projects/steward",
+          "run_as_user": "agent-steward",
+          "launcher": "/usr/local/sbin/forge/../../../bin/sh"
+        }
+      },
+      "expect": "reject"
+    },
+    {
+      "name": "uppercase-agent-name-is-rejected",
+      "policy": { "Writer": { "project_dir": "{HOME}/.claude/projects/writer" } },
+      "expect": "reject"
+    },
+    {
+      "name": "agent-name-with-a-dot-is-rejected",
+      "why": "The name is used to build paths on both sides.",
+      "policy": { "wri.ter": { "project_dir": "{HOME}/.claude/projects/writer" } },
+      "expect": "reject"
+    },
+    {
+      "name": "prototype-pollution-name-is-rejected",
+      "why": "JS-specific and free to close on both sides: `__proto__` as a key in an object literal is not an ordinary property, and a lookup by an agent name taken from task content must not reach an inherited member. The shared name regex rejects it because it does not start with a lowercase letter.",
+      "policy": { "__proto__": { "project_dir": "{HOME}/.claude/projects/writer" } },
+      "expect": "reject"
+    },
+    {
+      "name": "over-long-agent-name-is-rejected",
+      "policy": {
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa": { "project_dir": "{HOME}/.claude/projects/writer" }
+      },
+      "expect": "reject"
+    },
+    {
+      "name": "empty-document-is-rejected",
+      "why": "An empty roster leaves run_as_user absent for EVERY agent, which is how steward gets launched as ted. Degrading to `{}` is the failure both loaders are built to refuse.",
+      "policy": {},
+      "expect": "reject"
+    },
+    {
+      "name": "entry-that-is-not-a-mapping-is-rejected",
+      "policy": { "writer": "~/.claude/projects/writer" },
+      "expect": "reject"
+    },
+    {
+      "name": "one-bad-entry-rejects-the-whole-document",
+      "why": "A partially-honoured roster silently launches SOME agent the wrong way. Both sides must refuse the document, not skip the entry.",
+      "policy": {
+        "writer": { "project_dir": "{HOME}/.claude/projects/writer" },
+        "evil": { "project_dir": "/etc" }
+      },
+      "expect": "reject"
+    },
+    {
+      "name": "multiple-valid-agents-all-resolve",
+      "why": "Guards against a loop that returns after its first entry.",
+      "policy": {
+        "developer": { "project_dir": "{HOME}/.claude/projects/developer" },
+        "steward": {
+          "project_dir": "~/.claude/projects/steward",
+          "run_as_user": "agent-steward",
+          "launcher": "/usr/local/sbin/forge/run-steward.sh"
+        }
+      },
+      "expect": "accept",
+      "resolved": {
+        "developer": {
+          "project_dir": "{HOME}/.claude/projects/developer",
+          "run_as_user": null,
+          "launcher": null
+        },
+        "steward": {
+          "project_dir": "{HOME}/.claude/projects/steward",
+          "run_as_user": "agent-steward",
+          "launcher": "/usr/local/sbin/forge/run-steward.sh"
+        }
+      }
+    }
+  ]
+}

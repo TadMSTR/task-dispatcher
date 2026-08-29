@@ -16,7 +16,7 @@ Two properties, and neither is provable by testing child_workflow_mode() alone:
 
 Hermetic: redirects HOME to a tmpdir BEFORE importing the dispatcher (module-level
 code resolves TASK_QUEUE_DIR and opens a log file from it), stubs subprocess.Popen,
-matrix_notify, publish_nats and bus_log. Sends nothing, launches nothing, and never
+matrix_notify and bus_log. Sends nothing, launches nothing, and never
 touches the real queue.
 """
 
@@ -73,7 +73,6 @@ def _fake_popen(argv, cwd=None, stdout=None, stderr=None, env=None, **kw):
 
 td.subprocess.Popen = _fake_popen
 td.matrix_notify = lambda room, title, body: NOTIFICATIONS.append((room, title, body))
-td.publish_nats = lambda *a, **k: None
 td.bus_log = lambda *a, **k: None
 td.alert_auth_blocked = lambda *a, **k: None
 td.anthropic_creds_usable = lambda env: True

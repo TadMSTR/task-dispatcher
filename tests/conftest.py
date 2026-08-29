@@ -13,7 +13,7 @@ package on a venv path; loading the file by path would test a shape that is neve
 
 WHAT THE FIXTURES DO NOT DO. Nothing here stubs a function under test. `isolate` redirects
 the module's directory constants at a fresh tmp_path per test and neutralises the three
-outbound channels that would otherwise reach the network (matrix_notify, publish_nats,
+outbound channels that would otherwise reach the network (matrix_notify,
 bus_log) plus subprocess.Popen. Tests that assert on those channels take the recorder
 fixture for the one they care about, which re-stubs it with a capturing version — so a test
 that forgets to record still cannot send anything.
@@ -61,6 +61,7 @@ collect_ignore = [
     "test_version_no_roster.py",
     "test_gitleaks_gate.py",
     "test_task_queue_vocabulary.py",
+    "test_bus_vocabulary.py",
     "test_bus_emitter_live.py",
 ]
 
@@ -76,7 +77,6 @@ _REAL_POPEN = subprocess.Popen
 # WHOLE fixture, putting TASK_QUEUE_DIR back on the shared home and silently un-isolating
 # the test that called it.
 _REAL_MATRIX_NOTIFY = td.matrix_notify
-_REAL_PUBLISH_NATS = td.publish_nats
 # pid_alive() reads /proc, i.e. the HOST's process table. Left real, every test that
 # writes a run record would count as live-or-not depending on whether this machine
 # happens to have a process at the stub's pid right now — the concurrency cap would pass
@@ -152,7 +152,6 @@ def isolate(tmp_path, monkeypatch):
     monkeypatch.setattr(td, "load_agent_env", lambda agent_type: {})
 
     monkeypatch.setattr(td, "matrix_notify", lambda room, title, body: None)
-    monkeypatch.setattr(td, "publish_nats", lambda *a, **k: None)
     monkeypatch.setattr(td, "bus_log", lambda *a, **k: None)
     monkeypatch.setattr(td.subprocess, "Popen", lambda *a, **k: FakeProc())
     monkeypatch.setattr(td, "pid_alive", lambda pid, start_ticks=None: False)
@@ -218,12 +217,6 @@ def real_matrix_notify(isolate, monkeypatch):
 
 
 @pytest.fixture
-def real_publish_nats(isolate, monkeypatch):
-    """Restore the real publish_nats. Its subprocess.run must still be stubbed."""
-    monkeypatch.setattr(td, "publish_nats", _REAL_PUBLISH_NATS)
-
-
-@pytest.fixture
 def launches(monkeypatch):
     """Capture what WOULD have been launched. Popen is recorded, never executed."""
     captured: list[dict] = []
@@ -242,16 +235,6 @@ def notifications(monkeypatch):
     captured: list[tuple[str, str, str]] = []
     monkeypatch.setattr(
         td, "matrix_notify", lambda room, title, body: captured.append((room, title, body))
-    )
-    return captured
-
-
-@pytest.fixture
-def nats(monkeypatch):
-    """Capture publish_nats calls as (subject, payload)."""
-    captured: list[tuple[str, dict]] = []
-    monkeypatch.setattr(
-        td, "publish_nats", lambda subject, payload: captured.append((subject, payload))
     )
     return captured
 

@@ -368,9 +368,7 @@ def test_approve_and_write_persists_status_and_history(dispatcher, write_task):
     assert on_disk["history"][-1]["actor"] == "dispatcher"
 
 
-def test_request_approval_writes_before_it_announces(
-    dispatcher, write_task, notifications, nats, bus
-):
+def test_request_approval_writes_before_it_announces(dispatcher, write_task, notifications, bus):
     """pending-approval is on disk, the operator is told, and the reason is recorded."""
     path, task = write_task(risk_level="high")
 
@@ -383,9 +381,12 @@ def test_request_approval_writes_before_it_announces(
     assert "risk=high" in on_disk["history"][-1]["note"]
     assert [r for r, _, _ in notifications] == ["approvals"]
     assert "[APPROVAL NEEDED]" in notifications[0][1]
-    assert nats[0][0] == "tasks.approval-requested"
-    assert nats[0][1]["risk_level"] == "high"
+    # `risk_level` used to be readable only off the NATS payload; publish_nats is gone
+    # (plan 5.4) and the bus event now carries it in metadata (plan 5.2), so the
+    # assertion follows the field rather than being dropped with its old carrier.
     assert bus[0][0] == "task.dispatched"
+    assert bus[0][1]["metadata"]["risk_level"] == "high"
+    assert bus[0][1]["metadata"]["task_id"] == task["id"]
 
 
 def test_request_approval_puts_the_approve_command_in_the_notification(

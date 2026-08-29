@@ -68,6 +68,7 @@ _SCRIPT_JOBS = {
     "test_version_no_roster.py": "test",
     "test_gitleaks_gate.py": "secret-scan",
     "test_task_queue_vocabulary.py": "vocabulary-parity",
+    "test_bus_vocabulary.py": "bus-vocabulary",
     "test_bus_emitter_live.py": "bus-emitter",
 }
 
