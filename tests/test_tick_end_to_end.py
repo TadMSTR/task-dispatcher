@@ -21,7 +21,7 @@ import pytest
 
 
 @pytest.fixture
-def seeded(dispatcher, monkeypatch, write_task):
+def seeded(dispatcher, monkeypatch, write_task, launchable):
     """A queue with one task in each interesting state, and a matching manifest set."""
     for name, caps in (
         ("developer", ["build", "fix"]),
@@ -37,8 +37,6 @@ def seeded(dispatcher, monkeypatch, write_task):
                 "max_auto_risk": "medium",
             },
         )
-    monkeypatch.setattr(dispatcher, "load_agent_env", lambda a: {"SCOPED_MCP_BEARER_TOKEN": "t"})
-    monkeypatch.setattr(dispatcher, "anthropic_creds_usable", lambda env: True)
     return write_task
 
 

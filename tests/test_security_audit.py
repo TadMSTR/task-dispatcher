@@ -30,10 +30,8 @@ import pytest
 
 
 @pytest.fixture
-def audit_env(dispatcher, monkeypatch):
-    """Satisfy the two credential guards so tests reach the logic they are about."""
-    monkeypatch.setattr(dispatcher, "load_agent_env", lambda a: {"SCOPED_MCP_BEARER_TOKEN": "t"})
-    monkeypatch.setattr(dispatcher, "anthropic_creds_usable", lambda env: True)
+def audit_env(dispatcher, monkeypatch, launchable):
+    """The two credential guards satisfied (via `launchable`), plus a silenced alert."""
     monkeypatch.setattr(dispatcher, "alert_auth_blocked", lambda *a, **k: None)
 
 

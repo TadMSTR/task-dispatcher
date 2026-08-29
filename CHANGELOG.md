@@ -5,6 +5,110 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] - 2026-08-29
+
+Gives every launch a run record, then uses it for the two things that were impossible
+without one: a concurrency cap and a stuck-run sweep.
+
+Tracker: vikunja#559. Build plan: agent-workflow-interop-2026-08, Phases 3 and 4.
+
+### Added
+
+- **A run record beside every launch log.**
+  `~/.claude/comms/artifacts/task-launches/<agent>-<task8>.json`, carrying `run_id`,
+  `task_id`, `agent`, `launched_by`, `run_as_user`, `launcher`, `workflow_mode`,
+  `started`, `pid`, `pid_start_ticks`, `ended`, `exit_code` and `log_path`.
+
+  A launch was previously a side effect — `Popen(...)` and return, no pid, no exit code,
+  no wait. Nothing recorded that a session had started, so nothing could observe that one
+  had stopped, which is why 13 tasks sat at `in-progress` from as far back as 2026-05-28
+  with no mechanism in the system able to notice them.
+
+  The record is a **sibling** of the log, not a replacement. `<agent>-<task8>.log` is
+  parsed by the CloudCLI task-queue plugin and matched by the launch-log retention job
+  (vikunja#545); renaming it to make room would have silently stopped both.
+
+- **`FORGE_RUN_ID` and `FORGE_TASK_ID` in the launched session's environment**, next to
+  `FORGE_WORKFLOW_MODE`. This is what makes a Langfuse trace joinable back to the task
+  that paid for it — "what did this build cost" was previously unanswerable.
+
+  For the one run-as agent `sudo` scrubs the environment, so they travel as
+  `--run-id`/`--task-id` flags to `run-steward.sh` instead. Those flags are passed **only
+  if the deployed launcher is found to accept them**: it refuses unknown options outright,
+  and the launcher deploys from a different repository by a root script, so the two are
+  routinely out of step. Until `host-forge/scripts` is redeployed the flags are withheld
+  and a warning is logged; the record itself is unaffected.
+
+- **The security-audit launch is recorded too.** It is a third launcher, and it launches
+  headlessly even in `semi-auto`, which makes it the commonest kind of concurrent session
+  on this host. A cap that counted the other two and not this one would be a cap in name
+  only. Its log stays at `~/.pm2/logs/security-audit-<build>.log`, keyed by build name;
+  the record points at it from the launch directory.
+
+- **Concurrency caps.** `DISPATCHER_MAX_CONCURRENT_RUNS` (default 4) and
+  `DISPATCHER_MAX_RUNS_PER_AGENT` (default 1), counted from live run records. There was no
+  cap at all: ten `auto` tasks landing in one tick spawned ten concurrent Claude sessions
+  against one API key. Non-positive is unlimited.
+
+  A task that cannot get a slot **stays `submitted`** and is re-read next tick. No new
+  status was invented — a status is a vocabulary shared with task-queue-mcp and the
+  plugin's parity gate, and adding one on a single side is the drift class this
+  dispatcher's own vocabulary tests exist to catch.
+
+- **A stuck-run sweep.** When a run record is reaped dead and its task is still
+  `in-progress`, the task is moved to `failed` through task-queue-mcp's control API at
+  `POST /tasks/{id}/update` with `on_behalf_of`, so the history records `actor: operator`
+  alongside the agent's name and reads as a sweep years later rather than as the agent
+  having quietly closed its own work. There is **no fallback to writing the queue file**:
+  without the shared secret the sweep logs and does nothing.
+
+  It is evidence-gated and cannot reach the pre-existing backlog. It enumerates dead runs
+  and looks their task up, so a task with no run record is structurally out of reach.
+
+- **`DISPATCHER_MAX_RUN_SECONDS`** (default 6h). A run still alive past it has its
+  concurrency slot released and is marked `reaped: "max-runtime"`. It does **not** end the
+  session and does **not** touch the task: sweeping the task of an agent that is
+  demonstrably still working would fabricate a failure, and would strand the work as well,
+  since `completed` is only reachable from `in-progress`.
+
+### Fixed
+
+- **A dead OAuth burned a launch attempt per queued task per tick.**
+  `alert_auth_blocked()` debounced the *alert* at 900s but not the *attempt*, so a
+  credential outage sent every queued task to `routing-failed` with a retry backoff —
+  turning a 15-minute outage into a queue that needed chasing by hand. Launches are now
+  held at `submitted` while the same stamp is fresh.
+
+### Changed
+
+- **`launch_kind()` is the single decision about what a tick will do with an approved
+  task**, called by both the backpressure gate and the dispatch branch. The gate has to
+  run before the approval is written (a held task cannot stay `submitted` once `approved`
+  is on disk), which made it a second reader of a decision the dispatch branch already
+  made. One function, two callers.
+- **`launch_log_name()` is the one producer of the `<agent>-<task8>.log` convention.** It
+  was previously an inline f-string with no name, so the reader in the plugin had nothing
+  to be pinned to.
+- **`read_env_file()` extracted from `load_agent_env()`** — the sweep needs the same parse
+  against `~/.secrets/*.env`.
+- **`_auth_stamp_age()` extracted from `alert_auth_blocked()`**, now read by the alert and
+  the launch gate.
+- CI coverage floor raised 94 → 96 (measured 96.64%, up from 95.19%).
+
+### Known gaps
+
+- **`exit_code` is null for every dispatcher-launched run**, with `reaped: "pid-gone"`.
+  This is deliberate and not a stub. A cron tick spawns a detached child and exits, so the
+  child is reparented and its status is reaped by init — there is no `waitpid()` to call
+  and no surviving `/proc` entry to read one from. A zero would be a counter reporting
+  success for something nobody observed succeed, which is the failure this record exists
+  to expose. The CloudCLI plugin is a long-lived process and records a real exit code for
+  the runs it starts.
+- **`run-steward.sh` exports `FORGE_WORKFLOW_MODE` before sourcing the agent env file**,
+  so a key of that name in the env file would silently replace it. The new
+  `FORGE_RUN_ID`/`FORGE_TASK_ID` exports are placed after the source for that reason;
+  moving the mode export was left out of scope as it cannot be exercised without `sudo`.
+
 ## [1.2.0] - 2026-08-28
 
 Deduplicates the audit-launch block that had drifted between the two dispatch functions,

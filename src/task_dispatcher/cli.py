@@ -18,6 +18,7 @@ import os
 import re
 import subprocess
 import sys
+import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -504,7 +505,36 @@ def publish_nats(subject: str, payload: dict) -> None:
         )
 
 
-# --- Per-agent .env loader (SMCP-28) ---
+# --- .env file reader (SMCP-28) ---
+def read_env_file(path: Path) -> dict:
+    """Parse a KEY=VALUE file into a dict. Missing or unreadable file is an empty dict.
+
+    Extracted from load_agent_env() when the run sweep needed the same parse against
+    ~/.secrets/*.env. Two callers, one parser: a second copy would be a second set of
+    quoting rules, and this one already has a documented deviation from `source`
+    semantics (it does not expand $VAR, deliberately — see below).
+    """
+    env: dict[str, str] = {}
+    try:
+        lines = path.read_text().splitlines()
+    except OSError:
+        return env
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        # Strips one layer of matching-ish quoting and nothing else. No $VAR expansion,
+        # no `export ` prefix handling, no line continuations: this reads files this
+        # fleet writes, and every one of those is a flat KEY=VALUE. A value that needs
+        # more than that would be silently mangled, so do not feed one in.
+        value = value.strip().strip('"').strip("'")
+        if key:
+            env[key] = value
+    return env
+
+
 def load_agent_env(agent_type: str) -> dict:
     """Read /opt/appdata/agents/<agent_type>/.env (KEY=VALUE lines).
 
@@ -512,20 +542,7 @@ def load_agent_env(agent_type: str) -> dict:
     launched claude -p sessions get SCOPED_MCP_BEARER_TOKEN (and other agent
     secrets) in their environment instead of relying on the dispatcher's own env.
     """
-    env_path = Path(f"/opt/appdata/agents/{agent_type}/.env")
-    env = {}
-    if not env_path.is_file():
-        return env
-    for line in env_path.read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, _, value = line.partition("=")
-        key = key.strip()
-        value = value.strip().strip('"').strip("'")
-        if key:
-            env[key] = value
-    return env
+    return read_env_file(Path(f"/opt/appdata/agents/{agent_type}/.env"))
 
 
 # --- Anthropic credential preflight (SMCP-29) ---
@@ -562,15 +579,29 @@ def anthropic_creds_usable(child_env: dict) -> bool:
     return oauth.get("expiresAt", 0) > now_ms
 
 
+def _auth_stamp_age() -> float | None:
+    """Seconds since the auth-outage alert last fired, or None if outside the window.
+
+    None covers "never alerted", "stamp unreadable" and "alerted longer ago than the
+    debounce" identically, because all three mean the same thing to both callers: this
+    is not a known-live outage. Two readers now — the alert below, and the launch gate
+    in auth_outage_active(), which is what makes the debounce cover the ATTEMPT and not
+    just the notification.
+    """
+    try:
+        last = datetime.fromisoformat(AUTH_ALERT_STAMP.read_text().strip())
+    except (OSError, ValueError):
+        return None
+    if last.tzinfo is None:
+        last = last.replace(tzinfo=UTC)
+    age = (datetime.now(UTC) - last).total_seconds()
+    return age if age < AUTH_ALERT_DEBOUNCE_SEC else None
+
+
 def alert_auth_blocked(agent: str, task_id: str) -> None:
     """Debounced Matrix alert to #sysadmin when the auth guard blocks a launch."""
-    try:
-        if AUTH_ALERT_STAMP.exists():
-            last = datetime.fromisoformat(AUTH_ALERT_STAMP.read_text().strip())
-            if (datetime.now(UTC) - last).total_seconds() < AUTH_ALERT_DEBOUNCE_SEC:
-                return
-    except Exception:
-        pass
+    if _auth_stamp_age() is not None:
+        return
     matrix_notify(
         "sysadmin",
         "[auth] Headless launch blocked — no usable Anthropic credential",
@@ -599,6 +630,496 @@ def child_workflow_mode(parent_mode: str) -> str:
     in testing: the failure looks like an occasional handoff that did not auto-run.
     """
     return "auto" if parent_mode == "manual-then-auto" else parent_mode
+
+
+# --- Run records (Phase 3, agent-workflow-interop-2026-08 / vikunja#559) ---
+#
+# A launch used to be a side effect: Popen(...) and return. Nothing recorded that a
+# session had started, so nothing could observe that one had stopped — which is why 13
+# tasks sat at `in-progress` from as far back as 2026-05-28 with nothing in the system
+# able to notice, and why "what did this build cost" was unanswerable. A run record is
+# the missing entity.
+#
+# IT IS A SIBLING OF THE LAUNCH LOG, NEVER A REPLACEMENT FOR IT. The
+# `<agent>-<task8>.log` filename is load-bearing in two other places — the CloudCLI
+# plugin's Headless-runs reader parses it back into (agent, task8), and the
+# task-launches retention job (vikunja#545) matches on it — so the record takes the same
+# stem with a `.json` suffix and changes neither the name nor the contents of the log.
+
+LAUNCH_DIR = Path.home() / ".claude" / "comms" / "artifacts" / "task-launches"
+
+
+def _int_env(name: str, default: int) -> int:
+    """An int from the environment, or the default. Never raises.
+
+    This runs at import. A typo in a crontab line must not take down every tick with a
+    ValueError before a single task is read — it degrades to the default and says so.
+    """
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        log.warning(f"{name}={raw!r} is not an integer; using {default}")
+        return default
+
+
+# 6 hours. A backstop for slot accounting, not a runtime policy: it releases the slot of
+# a run that is somehow still alive that long, and deliberately does not end the session
+# or touch the task. See reap_runs().
+MAX_RUN_SECONDS = _int_env("DISPATCHER_MAX_RUN_SECONDS", 6 * 3600)
+
+# The control API this dispatcher sweeps through. Not the MCP transport: these are
+# task-queue-mcp's shared-secret custom routes, which are the only place OPERATOR_ACTOR
+# is assertable. See sweep_dead_runs().
+TASK_QUEUE_API = os.environ.get("TASK_QUEUE_API", "http://127.0.0.1:8485").rstrip("/")
+SECRET_FILES = (
+    Path.home() / ".secrets" / "task-queue-mcp.env",
+    Path.home() / ".secrets" / "forge.env",
+)
+
+
+def launch_log_name(agent: str, task_id: str) -> str:
+    """`<agent>-<task8>.log` — THE launch-log filename convention.
+
+    One producer, deliberately: this used to be spelled inline in launch_agent_headless
+    and nowhere else, so the reader in another repo had nothing to be pinned to. It is
+    mirrored by launchLogName() in cloudcli-plugin-task-queue/src/launch-policy.ts and
+    parsed back by parseLaunchLogName() there. Three sites, no gate between them yet —
+    Phase 5 of this plan is where that gate lands. Do not inline a fourth copy.
+    """
+    return f"{agent}-{task_id[:8]}.log"
+
+
+def run_record_name(agent: str, task_id: str) -> str:
+    """The run record for a launch — the log's stem with a `.json` suffix."""
+    return f"{agent}-{task_id[:8]}.json"
+
+
+def atomic_write_json(path: Path, data: dict) -> None:
+    """Write JSON to a tmp file then rename into place.
+
+    Separate from atomic_write() rather than a `format=` parameter on it: that one
+    serialises queue tasks as YAML and is called from eleven places that must never
+    accidentally emit JSON into the queue. Same durability pattern, different payload.
+
+    The tmp name carries the pid so two writers cannot collide on it. Queue files get
+    away with a bare `.tmp` because one process owns the queue; the launch directory has
+    two producers (this dispatcher and the CloudCLI plugin) writing concurrently.
+    """
+    tmp = path.with_suffix(f".{os.getpid()}.tmp")
+    try:
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f, indent=2, sort_keys=False)
+            f.write("\n")
+        tmp.rename(path)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def pid_start_ticks(pid: int) -> int | None:
+    """Field 22 of /proc/<pid>/stat — the process's start time, in clock ticks since boot.
+
+    Recorded alongside the pid so a RECYCLED pid cannot keep a finished run counted as
+    live forever. Pids wrap; a long-lived record holding a slot against an unrelated
+    process is a cap that silently stops issuing launches, which looks exactly like a
+    quiet queue.
+
+    Reading /proc rather than os.kill(pid, 0) is also what makes this work across users:
+    steward's session runs as agent-steward, and signalling it from ted raises
+    PermissionError — which a liveness check would have to treat as "alive", making a
+    dead steward run unreapable. /proc/<pid>/stat is world-readable.
+    """
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as fh:
+            data = fh.read()
+    except OSError:
+        return None
+    # Field 2 (comm) is parenthesised and may itself contain spaces and ')'. Splitting
+    # after the LAST ')' is the documented way to parse this file; splitting on
+    # whitespace from the left is the classic wrong way and misparses `claude (real)`.
+    try:
+        rest = data[data.rindex(b")") + 1 :].split()
+        return int(rest[19])  # field 22 overall; the split drops fields 1 and 2
+    except (ValueError, IndexError):
+        return None
+
+
+def pid_alive(pid: object, start_ticks: object = None) -> bool:
+    """True if `pid` names a live process that is still the one we launched."""
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return False
+    current = pid_start_ticks(pid)
+    if current is None:
+        return False
+    if isinstance(start_ticks, int) and not isinstance(start_ticks, bool):
+        return current == start_ticks
+    # No recorded start time — a record written before this field existed. Fall back to
+    # bare presence rather than refusing to judge; the alternative is a record that can
+    # never be reaped.
+    return True
+
+
+def write_run_record(
+    *,
+    run_id: str,
+    task_id: str,
+    agent: str,
+    launched_by: str,
+    pid: int,
+    log_path: Path,
+    workflow_mode: str,
+    run_as_user: str | None = None,
+    launcher: str | None = None,
+) -> dict | None:
+    """Record a launch. Returns the record, or None if it could not be written.
+
+    WRITTEN AFTER Popen, NOT BEFORE, and the ordering is not incidental. The record's
+    whole purpose is to carry a pid, and a record written first would have to carry a
+    null one — which every reader here treats as a dead run, so the reaper would sweep
+    the task to `failed` moments after the session it describes started successfully.
+    A launch with no record undercounts a concurrency slot; a record with no pid
+    fabricates a failure. The first is the cheaper way to be wrong.
+
+    `run_id` is minted by the caller, not here, for the same ordering reason: the child
+    carries it in FORGE_RUN_ID, so it has to exist before the process it identifies.
+    """
+    record = {
+        "run_id": run_id,
+        "task_id": task_id,
+        "agent": agent,
+        "launched_by": launched_by,
+        "run_as_user": run_as_user,
+        "launcher": launcher,
+        "workflow_mode": workflow_mode,
+        "started": now_iso(),
+        "pid": pid,
+        "pid_start_ticks": pid_start_ticks(pid),
+        "ended": None,
+        "exit_code": None,
+        "log_path": str(log_path),
+    }
+    path = LAUNCH_DIR / run_record_name(agent, task_id)
+    try:
+        LAUNCH_DIR.mkdir(parents=True, exist_ok=True)
+        atomic_write_json(path, record)
+    except Exception as e:
+        log.warning(f"Could not write run record {path.name}: {e}")
+        return None
+    return record
+
+
+def read_run_record(path: Path) -> dict | None:
+    try:
+        record = json.loads(path.read_text())
+    except Exception:
+        return None
+    return record if isinstance(record, dict) else None
+
+
+def iter_run_records() -> list[tuple[Path, dict]]:
+    """Every readable run record in the launch directory."""
+    try:
+        names = sorted(p for p in LAUNCH_DIR.glob("*.json"))
+    except OSError:
+        return []
+    out = []
+    for path in names:
+        # Regular files only, and is_symlink() rather than is_file(), which follows the
+        # link. A record's contents reach a task's history note through the sweep, so a
+        # symlink planted here would put an arbitrary file's first fields in front of an
+        # operator. The plugin's reader had exactly this hole and a real ~/.secrets
+        # symlink was planted in this directory to prove it.
+        if path.is_symlink() or not path.is_file():
+            continue
+        record = read_run_record(path)
+        if record is not None:
+            out.append((path, record))
+    return out
+
+
+def _record_age_seconds(record: dict) -> float | None:
+    try:
+        started = datetime.fromisoformat(str(record.get("started", "")))
+    except (ValueError, TypeError):
+        return None
+    if started.tzinfo is None:
+        started = started.replace(tzinfo=UTC)
+    return (datetime.now(UTC) - started).total_seconds()
+
+
+def _close_record(path: Path, record: dict, reason: str) -> dict:
+    """Stamp a run as ended, WITHOUT inventing an exit code.
+
+    `exit_code` stays null. The dispatcher does not outlive the session it starts — a
+    cron tick Popens a detached child and exits, so the child is reparented and its
+    status is reaped by init. There is no /proc entry left to read a status from and no
+    waitpid() to call: for a dispatcher-launched run the exit code is genuinely
+    unknowable, and `reaped` says which kind of unknowable it is.
+
+    A zero here would be a counter reporting success for something nobody observed
+    succeed, which is the failure class this whole build exists to make visible.
+    """
+    record["ended"] = now_iso()
+    record["reaped"] = reason
+    record.setdefault("exit_code", None)
+    with contextlib.suppress(Exception):
+        atomic_write_json(path, record)
+    return record
+
+
+def reap_runs() -> list[dict]:
+    """Close out run records whose session is gone. Returns those newly found dead.
+
+    Two outcomes, and only one of them licenses touching a task:
+
+      pid-gone      the process is not there. Evidence of death; the caller may sweep
+                    the task (see sweep_dead_runs).
+      max-runtime   the process is still alive but the run is older than
+                    MAX_RUN_SECONDS. This releases the concurrency SLOT and nothing
+                    else. Sweeping a task whose agent is demonstrably still working
+                    would be a fabricated failure, and would additionally break that
+                    agent's own close — `completed` is only reachable from
+                    `in-progress`, so the sweep would strand the very work it claimed
+                    to tidy up.
+    """
+    dead: list[dict] = []
+    for path, record in iter_run_records():
+        if record.get("ended"):
+            continue
+        if pid_alive(record.get("pid"), record.get("pid_start_ticks")):
+            age = _record_age_seconds(record)
+            if MAX_RUN_SECONDS > 0 and age is not None and age > MAX_RUN_SECONDS:
+                _close_record(path, record, "max-runtime")
+                log.warning(
+                    f"Run {record.get('run_id', path.stem)} exceeded "
+                    f"{MAX_RUN_SECONDS}s and its slot was released; pid "
+                    f"{record.get('pid')} is STILL RUNNING and its task is untouched"
+                )
+            continue
+        dead.append(_close_record(path, record, "pid-gone"))
+        log.info(
+            f"Reaped run {record.get('run_id', path.stem)} "
+            f"(agent={record.get('agent')} task={str(record.get('task_id'))[:8]} "
+            f"pid={record.get('pid')} exit_code=unknown)"
+        )
+    return dead
+
+
+def live_runs() -> list[dict]:
+    """Open run records whose process is still alive — the concurrency accounting.
+
+    Read from disk on every call rather than cached for the tick. Records are written
+    the moment a launch succeeds, so re-reading is what makes a cap hold WITHIN a tick;
+    a snapshot taken once would let a single tick launch the whole queue against a cap
+    of four.
+    """
+    return [
+        record
+        for _, record in iter_run_records()
+        if not record.get("ended") and pid_alive(record.get("pid"), record.get("pid_start_ticks"))
+    ]
+
+
+def launcher_accepts(launcher: str, flag: str) -> bool:
+    """Whether the DEPLOYED run-as launcher understands `flag`.
+
+    run-steward.sh refuses any unrecognised option outright (`die "unknown option"`), so
+    handing it a flag it has not learned yet does not degrade gracefully — it kills every
+    launch for that agent until the script is redeployed. And the two artefacts ship
+    separately: this repo deploys with venv-deploy.sh, the launcher lives in
+    host-forge-scripts and reaches /usr/local/sbin/forge only when a root
+    forge-scripts-deploy.sh run puts it there. They WILL be out of step, and today
+    already are — the repo copy is two comment-only commits ahead of the deployed one.
+
+    So the flag is offered, not assumed. Probing the deployed file for the literal is the
+    only channel available (there is no --help and no --version), and it has the property
+    that matters: it reads the artefact that will actually run. A version constant in this
+    repo would only ever assert something about this repo.
+    """
+    try:
+        return flag in Path(launcher).read_text()
+    except OSError:
+        return False
+
+
+# --- Backpressure and the stuck-run sweep (Phase 4, vikunja#559) ---
+#
+# There was no cap. Every eligible `submitted` task in a tick got a launch, so ten
+# `auto` tasks landing together spawned ten concurrent Claude sessions against one API
+# key. The caps below are counted from live run records, which is the only reason they
+# can exist at all — before Phase 3 there was nothing to count.
+
+
+# Non-positive means unlimited, for both caps. That is the documented escape hatch for
+# an operator who needs to drain a queue by hand, and it is why every comparison below
+# is guarded on `> 0` rather than being written as a bare `>=`.
+MAX_CONCURRENT_RUNS = _int_env("DISPATCHER_MAX_CONCURRENT_RUNS", 4)
+# One per agent, not two. Two sessions for the same agent share a project directory, a
+# scoped-mcp bearer token (identity IS the token) and a task-queue actor name, so the
+# second one is not a second worker — it is the same worker racing itself.
+MAX_RUNS_PER_AGENT = _int_env("DISPATCHER_MAX_RUNS_PER_AGENT", 1)
+# The two launch kinds that start a local `claude` session and therefore consume a slot.
+# `temporal` does not — it hands work to a Temporal worker and returns — and
+# `operator-pickup` launches nothing at all.
+LAUNCHING_KINDS = {"headless", "audit"}
+
+
+def launch_kind(task: dict, target_agent: str) -> str:
+    """What this tick will DO with an approved task: the single decision, two readers.
+
+    The backpressure gate has to know whether a launch is coming BEFORE the approval is
+    written, because a task denied a slot must stay `submitted` — and it cannot stay
+    `submitted` once the approve branch has put `approved` on disk. That makes the gate
+    a second reader of a decision the dispatch branch already makes. Two copies of that
+    decision, drifting, is the exact failure class this build exists to close, so there
+    is one function and both call it.
+
+    Note the ordering is load-bearing and matches the dispatch branch it was extracted
+    from: an audit outranks workflow_mode, which is why an audit launches headlessly
+    even in semi-auto.
+    """
+    task_type = task.get("task_type")
+    if task_type == "workflow":
+        return "temporal"
+    if task_type == "audit" and target_agent == "security":
+        return "audit"
+    # DO NOT rewrite this as `!= "semi-auto"` — see the comment at the dispatch branch.
+    if task.get("workflow_mode", "semi-auto") == "auto":
+        return "headless"
+    return "operator-pickup"
+
+
+def slot_denial(agent: str) -> str | None:
+    """The reason `agent` cannot have a launch slot right now, or None if it can."""
+    live = live_runs()
+    if MAX_CONCURRENT_RUNS > 0 and len(live) >= MAX_CONCURRENT_RUNS:
+        return (
+            f"global cap reached ({len(live)}/{MAX_CONCURRENT_RUNS} live runs: "
+            f"{', '.join(sorted(str(r.get('agent')) for r in live))})"
+        )
+    mine = [r for r in live if r.get("agent") == agent]
+    if MAX_RUNS_PER_AGENT > 0 and len(mine) >= MAX_RUNS_PER_AGENT:
+        return f"per-agent cap reached for {agent} ({len(mine)}/{MAX_RUNS_PER_AGENT} live runs)"
+    return None
+
+
+def auth_outage_active() -> bool:
+    """True while the auth-outage alert is inside its debounce window.
+
+    alert_auth_blocked() debounced the ALERT and not the ATTEMPT, so a dead OAuth still
+    burned one launch attempt per queued task per tick — and each of those attempts sent
+    its task to `routing-failed` with a backoff, converting a 15-minute credential
+    outage into a queue full of tasks that need chasing. Holding them at `submitted`
+    instead costs nothing: they are re-read from scratch on the next tick.
+
+    The stamp is not cleared on recovery, so launches stay held for up to
+    AUTH_ALERT_DEBOUNCE_SEC after auth comes back. At a 2-minute tick that is a handful
+    of delayed ticks, against a failure mode that previously needed manual cleanup.
+    """
+    return _auth_stamp_age() is not None
+
+
+def task_queue_api_secret() -> str:
+    """The shared secret for task-queue-mcp's control routes, or '' if unavailable.
+
+    The dispatcher runs from a bare crontab line, so its environment is close to empty —
+    the secret is normally read from a file here rather than inherited. Environment
+    first regardless, so an operator running a tick by hand can override.
+    """
+    from_env = os.environ.get("TASK_QUEUE_API_SECRET", "").strip()
+    if from_env:
+        return from_env
+    for path in SECRET_FILES:
+        value = read_env_file(path).get("TASK_QUEUE_API_SECRET", "").strip()
+        if value:
+            return value
+    return ""
+
+
+def control_api_update(task_id: str, status: str, note: str, on_behalf_of: str) -> bool:
+    """Sweep a task to a terminal status through the operator route. True on success.
+
+    POST /tasks/{id}/update is the ONE path that may close another agent's work
+    honestly: it binds `actor` to the shared secret (so it records `operator`), verifies
+    `on_behalf_of` against the task's own target_agent, and writes both names into
+    history. A sweep then reads as a sweep years later instead of as the agent having
+    quietly closed its own task. task-queue-mcp's README §"The operator sweep" is the
+    long version.
+
+    THERE IS NO FALLBACK TO WRITING THE QUEUE FILE. The dispatcher has atomic_write()
+    and could trivially set `status: failed` itself — and that is precisely the
+    dishonest close this route was built to replace. Without the secret this returns
+    False and the task is left alone.
+    """
+    secret = task_queue_api_secret()
+    if not secret:
+        log.error(
+            "Cannot sweep stuck runs: TASK_QUEUE_API_SECRET is not in the environment "
+            f"and not in {' or '.join(str(p) for p in SECRET_FILES)}. Refusing to write "
+            "the queue file directly — a sweep that does not go through the operator "
+            "route is indistinguishable in history from the agent closing its own work."
+        )
+        return False
+    url = f"{TASK_QUEUE_API}/tasks/{task_id}/update"
+    try:
+        resp = httpx.post(
+            url,
+            json={"status": status, "note": note, "on_behalf_of": on_behalf_of},
+            headers={"X-Task-Queue-Secret": secret},
+            timeout=10.0,
+        )
+    except httpx.HTTPError as e:
+        log.warning(f"Control API unreachable at {url}: {e}")
+        return False
+    if resp.status_code != 200:
+        # The body carries the handler's own refusal text (a rejected transition, a
+        # mismatched on_behalf_of). Logging the status alone turns a precise message
+        # into "it didn't work".
+        log.warning(
+            f"Control API refused the sweep of {task_id[:8]}: {resp.status_code} {resp.text[:300]}"
+        )
+        return False
+    return True
+
+
+def sweep_dead_runs(dead: list[dict]) -> None:
+    """Move each dead run's task out of `in-progress`, if it is still sitting there.
+
+    Evidence-gated on purpose, and this is the part that keeps it away from the existing
+    backlog: a task is only swept if a run record says a session was launched for it and
+    that session is gone. The 13 `in-progress` and 29 `approved` tasks that predate this
+    build have no run record, so nothing here can reach them — they are reported to the
+    operator by hand (see plan Phase 4.3), never bulk-closed.
+    """
+    for record in dead:
+        task_id = record.get("task_id")
+        if not isinstance(task_id, str) or not TASK_ID_RE.fullmatch(task_id):
+            continue
+        task = find_task_by_id(task_id)
+        if not task or task.get("status") != "in-progress":
+            continue
+        target_agent = task.get("target_agent", "")
+        note = (
+            f"Swept by the dispatcher: run {record.get('run_id')} is gone (agent "
+            f"{record.get('agent')}, pid {record.get('pid')}, started "
+            f"{record.get('started')}, reaped {record.get('ended')}). Exit code unknown "
+            f"— the dispatcher does not outlive the session it launches, so there is no "
+            f"status left to read. Log: {record.get('log_path')}"
+        )
+        if not control_api_update(task_id, "failed", note, target_agent):
+            continue
+        log.info(f"Swept {task_id[:8]} in-progress → failed (run {record.get('run_id')} died)")
+        bus_log(
+            "task.failed",
+            source="dispatcher",
+            summary=f"Stuck run swept: {task.get('summary', task_id[:8])}",
+            target=target_agent,
+            artifact_path=str(LAUNCH_DIR / run_record_name(str(record.get("agent")), task_id)),
+        )
 
 
 # --- Headless agent launch ---
@@ -639,6 +1160,8 @@ def launch_agent_headless(task: dict) -> None:
     # is what still gets logged below, because that is what the operator chose; this is
     # what its children will get.
     inherited_mode = child_workflow_mode(workflow_mode)
+    # Minted before the env is built and before Popen, because it travels IN that env.
+    run_id = str(uuid.uuid4())
     # Build env: inherit the running process env, layer in the target agent's
     # own .env (SCOPED_MCP_BEARER_TOKEN etc. — SMCP-28), then inject FORGE_WORKFLOW_MODE.
     # SECURITY[control]: workflow_mode is validated against VALID_WORKFLOW_MODES in task-queue-mcp
@@ -652,6 +1175,11 @@ def launch_agent_headless(task: dict) -> None:
     if run_as is None:
         child_env.update(load_agent_env(target))
     child_env["FORGE_WORKFLOW_MODE"] = inherited_mode
+    # The run's identity, in the child, so a Langfuse trace can be joined back to the
+    # task that paid for it — "what did this build cost" has been unanswerable purely
+    # because nothing downstream ever learned which task it was serving.
+    child_env["FORGE_RUN_ID"] = run_id
+    child_env["FORGE_TASK_ID"] = task_id
     # SMCP-28 fail-loud guard: .mcp.json's ${VAR} header interpolation only
     # supports bare $VAR/${VAR} (no bash :?/:- operators), so an unresolved
     # bearer token fails silently as a 401 deep inside the launched session
@@ -721,9 +1249,21 @@ def launch_agent_headless(task: dict) -> None:
             launcher,
             "--workflow-mode",
             inherited_mode,
-            "--",
-            prompt,
         ]
+        # PROPAGATION SITE for the run identity, and the reason it is conditional: sudo
+        # scrubs the environment, so unlike every other agent the run-as agent cannot be
+        # handed FORGE_RUN_ID through child_env — a flag is the only channel. See
+        # launcher_accepts() for why an undeployed launcher must not be assumed to have
+        # learned it.
+        if launcher_accepts(launcher, "--run-id"):
+            argv += ["--run-id", run_id, "--task-id", task_id]
+        else:
+            log.warning(
+                f"Deployed launcher {launcher} does not accept --run-id; launching "
+                f"{target} without a run identity in its environment. The run record is "
+                f"still written. Redeploy host-forge-scripts to close this."
+            )
+        argv += ["--", prompt]
 
     # One launch-log destination, shared with the CloudCLI task-queue plugin
     # (task-queue-plugin-repair-2026-08 Phase 3). This used to be
@@ -735,9 +1275,8 @@ def launch_agent_headless(task: dict) -> None:
     # PREVIEW_ALLOWED_PREFIXES, whereas ~/.pm2/logs is not and must not be added — that
     # prefix covers every PM2 service log on the host, which would make the plugin's
     # file-preview endpoint a reader of all of them.
-    log_dir = Path.home() / ".claude" / "comms" / "artifacts" / "task-launches"
-    log_dir.mkdir(parents=True, exist_ok=True)
-    log_file = log_dir / f"{target}-{task_id[:8]}.log"
+    LAUNCH_DIR.mkdir(parents=True, exist_ok=True)
+    log_file = LAUNCH_DIR / launch_log_name(target, task_id)
     with open(log_file, "a") as lf:
         proc = subprocess.Popen(
             argv,
@@ -746,8 +1285,19 @@ def launch_agent_headless(task: dict) -> None:
             stderr=lf,
             env=child_env,
         )
+    write_run_record(
+        run_id=run_id,
+        task_id=task_id,
+        agent=target,
+        launched_by="dispatcher",
+        pid=proc.pid,
+        log_path=log_file,
+        workflow_mode=workflow_mode,
+        run_as_user=run_as[0] if run_as else None,
+        launcher=run_as[1] if run_as else None,
+    )
     log.info(
-        f"Headless launch: {target} (pid={proc.pid}) task={task_id[:8]} "
+        f"Headless launch: {target} (pid={proc.pid}) task={task_id[:8]} run={run_id[:8]} "
         f"workflow_mode={workflow_mode} child_workflow_mode={inherited_mode}"
     )
 
@@ -1021,6 +1571,19 @@ def launch_security_audit(path: Path, task: dict, *, retry: bool = False) -> boo
     audit_task_id = task.get("id", "unknown")
     if not TASK_ID_RE.fullmatch(audit_task_id):
         audit_task_id = "invalid-id"
+    # THIS IS THE THIRD LAUNCHER, and it gets a run record for the same reason the other
+    # two do — plus one specific to Phase 4. An audit launches headlessly even in
+    # semi-auto (see the dispatch branch), which makes it the single most common kind of
+    # concurrent session on this host. A concurrency cap that counted the other two and
+    # not this one would be a cap in name only.
+    #
+    # Its log stays at ~/.pm2/logs/security-audit-<build>.log, keyed by build name, which
+    # is what an operator chasing an audit actually knows. So the record lives in the
+    # launch directory with `log_path` pointing out of it; the plugin's reader was taught
+    # to render that case rather than the log being relocated to suit the reader.
+    audit_run_id = str(uuid.uuid4())
+    audit_env["FORGE_RUN_ID"] = audit_run_id
+    audit_env["FORGE_TASK_ID"] = audit_task_id
     with open(audit_log, "a") as audit_log_fh:
         proc = subprocess.Popen(
             [
@@ -1036,8 +1599,20 @@ def launch_security_audit(path: Path, task: dict, *, retry: bool = False) -> boo
             stderr=audit_log_fh,
             env=audit_env,
         )
+    write_run_record(
+        run_id=audit_run_id,
+        task_id=audit_task_id,
+        agent="security",
+        launched_by="dispatcher-audit",
+        pid=proc.pid,
+        log_path=audit_log,
+        workflow_mode=task.get("workflow_mode", "semi-auto"),
+    )
     suffix = "— routing-failed retry" if retry else f"log={audit_log}"
-    log.info(f"{path.name}: headless audit launched for {build_name} (pid={proc.pid}) {suffix}")
+    log.info(
+        f"{path.name}: headless audit launched for {build_name} "
+        f"(pid={proc.pid}, run={audit_run_id[:8]}) {suffix}"
+    )
     return True
 
 
@@ -1219,6 +1794,27 @@ def process_submitted(manifests: dict) -> None:
         if needs_approval:
             request_approval(path, task, risk, max_auto, approval_reason, target_agent)
         else:
+            # BACKPRESSURE (Phase 4). Placed ahead of the approval write on purpose: a
+            # task denied a launch cannot stay `submitted` once `approved` is on disk,
+            # and staying `submitted` is exactly the contract — no new status is
+            # invented here, because a status is a three-repo vocabulary and adding one
+            # on a single side is the drift this build closes. The task is simply
+            # re-read from scratch on the next tick.
+            kind = launch_kind(task, target_agent)
+            if kind in LAUNCHING_KINDS:
+                if auth_outage_active():
+                    log.info(
+                        f"{path.name}: auth outage is live — holding at submitted "
+                        f"rather than burning a launch attempt (retry next tick)"
+                    )
+                    continue
+                denial = slot_denial(target_agent)
+                if denial:
+                    log.info(
+                        f"{path.name}: no launch slot — {denial}. Staying submitted, "
+                        f"retry next tick."
+                    )
+                    continue
             task["status"] = "approved"
             append_history(task, "approved", "dispatcher", f"Auto-approved: {approval_reason}")
             atomic_write(path, task)
@@ -1230,7 +1826,7 @@ def process_submitted(manifests: dict) -> None:
                     "summary": task.get("summary"),
                 },
             )
-            if task.get("task_type") == "workflow":
+            if kind == "temporal":
                 if launch_temporal_workflow(path, task):
                     task["status"] = "in-progress"
                     append_history(task, "in-progress", "dispatcher", "Temporal workflow submitted")
@@ -1257,21 +1853,16 @@ def process_submitted(manifests: dict) -> None:
             # implicitly approved by requesting it, and gating it behind a manual resume
             # would stall every build at the same point. Recorded here because it reads
             # like an oversight and has been questioned more than once.
-            elif task.get("task_type") == "audit" and target_agent == "security":
+            elif kind == "audit":
                 if not launch_security_audit(path, task):
                     continue
             else:
                 workflow_mode = task.get("workflow_mode", "semi-auto")
-                # DO NOT rewrite this as `!= "semi-auto"`. It reads like a tidy-up and it
-                # is the one edit that would silently auto-launch `manual-then-auto`,
-                # destroying the only property that mode has: that its own leg waits for
-                # an operator. An equality test against "auto" is load-bearing — every
-                # mode that is not literally "auto" must fall to operator pickup.
-                if workflow_mode == "auto":
-                    # workflow_mode is the only switch here. An older comment mentioned an
-                    # `auto_start` flag as an alternative trigger; no such field is a
-                    # submit_task parameter, none is written to any task, and nothing reads
-                    # one — it is gone from the agent docs too as of 2026-08-16.
+                # The `workflow_mode == "auto"` equality test that used to be spelled
+                # here now lives in launch_kind(), with its warning, so the gate above
+                # and this branch cannot disagree about what a mode means. DO NOT
+                # reintroduce a mode test here.
+                if kind == "headless":
                     log.info(f"{path.name}: workflow_mode=auto — launching headless")
                     launch_agent_headless(task)
                 else:
@@ -1487,6 +2078,16 @@ def main():
     # Sorted: dict order here is roster-file order, which is arbitrary and unstable across
     # edits. Unsorted it defeats `uniq` and would defeat log-based dedup in Loki too.
     log.debug(f"Loaded {len(manifests)} agent manifests: {sorted(manifests)}")
+
+    # Before process_submitted: the reaper reports on the PREVIOUS tick's launches, and
+    # dispatch decides this one's, so a tick reads top to bottom in the log.
+    #
+    # It is NOT a slot-accounting dependency, and it would be easy to write that here and
+    # be wrong. live_runs() tests pid liveness, not the `ended` field, so a run stops
+    # holding a slot the moment its process dies — reaping only records that it did. The
+    # order is pinned by a test so the sequence stays stable, not because reversing it
+    # would leak slots.
+    sweep_dead_runs(reap_runs())
 
     process_submitted(manifests)
     process_routing_failed(manifests)

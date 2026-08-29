@@ -77,6 +77,16 @@ _REAL_POPEN = subprocess.Popen
 # the test that called it.
 _REAL_MATRIX_NOTIFY = td.matrix_notify
 _REAL_PUBLISH_NATS = td.publish_nats
+# pid_alive() reads /proc, i.e. the HOST's process table. Left real, every test that
+# writes a run record would count as live-or-not depending on whether this machine
+# happens to have a process at the stub's pid right now — the concurrency cap would pass
+# or fail by coincidence. /proc is host state in exactly the sense the network is, so it
+# is cut here for the same reason, and handed back by `real_pid_alive`.
+_REAL_PID_ALIVE = td.pid_alive
+# load_agent_env() reads /opt/appdata/agents/<agent>/.env — real files on this host, which
+# is the second and less obvious credential channel `isolate` has to cut. The tests that
+# are ABOUT that parser take it back through `real_load_agent_env`.
+_REAL_LOAD_AGENT_ENV = td.load_agent_env
 
 
 class FakeProc:
@@ -109,15 +119,43 @@ def isolate(tmp_path, monkeypatch):
     monkeypatch.setattr(td, "ARCHIVE_DIR", queue / "archive")
     monkeypatch.setattr(td, "DEAD_LETTER_DIR", queue / "dead-letters")
     monkeypatch.setattr(td, "AUTH_ALERT_STAMP", queue / ".auth-alert-stamp")
+    # Run records. Without this every launch test writes into the module-scope $HOME and
+    # the records outlive the test — which would silently make the concurrency cap the
+    # NEXT test measures depend on how many launches ran before it.
+    launches_dir = tmp_path / "task-launches"
+    launches_dir.mkdir()
+    monkeypatch.setattr(td, "LAUNCH_DIR", launches_dir)
     manifests = tmp_path / "manifests"
     manifests.mkdir()
     monkeypatch.setattr(td, "MANIFEST_DIR", manifests)
     monkeypatch.setattr(td, "OAUTH_CRED_PATH", tmp_path / ".credentials.json")
 
+    # Cut the credential supply a launch checks for. TWO CHANNELS, and the second is the
+    # one that bites: this host has real /opt/appdata/agents/<agent>/.env files, and
+    # load_agent_env() reads them into child_env before the bearer-token guard runs. A
+    # test needing a launch therefore passed on this workstation and failed in CI, which
+    # has neither the files nor the exported vars — in the worst direction for this
+    # suite, because a launch that never happened is indistinguishable from a concurrency
+    # cap that refused it.
+    #
+    # load_agent_env is stubbed rather than pointed at a tmp path: reading /opt/appdata is
+    # host state in the same sense /proc and the network are, and this file cuts those too.
+    # A test that WANTS a launch takes the `launchable` fixture, which is explicit and
+    # cannot be satisfied by accident.
+    for var in (
+        "SCOPED_MCP_BEARER_TOKEN",
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+    ):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr(td, "load_agent_env", lambda agent_type: {})
+
     monkeypatch.setattr(td, "matrix_notify", lambda room, title, body: None)
     monkeypatch.setattr(td, "publish_nats", lambda *a, **k: None)
     monkeypatch.setattr(td, "bus_log", lambda *a, **k: None)
     monkeypatch.setattr(td.subprocess, "Popen", lambda *a, **k: FakeProc())
+    monkeypatch.setattr(td, "pid_alive", lambda pid, start_ticks=None: False)
     return queue
 
 
@@ -128,6 +166,22 @@ def queue(isolate):
 
 
 @pytest.fixture
+def launchable(dispatcher, monkeypatch):
+    """Satisfy the two credential guards, so a test reaches the logic it is about.
+
+    NOT part of `isolate`, deliberately: three tests exist to prove those guards REFUSE a
+    launch, and an autouse stub would quietly disarm them.
+
+    It is here rather than copied into each file because leaving it local is how a test
+    ends up depending on the developer's own shell. Tests written without it passed on a
+    workstation that carries a real SCOPED_MCP_BEARER_TOKEN and failed in CI, which has
+    none — a launch that never happened looks identical to a cap that refused it.
+    """
+    monkeypatch.setattr(dispatcher, "load_agent_env", lambda a: {"SCOPED_MCP_BEARER_TOKEN": "t"})
+    monkeypatch.setattr(dispatcher, "anthropic_creds_usable", lambda env: True)
+
+
+@pytest.fixture
 def real_popen(isolate, monkeypatch):
     """Undo `isolate`'s Popen stub for a test that must run a real child process.
 
@@ -135,6 +189,26 @@ def real_popen(isolate, monkeypatch):
     it always runs AFTER the stub is installed rather than racing it.
     """
     monkeypatch.setattr(td.subprocess, "Popen", _REAL_POPEN)
+
+
+@pytest.fixture
+def live_pids(isolate, monkeypatch):
+    """Declare which pids are alive. Returns the mutable set the stub consults."""
+    alive: set[int] = set()
+    monkeypatch.setattr(td, "pid_alive", lambda pid, start_ticks=None: pid in alive)
+    return alive
+
+
+@pytest.fixture
+def real_pid_alive(isolate, monkeypatch):
+    """Restore the real pid_alive, for the tests that are about /proc itself."""
+    monkeypatch.setattr(td, "pid_alive", _REAL_PID_ALIVE)
+
+
+@pytest.fixture
+def real_load_agent_env(isolate, monkeypatch):
+    """Restore the real load_agent_env, for the tests that are about the parser itself."""
+    monkeypatch.setattr(td, "load_agent_env", _REAL_LOAD_AGENT_ENV)
 
 
 @pytest.fixture

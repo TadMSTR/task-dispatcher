@@ -97,11 +97,11 @@ jobs:
   # Coverage is a floor, not a report. It was configured in pyproject.toml and measured
   # by nobody, so it drifted unobserved.
   #
-  # 94, and the number is the MEASURED value of what this build ships (94.86%), not an
-  # aspirational one — same rule as when this job was added at 46. The build plan asked
-  # for 80; 80 would pass today while allowing fifteen points of silent regression, which
-  # is the failure mode a floor exists to prevent. It is a ratchet: raise it when the
-  # measured value rises, and never lower it to make a commit go green.
+  # 96, and the number is the MEASURED value of what this build ships (96.64%), not an
+  # aspirational one — same rule as when this job was added at 46 and raised to 94. The
+  # build plan asked for 80; 80 would pass today while allowing sixteen points of silent
+  # regression, which is the failure mode a floor exists to prevent. It is a ratchet:
+  # raise it when the measured value rises, and never lower it to make a commit go green.
   #
   # `precision = 2` in pyproject.toml is what makes this safe to set close to the measured
   # value. At precision 0 a real regression of half a point hides inside a rounding
@@ -165,7 +165,7 @@ jobs:
           coverage combine
 
       - name: Report and enforce the floor
-        run: coverage report --fail-under=94
+        run: coverage report --fail-under=96
 
   # Secret scanning ran only on the developer's workstation before this. The config
   # shipped; nothing in CI executed it, so the repo had a leak gate in name only — on a
