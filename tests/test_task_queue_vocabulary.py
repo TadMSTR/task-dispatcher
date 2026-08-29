@@ -194,6 +194,19 @@ def check_shared_dirnames() -> None:
 
 def fetch_upstream() -> str:
     try:
+        # SECURITY[accepted]: urllib follows redirects by default; no redirect handling is
+        # set, deviating from baseline pattern SSRF-02. Same disposition as the TypeScript
+        # gates in cloudcli-plugin-task-queue, and recorded inline for the same reason —
+        # so the next audit of this file reads the ruling instead of re-deriving it.
+        # The URL is not caller-supplied: host and path are literals and only the ref
+        # segment varies, charset-checked and `..`-rejected above. Nothing fetched is
+        # executed — it is parsed with `ast` and never imported. Worst case from a hostile
+        # redirect is a false red (loud, blocks CI) or a false green requiring the attacker
+        # to serve the exact correct upstream, which achieves nothing. This runs in CI and
+        # from a developer shell only. Reviewed and accepted 2026-08-29 —
+        # agent-workflow-interop-2026-08-phase5 audit, INFO 3; row in
+        # host-forge-knowledge-base/security/accepted-risks.md. Revisit if this is ever
+        # made to accept a caller-supplied URL or host.
         with urllib.request.urlopen(UPSTREAM_URL, timeout=30) as resp:
             if resp.status != 200:
                 raise urllib.error.HTTPError(
