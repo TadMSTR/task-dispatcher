@@ -36,6 +36,35 @@ except ImportError:
         pass  # no-op if client missing (safe degradation)
 
 
+def bus_metadata(task: dict, run_id: str | None = None) -> dict:
+    """Correlation fields for a bus event, derived from the task it is about.
+
+    WHY THIS EXISTS (plan Phase 5.2). Every bus_log() call passed `artifact_path` and
+    no `metadata`, so joining a bus event back to its task meant string-parsing a
+    filename — while the `publish_nats()` call on the adjacent line was already sending
+    a structured `{"task_id": ...}`. Two emitters, one event, and only the one nobody
+    consumed carried the id.
+
+    One function rather than seven inline dicts: seven copies of a field list is seven
+    places for one of them to quietly stop including `run_id`, which is the shape of
+    drift this whole build plan is about.
+
+    `run_id` is an argument rather than a task field because a task does not have one —
+    a RUN does. Only the sweep path holds a run record at the point it logs; everywhere
+    else it is legitimately absent, and absent is honest.
+
+    Keys with no value are omitted rather than emitted as null, so a consumer can tell
+    "this event has no run" from "this event's run id failed to resolve".
+    """
+    fields = {
+        "task_id": task.get("id"),
+        "run_id": run_id,
+        "workflow_mode": task.get("workflow_mode"),
+        "risk_level": task.get("risk_level"),
+    }
+    return {k: v for k, v in fields.items() if v is not None}
+
+
 # --- Config ---
 TASK_QUEUE_DIR = Path.home() / ".claude" / "task-queue"
 ARCHIVE_DIR = TASK_QUEUE_DIR / "archive"
@@ -378,6 +407,7 @@ def handle_routing_failure(path: Path, task: dict, reason: str) -> None:
             summary=f"Routing failed (retry {retry_count + 1}/{max_retries}): {reason}",
             target=task.get("target_agent"),
             artifact_path=str(path),
+            metadata=bus_metadata(task),
         )
         log.info(
             f"{path.name}: routing failed ({reason}); "
@@ -385,13 +415,13 @@ def handle_routing_failure(path: Path, task: dict, reason: str) -> None:
         )
     else:
         task["status"] = "failed"
-        publish_nats("tasks.failed", {"task_id": task.get("id"), "summary": task.get("summary")})
         bus_log(
             "task.failed",
             source="dispatcher",
             summary=f"Task failed (exhausted {max_retries} retries): {reason}",
             target=task.get("target_agent"),
             artifact_path=str(path),
+            metadata=bus_metadata(task),
         )
         log.warning(f"{path.name}: exhausted {max_retries} retries: {reason}")
         move_to_dead_letter(path, task, reason)
@@ -492,17 +522,6 @@ def matrix_notify(room: str, title: str, body: str) -> None:
         log.info(f"matrix_notify sent to #{room}: {title}")
     except Exception as e:
         log.warning(f"matrix_notify failed for #{room}: {title!r}: {e}")
-
-
-# --- NATS publish (fire-and-forget) ---
-def publish_nats(subject: str, payload: dict) -> None:
-    """Fire-and-forget NATS publish — never blocks the dispatcher."""
-    with contextlib.suppress(Exception):
-        subprocess.run(
-            ["nats", "pub", "--server", "nats://localhost:4222", subject, json.dumps(payload)],
-            timeout=5,
-            capture_output=True,
-        )
 
 
 # --- .env file reader (SMCP-28) ---
@@ -1119,6 +1138,9 @@ def sweep_dead_runs(dead: list[dict]) -> None:
             summary=f"Stuck run swept: {task.get('summary', task_id[:8])}",
             target=target_agent,
             artifact_path=str(LAUNCH_DIR / run_record_name(str(record.get("agent")), task_id)),
+            # The only site with a run in hand: the sweep is reading run records, so
+            # the event can name the run that died rather than only the task.
+            metadata=bus_metadata(task, run_id=record.get("run_id")),
         )
 
 
@@ -1457,20 +1479,13 @@ def request_approval(
     task["status"] = "pending-approval"
     append_history(task, "pending-approval", "dispatcher", f"Needs approval: {approval_reason}")
     atomic_write(path, task)
-    publish_nats(
-        "tasks.approval-requested",
-        {
-            "task_id": task.get("id"),
-            "target_agent": target_agent,
-            "risk_level": risk,
-        },
-    )
     bus_log(
         "task.dispatched",
         source="dispatcher",
         summary=f"Dispatched for approval: {task.get('summary', path.stem)}",
         target=target_agent,
         artifact_path=str(path),
+        metadata=bus_metadata(task),
     )
     log.info(f"{path.name}: → pending-approval (risk={risk}, max_auto={max_auto})")
     matrix_notify(
@@ -1681,6 +1696,7 @@ def process_submitted(manifests: dict) -> None:
                 summary=f"Notification delivered: {task.get('summary', path.stem)}",
                 target=task.get("target_agent", ""),
                 artifact_path=str(path),
+                metadata=bus_metadata(task),
             )
             # The room name is the ONE value here that is not just rendered — it selects
             # a destination. This branch returns before the routing block, so unlike the
@@ -1704,15 +1720,6 @@ def process_submitted(manifests: dict) -> None:
             continue
 
         log.info(f"Processing submitted task: {path.name}")
-        publish_nats(
-            "tasks.submitted",
-            {
-                "task_id": task.get("id"),
-                "summary": task.get("summary"),
-                "target_agent": task.get("target_agent"),
-                "risk_level": task.get("risk_level", "low"),
-            },
-        )
         target = task.get("target_agent", "auto")
 
         # Resolve auto-routing
@@ -1818,14 +1825,6 @@ def process_submitted(manifests: dict) -> None:
             task["status"] = "approved"
             append_history(task, "approved", "dispatcher", f"Auto-approved: {approval_reason}")
             atomic_write(path, task)
-            publish_nats(
-                "tasks.approved",
-                {
-                    "task_id": task.get("id"),
-                    "target_agent": target_agent,
-                    "summary": task.get("summary"),
-                },
-            )
             if kind == "temporal":
                 if launch_temporal_workflow(path, task):
                     task["status"] = "in-progress"
@@ -1837,6 +1836,7 @@ def process_submitted(manifests: dict) -> None:
                         summary=f"Temporal workflow started: {task.get('summary', path.stem)}",
                         target=target_agent,
                         artifact_path=str(path),
+                        metadata=bus_metadata(task),
                     )
                     log.info(f"{path.name}: → in-progress (temporal workflow)")
                     matrix_notify(
@@ -1889,6 +1889,7 @@ def process_submitted(manifests: dict) -> None:
                 summary=task.get("summary", path.stem),
                 target=target_agent,
                 artifact_path=str(path),
+                metadata=bus_metadata(task),
             )
             log.info(f"{path.name}: → approved (auto)")
             matrix_notify(

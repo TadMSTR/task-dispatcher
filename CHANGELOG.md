@@ -5,6 +5,75 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.0] - 2026-08-29
+
+Build plan `agent-workflow-interop-2026-08`, Phase 5.2–5.5. Tickets vikunja#560, #561.
+
+### Removed
+
+- **`publish_nats()` and its four call sites, outright — no deprecation window.** The
+  dispatcher published `tasks.submitted` / `tasks.approved` / `tasks.failed` /
+  `tasks.approval-requested` by shelling out to the `nats` CLI, alongside agent-bus
+  publishing the same logical events on its own subject: two subjects, two payload
+  shapes, one set of events, and only one of them with a consumer.
+
+  Verified before deleting rather than assumed — the preflight measurement was
+  re-checked against the live host at build time: **zero** JetStream streams captured
+  `tasks.*`, `tasks.{submitted,approved,failed,approval-requested}` appears nowhere in
+  `~/repos/personal` or `~/scripts` outside this repo and its own tests, and
+  `nats.conf`'s per-agent grants are scoped to `tasks.<agent>.>` subtrees that none of
+  those subjects match. Every one of those publishes was being discarded on arrival.
+
+  This also removes the dispatcher's only reason to shell out to a `nats` binary, which
+  was a PATH dependency in a cron context — a class of failure this repo has hit before.
+
+### Added
+
+- **Correlation ids on every bus event.** All seven `bus_log()` sites now pass
+  `metadata={"task_id", "run_id", "workflow_mode", "risk_level"}` via a new
+  `bus_metadata()` helper. Joining a bus event to its task previously meant
+  string-parsing a filename out of `artifact_path`, while the `publish_nats()` call on
+  the adjacent line was already sending a structured `{"task_id": ...}` — the emitter
+  with no consumer was the only one carrying the id.
+
+  Fields with no value are omitted rather than emitted as null, so a consumer can tell
+  "this event has no run" from "this event's run id failed to resolve". Only the
+  stuck-run sweep holds a run record when it logs, so `run_id` is an argument rather
+  than a task field.
+
+  The build plan said six sites. There are seven — `task.dispatched` in
+  `request_approval()` was missed when the plan was written, which is why
+  `tests/test_bus_correlation.py` asserts the COUNT as well as the property.
+
+- **`tests/test_bus_vocabulary.py`** — a new gate, in its own CI job. Parses the event
+  types out of `cli.py` with `ast` and asserts each is declared in agent-bus's
+  `event_vocab.py`, read from that repo's `main`. This is the check that would have
+  caught `task.workflow_started`, emitted here for months while undeclared upstream; it
+  reached the cross-agent log only because every caller happened to leave `scope` at its
+  default. agent-bus v0.4.0 turned that accident into a rejection under
+  `AGENT_BUS_STRICT_VOCAB=enforce`.
+
+  It refuses a computed event type rather than skipping it, and it has no
+  skip-on-no-network path — a check that passes when it could not read the upstream
+  reports the same result whether or not the two sides agree.
+
+- **`tests/fixtures/launch-policy-corpus.json`** — 27 accept/reject cases for the launch
+  policy validator, loaded by this suite AND by the CloudCLI plugin's, which fetches it
+  from this repo's `main`. The plugin's `launch-policy.ts` carried a comment saying the
+  Python side "must keep computing this the same way"; this is that comment as a test.
+  Resolved values are compared, not just verdicts — the `.resolve()` divergence that
+  motivated this changed what a spawn's cwd would be long before it changed any
+  accept/reject answer.
+
+- **The dead-letter and archive directory names are now gated** in
+  `test_task_queue_vocabulary.py`. `task-dispatcher` writes
+  `~/.claude/task-queue/dead-letters/` and task-queue-mcp reads it, through two
+  independent literals nothing pinned together; if the writer's name drifted,
+  `get_task` and `list_tasks` would silently stop finding new dead letters — vikunja#557
+  recurring inside the fix for vikunja#557. Carried in from the Phase 1 audit, which
+  deferred it here by name.
+
+
 ## [1.3.0] - 2026-08-29
 
 Gives every launch a run record, then uses it for the two things that were impossible

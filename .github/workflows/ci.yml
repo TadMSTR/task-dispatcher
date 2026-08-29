@@ -142,6 +142,7 @@ jobs:
       #   test_task_queue_vocabulary  reads task-queue-mcp's vocabulary over the network;
       #                               it lives in its own job precisely so an upstream
       #                               change is not confusable with a defect here.
+      #   test_bus_vocabulary.py      same, against agent-bus's event_vocab.py.
       #   test_bus_emitter_live.py    needs the git+https `bus` extra. Coupling the floor
       #                               to a network install makes the gate flaky in the one
       #                               direction that matters — a spurious red teaches
@@ -224,3 +225,28 @@ jobs:
       # only ref that proves parity with what is deployed. See the test's docstring.
       - name: task queue vocabulary parity
         run: python tests/test_task_queue_vocabulary.py
+
+  # SEPARATE JOB, for the same reason as vocabulary-parity above and NOT folded into it:
+  # they read two different upstreams. Sharing a job would mean an agent-bus change and a
+  # task-queue-mcp change produce the same red, and the first failure would stop the
+  # second from running at all — so "which upstream moved" would need a log dive on every
+  # occurrence.
+  #
+  # This is the gate that would have caught `task.workflow_started`, emitted here for
+  # months while absent from agent-bus's vocabulary. It reached the cross-agent log by
+  # accident (see the test's docstring); agent-bus v0.4.0 made that accident a rejection
+  # under AGENT_BUS_STRICT_VOCAB=enforce.
+  bus-vocabulary:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.13"
+
+      # AGENT_BUS_REF is deliberately NOT set — it defaults to `main`. A pipeline pinned
+      # to a feature branch would assert agreement with something nobody is running.
+      - name: bus event vocabulary parity
+        run: python tests/test_bus_vocabulary.py

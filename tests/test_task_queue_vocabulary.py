@@ -15,6 +15,20 @@ task-queue-headless-chain-2026-08 added two values that both sides must agree on
 (`notify` as self-terminal, `manual-then-auto`), which is the second instance of
 exactly this class. Rather than add it and file the drift, this closes it.
 
+THE DIRECTORY NAMES ARE THE SAME CONTRACT, ONE LAYER DOWN
+
+Carried in from the Phase 1 audit of agent-workflow-interop-2026-08 (INFO, deferred
+to Phase 5 by name). `task-dispatcher` WRITES `~/.claude/task-queue/dead-letters/`
+and task-queue-mcp READS it, via two independent string literals that nothing pinned
+to each other. If the writer's name drifts, `get_task` and `list_tasks` silently stop
+finding new dead letters — which is vikunja#557 exactly, recurring in the fix for
+vikunja#557. Seventeen security audit requests went into that directory over three
+months and no interface could show them.
+
+The names live in different syntax on each side (`TASK_QUEUE_DIR / "dead-letters"`
+here, a bare `DEAD_LETTER_DIRNAME = "dead-letters"` upstream), which is why they need
+their own extractor below rather than falling out of the set comparison.
+
 HOW
 
 The MCP is a separate, public repo, so the check reads its source over HTTP and
@@ -121,6 +135,63 @@ def literal_sets(source: str, origin: str) -> dict[str, set]:
     return found
 
 
+# The shared directory names: dispatcher constant → MCP constant. The dispatcher spells
+# each as a path join off TASK_QUEUE_DIR; the MCP spells it as a bare string, because it
+# joins with os.path. What must agree is the SEGMENT, not the expression.
+SHARED_DIRNAMES = {
+    "DEAD_LETTER_DIR": "DEAD_LETTER_DIRNAME",
+    "ARCHIVE_DIR": "ARCHIVE_DIRNAME",
+}
+
+
+def literal_strings(source: str, origin: str) -> dict[str, str]:
+    """Module-level `NAME = "value"` and `NAME = <anything> / "value"` string literals.
+
+    The second form is the dispatcher's (`TASK_QUEUE_DIR / "dead-letters"`); only the
+    final path segment is taken, since that is the part the two repos must agree on. A
+    multi-segment join would yield only its last component, which would be a wrong
+    comparison rather than a missing one — so it is refused below instead.
+    """
+    found: dict[str, str] = {}
+    for node in ast.parse(source).body:
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+            continue
+        target = node.targets[0]
+        if not isinstance(target, ast.Name):
+            continue
+        value = node.value
+        if isinstance(value, ast.BinOp) and isinstance(value.op, ast.Div):
+            # `A / "b"` — take the right operand, and only if it is a plain literal.
+            value = value.right
+        if isinstance(value, ast.Constant) and isinstance(value.value, str):
+            found[target.id] = value.value
+    return found
+
+
+def check_shared_dirnames() -> None:
+    """The dead-letter/archive directory names, writer vs reader."""
+    disp = literal_strings(DISPATCHER.read_text(), "src/task_dispatcher/cli.py")
+    mcp = literal_strings(fetch_upstream(), "task-queue-mcp/src/tools/queue.py")
+
+    for disp_name, mcp_name in sorted(SHARED_DIRNAMES.items()):
+        ours, theirs = disp.get(disp_name), mcp.get(mcp_name)
+        if ours is None:
+            # Not "assume it moved and pass" — an unparseable writer side is exactly
+            # the state in which this contract is least verified and most likely broken.
+            check(False, f"{disp_name} is missing or not a plain literal in cli.py")
+            continue
+        if theirs is None:
+            check(False, f"{mcp_name} is missing from task-queue-mcp — renamed upstream?")
+            continue
+        check(
+            ours == theirs,
+            f"{disp_name} == {mcp_name} ({ours!r})"
+            if ours == theirs
+            else f"{disp_name}={ours!r} != {mcp_name}={theirs!r} — the writer and the "
+            f"reader disagree about where dead letters live, so nothing will find them",
+        )
+
+
 def fetch_upstream() -> str:
     try:
         with urllib.request.urlopen(UPSTREAM_URL, timeout=30) as resp:
@@ -172,6 +243,8 @@ def main() -> int:
                 detail.append(f"mcp-only: {only_theirs}")
             check(False, f"{disp_name} != {mcp_name} — " + "; ".join(detail))
 
+    check_shared_dirnames()
+
     print()
     if FAILURES:
         print(f"VOCABULARY DRIFT ({len(FAILURES)}):")
@@ -180,7 +253,10 @@ def main() -> int:
         print()
         print(
             "Fix by editing the vocabulary block in src/task_dispatcher/cli.py to match "
-            "task-queue-mcp. Do not edit this test to make it pass."
+            "task-queue-mcp — or, for a DIRECTORY NAME failure, by agreeing the segment "
+            "on both sides: the dispatcher writes that directory and task-queue-mcp "
+            "reads it, so a mismatch means dead letters exist that no tool can "
+            "enumerate. Do not edit this test to make it pass."
         )
         return 1
     print("vocabulary is in sync")

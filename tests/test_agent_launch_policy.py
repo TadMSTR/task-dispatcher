@@ -28,6 +28,7 @@ can drift from it. Validating the live file is host-forge/scripts' job.
 from __future__ import annotations
 
 import importlib
+import json
 import os
 import sys
 import tempfile
@@ -334,6 +335,75 @@ check(
     all(e["run_as_user"] is None for a, e in td.LAUNCH_POLICY.items() if a not in td.AGENT_RUN_AS),
     "no agent outside AGENT_RUN_AS carries a run_as_user",
 )
+
+# --- the shared cross-language corpus (plan Phase 5.5) ------------------------
+#
+# tests/fixtures/launch-policy-corpus.json is validated by BOTH this validator and the
+# CloudCLI plugin's validateLaunchPolicy(). The plugin fetches it from this repo's
+# `main`; this side reads it from disk. See the corpus's own $schema_notes for why it
+# exists and why a verdict-only comparison would not have caught the divergence that
+# motivated it.
+print("\nshared accept/reject corpus (must agree with the plugin, case for case)")
+
+_CORPUS = json.loads((REPO_ROOT / "tests" / "fixtures" / "launch-policy-corpus.json").read_text())
+_CORPUS_ROOT = _HOME / ".claude" / "projects"
+
+
+def _sub(value):
+    """Substitute {HOME} through a nested structure.
+
+    Each side substitutes its OWN home — Python expands `~` against the ambient $HOME
+    while the TypeScript side expands it against an argument, so a literal path in the
+    corpus would make the two incomparable for exactly the `~` cases.
+    """
+    if isinstance(value, str):
+        return value.replace("{HOME}", str(_HOME))
+    if isinstance(value, dict):
+        return {k: _sub(v) for k, v in value.items()}
+    return value
+
+
+check(bool(_CORPUS.get("cases")), "the corpus parsed and is non-empty")
+
+for _case in _CORPUS["cases"]:
+    _name = _case["name"]
+    _policy = _sub(_case["policy"])
+    try:
+        _got = td.validate_launch_policy(_policy, project_root=_CORPUS_ROOT)
+        _verdict = "accept"
+        _error = None
+    except td.LaunchPolicyError as e:
+        _got = None
+        _verdict = "reject"
+        _error = str(e)
+
+    if _verdict != _case["expect"]:
+        detail = f"got {_verdict}" + (f" ({_error})" if _error else "")
+        check(False, f"corpus[{_name}]: expected {_case['expect']}, {detail}")
+        continue
+    check(True, f"corpus[{_name}]: {_verdict}")
+
+    if _case["expect"] != "accept":
+        continue
+
+    # A verdict match is not enough. The RESOLVED values are what reach a subprocess —
+    # the .resolve() divergence this corpus exists for changed the spawn cwd long
+    # before it changed any accept/reject answer.
+    _want = _sub(_case["resolved"])
+    _flat = {
+        agent: {
+            "project_dir": str(entry["project_dir"]),
+            "run_as_user": entry["run_as_user"],
+            "launcher": entry["launcher"],
+        }
+        for agent, entry in _got.items()
+    }
+    check(
+        _flat == _want,
+        f"corpus[{_name}]: resolved values match"
+        if _flat == _want
+        else f"corpus[{_name}]: resolved {_flat} != expected {_want}",
+    )
 
 print()
 if FAILURES:

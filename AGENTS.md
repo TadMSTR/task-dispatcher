@@ -76,16 +76,31 @@ fail. `tests/test_version_no_roster.py` pins both halves.
 
 ## Tests
 
-They are standalone scripts with a `check()` harness, not a pytest suite. Run them
-directly; each exits non-zero on failure. CI gives each one **its own step** so an early
-failure cannot mask a later one.
+Two harnesses. Most tests are pytest (`pytest`); seven are standalone scripts with a
+`check()` harness, run directly and exiting non-zero on failure. CI gives each script
+**its own step** so an early failure cannot mask a later one, and
+`tests/test_ci_wiring.py` asserts every `tests/test_*.py` is either collected by pytest
+or named in `conftest.collect_ignore` **and** run by its own named CI job — so a new file
+cannot end up in neither.
 
-The vocabulary parity check runs as a **separate CI job**. It compares this package's
-queue vocabulary against `task-queue-mcp`'s `main` over HTTPS, so it goes red when that
-repository changes — an alarm about the world, not about your commit. Keeping it in its
-own job stops it being confused with a genuine regression. It has no skip path: a check
-that passes when it could not reach the upstream reports the same thing whether or not the
-two sides agree.
+**Two parity checks run as separate CI jobs**, one per upstream:
+
+- `test_task_queue_vocabulary.py` — this package's queue vocabulary, and the
+  `dead-letters`/`archive` directory names, against `task-queue-mcp`'s `main`.
+- `test_bus_vocabulary.py` — the event types this dispatcher emits, against `agent-bus`'s
+  `main`.
+
+Both read over HTTPS, so either goes red when its upstream changes — an alarm about the
+world, not about your commit. They are separate jobs, not one, because sharing a job
+would make the two upstreams produce the same red and let the first failure stop the
+second from running.
+
+Neither has a skip path: a check that passes when it could not reach the upstream reports
+the same thing whether or not the two sides agree.
+
+`tests/fixtures/launch-policy-corpus.json` is the third of these, inverted — this repo
+OWNS it and the CloudCLI plugin fetches it from `main`. Adding a case pins a behaviour in
+both languages at once. Do not delete a case to make a side pass; make the sides agree.
 
 ## Releasing
 
