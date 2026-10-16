@@ -93,13 +93,20 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 # — they enumerate the `task.*` lifecycle events and miss `task.workflow_started`, which is
 # emitted from the Temporal branch of process_submitted(). That undercount is exactly what
 # the parity check exists to catch, and it caught it on the first run.
+#
+# v1.5.0 (operator-panel part 3): `task.dispatched` → `task.pending-approval`,
+# `task.workflow_started` → `task.workflow-started` (vikunja#553), and three new types,
+# `task.dead-lettered`, `run.started`, `run.ended`.
 DISPATCHER_EVENTS = [
+    "run.ended",
+    "run.started",
     "task.approved",
     "task.completed",
-    "task.dispatched",
+    "task.dead-lettered",
     "task.failed",
+    "task.pending-approval",
     "task.routing-failed",
-    "task.workflow_started",
+    "task.workflow-started",
 ]
 
 # Run in a child so AGENT_BUS_COMMS_DIR is set before agent_bus_client resolves it at

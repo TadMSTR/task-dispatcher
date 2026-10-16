@@ -210,7 +210,8 @@ def test_exhausted_retries_emit_task_failed_not_routing_failed(dispatcher, write
 
     dispatcher.handle_routing_failure(path, task, "reason")
 
-    assert [e for e, _ in bus] == ["task.failed"]
+    # Then dead-lettered (v1.5.0), still never routing-failed.
+    assert [e for e, _ in bus] == ["task.failed", "task.dead-lettered"]
 
 
 def test_exhausted_retries_do_not_schedule_another_attempt(dispatcher, queue, write_task):

@@ -69,8 +69,14 @@ def test_the_expected_number_of_emitter_sites_is_pinned():
     The build plan said six sites; there are seven. `task.dispatched` in
     request_approval was missed when the plan was written, and a check that only looked
     for "sites without metadata" would have reported clean either way.
+
+    Eleven since v1.5.0 (operator-panel part 3): +task.dead-lettered, +run.started,
+    +run.ended, +task.completed and +task.workflow-started on the routing-failed retry
+    path, which wrote those statuses with no event; the sweep's own task.failed was
+    deleted (task-queue-mcp emits it for the API write), and task.approved moved into
+    approve_and_write, so it is one site, not two.
     """
-    assert len(_bus_log_calls(CLI_SOURCE.read_text())) == 7
+    assert len(_bus_log_calls(CLI_SOURCE.read_text())) == 11
 
 
 # ── bus_metadata itself ───────────────────────────────────────────────────────

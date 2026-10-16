@@ -36,7 +36,12 @@ except ImportError:
         pass  # no-op if client missing (safe degradation)
 
 
-def bus_metadata(task: dict, run_id: str | None = None) -> dict:
+def bus_metadata(
+    task: dict,
+    run_id: str | None = None,
+    from_status: str | None = None,
+    to_status: str | None = None,
+) -> dict:
     """Correlation fields for a bus event, derived from the task it is about.
 
     WHY THIS EXISTS (plan Phase 5.2). Every bus_log() call passed `artifact_path` and
@@ -55,12 +60,22 @@ def bus_metadata(task: dict, run_id: str | None = None) -> dict:
 
     Keys with no value are omitted rather than emitted as null, so a consumer can tell
     "this event has no run" from "this event's run id failed to resolve".
+
+    `from_status` / `to_status` are passed at every site that writes a status (operator-
+    panel part 3). task-queue-mcp's events carry the same two keys, and the coverage check
+    matches every queue history entry to an event by `(task_id, to_status)`, whichever
+    component wrote it. `build_name` / `audit_round` are task fields since task-queue-mcp
+    v0.14.0, carried so a build's timeline can join dispatcher events too.
     """
     fields = {
         "task_id": task.get("id"),
         "run_id": run_id,
+        "from_status": from_status,
+        "to_status": to_status,
         "workflow_mode": task.get("workflow_mode"),
         "risk_level": task.get("risk_level"),
+        "build_name": task.get("build_name"),
+        "audit_round": task.get("audit_round"),
     }
     return {k: v for k, v in fields.items() if v is not None}
 
@@ -384,6 +399,7 @@ def handle_routing_failure(path: Path, task: dict, reason: str) -> None:
     policy = task.setdefault("retry_policy", {})
     retry_count = policy.get("retry_count", 0)
     max_retries = policy.get("max_retries", 3)
+    from_status = task.get("status")
 
     policy["last_failure_reason"] = reason
     append_history(task, "routing-failed", "dispatcher", reason)
@@ -407,7 +423,7 @@ def handle_routing_failure(path: Path, task: dict, reason: str) -> None:
             summary=f"Routing failed (retry {retry_count + 1}/{max_retries}): {reason}",
             target=task.get("target_agent"),
             artifact_path=str(path),
-            metadata=bus_metadata(task),
+            metadata=bus_metadata(task, from_status=from_status, to_status="routing-failed"),
         )
         log.info(
             f"{path.name}: routing failed ({reason}); "
@@ -421,7 +437,7 @@ def handle_routing_failure(path: Path, task: dict, reason: str) -> None:
             summary=f"Task failed (exhausted {max_retries} retries): {reason}",
             target=task.get("target_agent"),
             artifact_path=str(path),
-            metadata=bus_metadata(task),
+            metadata=bus_metadata(task, from_status=from_status, to_status="failed"),
         )
         log.warning(f"{path.name}: exhausted {max_retries} retries: {reason}")
         move_to_dead_letter(path, task, reason)
@@ -828,7 +844,36 @@ def write_run_record(
     except Exception as e:
         log.warning(f"Could not write run record {path.name}: {e}")
         return None
+    # Emitted only once the record is on disk, so a `run.started` always has a record
+    # behind it. A reader of "live runs" needs these two events, not the record files.
+    bus_log(
+        "run.started",
+        source="dispatcher",
+        summary=f"Run started: {agent} for task {task_id[:8]}",
+        target=agent,
+        artifact_path=str(path),
+        metadata=run_metadata(record),
+    )
     return record
+
+
+def run_metadata(record: dict) -> dict:
+    """The run.* event fields, from a run record. None values omitted.
+
+    `exit_code` is deliberately absent: it is null in every dispatcher-launched record
+    (see _close_record), and an event must not invent one.
+    """
+    fields = {
+        "run_id": record.get("run_id"),
+        "task_id": record.get("task_id"),
+        "agent": record.get("agent"),
+        "launcher": record.get("launcher"),
+        "launched_by": record.get("launched_by"),
+        "run_as_user": record.get("run_as_user"),
+        "workflow_mode": record.get("workflow_mode"),
+        "reaped": record.get("reaped"),
+    }
+    return {k: v for k, v in fields.items() if v is not None}
 
 
 def read_run_record(path: Path) -> dict | None:
@@ -887,6 +932,15 @@ def _close_record(path: Path, record: dict, reason: str) -> dict:
     record.setdefault("exit_code", None)
     with contextlib.suppress(Exception):
         atomic_write_json(path, record)
+    bus_log(
+        "run.ended",
+        source="dispatcher",
+        summary=f"Run ended ({reason}): {record.get('agent')} for task "
+        f"{str(record.get('task_id'))[:8]}",
+        target=record.get("agent"),
+        artifact_path=str(path),
+        metadata=run_metadata(record),
+    )
     return record
 
 
@@ -1132,16 +1186,10 @@ def sweep_dead_runs(dead: list[dict]) -> None:
         if not control_api_update(task_id, "failed", note, target_agent):
             continue
         log.info(f"Swept {task_id[:8]} in-progress → failed (run {record.get('run_id')} died)")
-        bus_log(
-            "task.failed",
-            source="dispatcher",
-            summary=f"Stuck run swept: {task.get('summary', task_id[:8])}",
-            target=target_agent,
-            artifact_path=str(LAUNCH_DIR / run_record_name(str(record.get("agent")), task_id)),
-            # The only site with a run in hand: the sweep is reading run records, so
-            # the event can name the run that died rather than only the task.
-            metadata=bus_metadata(task, run_id=record.get("run_id")),
-        )
+        # NO bus_log here since v1.5.0. The close went through task-queue-mcp's API, and
+        # task-queue-mcp emits `task.failed` for every write it makes, with actor and
+        # on_behalf_of. Emitting it here too would count the failure twice. The run that
+        # died is named by `run.ended`, which reap_runs emitted when it closed the record.
 
 
 # --- Headless agent launch ---
@@ -1398,6 +1446,16 @@ def move_to_dead_letter(path: Path, task: dict, reason: str) -> None:
     dest = DEAD_LETTER_DIR / path.name
     atomic_write(dest, task)
     path.unlink(missing_ok=True)
+    # vikunja#557: seventeen audits went here with one Matrix message each and no bus
+    # record. High-priority in agent-bus, so it also pushes a notification.
+    bus_log(
+        "task.dead-lettered",
+        source="dispatcher",
+        summary=f"Dead-lettered: {task.get('summary', path.stem)}",
+        target=task.get("target_agent"),
+        artifact_path=str(dest),
+        metadata=bus_metadata(task) | {"reason": str(reason)[:300]},
+    )
     matrix_notify(
         "alerts",
         f"[dead-letter] {task.get('summary', path.stem)}",
@@ -1476,16 +1534,20 @@ def request_approval(
     state. A crash between the two leaves a task an operator can still find, rather than
     an approval request pointing at a task still on disk as `submitted`.
     """
+    from_status = task.get("status")
     task["status"] = "pending-approval"
     append_history(task, "pending-approval", "dispatcher", f"Needs approval: {approval_reason}")
     atomic_write(path, task)
+    # Was `task.dispatched` "Dispatched for approval" until v1.5.0: the task had not been
+    # dispatched anywhere, it was waiting for the operator. Any consumer filtering on
+    # `task.dispatched` before then was counting approvals as launches.
     bus_log(
-        "task.dispatched",
+        "task.pending-approval",
         source="dispatcher",
-        summary=f"Dispatched for approval: {task.get('summary', path.stem)}",
+        summary=f"Awaiting approval: {task.get('summary', path.stem)}",
         target=target_agent,
         artifact_path=str(path),
-        metadata=bus_metadata(task),
+        metadata=bus_metadata(task, from_status=from_status, to_status="pending-approval"),
     )
     log.info(f"{path.name}: → pending-approval (risk={risk}, max_auto={max_auto})")
     matrix_notify(
@@ -1498,10 +1560,26 @@ def request_approval(
 
 
 def approve_and_write(path: Path, task: dict, note: str) -> None:
-    """Mark a task approved, record why in its history, and persist it."""
+    """Mark a task approved, record why in its history, persist it, and say so on the bus.
+
+    The ONE place the dispatcher writes `approved`, and the event is emitted here, right
+    after the write. It used to be emitted near the end of process_submitted's success
+    path, so every branch that `continue`d first — a Temporal launch, a refused audit
+    launch — wrote `approved` with no event, and the routing-failed retry path never
+    emitted one at all.
+    """
+    from_status = task.get("status")
     task["status"] = "approved"
     append_history(task, "approved", "dispatcher", note)
     atomic_write(path, task)
+    bus_log(
+        "task.approved",
+        source="dispatcher",
+        summary=task.get("summary", path.stem),
+        target=task.get("target_agent"),
+        artifact_path=str(path),
+        metadata=bus_metadata(task, from_status=from_status, to_status="approved"),
+    )
 
 
 def launch_security_audit(path: Path, task: dict, *, retry: bool = False) -> bool:
@@ -1696,7 +1774,7 @@ def process_submitted(manifests: dict) -> None:
                 summary=f"Notification delivered: {task.get('summary', path.stem)}",
                 target=task.get("target_agent", ""),
                 artifact_path=str(path),
-                metadata=bus_metadata(task),
+                metadata=bus_metadata(task, from_status="submitted", to_status="completed"),
             )
             # The room name is the ONE value here that is not just rendered — it selects
             # a destination. This branch returns before the routing block, so unlike the
@@ -1822,21 +1900,23 @@ def process_submitted(manifests: dict) -> None:
                         f"retry next tick."
                     )
                     continue
-            task["status"] = "approved"
-            append_history(task, "approved", "dispatcher", f"Auto-approved: {approval_reason}")
-            atomic_write(path, task)
+            approve_and_write(path, task, f"Auto-approved: {approval_reason}")
             if kind == "temporal":
                 if launch_temporal_workflow(path, task):
                     task["status"] = "in-progress"
                     append_history(task, "in-progress", "dispatcher", "Temporal workflow submitted")
                     atomic_write(path, task)
+                    # Hyphenated since v1.5.0 (vikunja#553), like every other task.* type.
+                    # agent-bus declares both spellings for one release.
                     bus_log(
-                        "task.workflow_started",
+                        "task.workflow-started",
                         source="dispatcher",
                         summary=f"Temporal workflow started: {task.get('summary', path.stem)}",
                         target=target_agent,
                         artifact_path=str(path),
-                        metadata=bus_metadata(task),
+                        metadata=bus_metadata(
+                            task, from_status="approved", to_status="in-progress"
+                        ),
                     )
                     log.info(f"{path.name}: → in-progress (temporal workflow)")
                     matrix_notify(
@@ -1883,14 +1963,6 @@ def process_submitted(manifests: dict) -> None:
                         f"Task ID: {task_id}\nFrom: {source} | Risk: {risk}\n"
                         f"Resume: Check task queue (id={task_id}) and run shared-build-review.",
                     )
-            bus_log(
-                "task.approved",
-                source="dispatcher",
-                summary=task.get("summary", path.stem),
-                target=target_agent,
-                artifact_path=str(path),
-                metadata=bus_metadata(task),
-            )
             log.info(f"{path.name}: → approved (auto)")
             matrix_notify(
                 "announcements",
@@ -2007,6 +2079,14 @@ def process_routing_failed(manifests: dict) -> None:
                 "Notification delivered — no session required (routing-failed retry)",
             )
             atomic_write(path, task)
+            bus_log(
+                "task.completed",
+                source="dispatcher",
+                summary=f"Notification delivered: {task.get('summary', path.stem)}",
+                target=task.get("target_agent", ""),
+                artifact_path=str(path),
+                metadata=bus_metadata(task, from_status="routing-failed", to_status="completed"),
+            )
             log.info(f"{path.name}: → completed ({retry_type}, no launch, routing-failed retry)")
             continue
 
@@ -2035,6 +2115,16 @@ def process_routing_failed(manifests: dict) -> None:
                     "Temporal workflow submitted (routing-failed retry)",
                 )
                 atomic_write(path, task)
+                bus_log(
+                    "task.workflow-started",
+                    source="dispatcher",
+                    summary=f"Temporal workflow started: {task.get('summary', path.stem)}",
+                    target=target_agent,
+                    artifact_path=str(path),
+                    metadata=bus_metadata(
+                        task, from_status="routing-failed", to_status="in-progress"
+                    ),
+                )
                 log.info(f"{path.name}: → in-progress (temporal, routing-failed retry)")
             continue
 

@@ -384,7 +384,8 @@ def test_request_approval_writes_before_it_announces(dispatcher, write_task, not
     # `risk_level` used to be readable only off the NATS payload; publish_nats is gone
     # (plan 5.4) and the bus event now carries it in metadata (plan 5.2), so the
     # assertion follows the field rather than being dropped with its old carrier.
-    assert bus[0][0] == "task.dispatched"
+    # `task.dispatched` until v1.5.0, which mislabelled a wait as a launch.
+    assert bus[0][0] == "task.pending-approval"
     assert bus[0][1]["metadata"]["risk_level"] == "high"
     assert bus[0][1]["metadata"]["task_id"] == task["id"]
 
