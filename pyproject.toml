@@ -25,13 +25,13 @@ dependencies = [
 # this installs into a root-owned venv on forge. THE TAG IS NAMED IN THIS COMMENT because
 # nobody can read a version out of a bare SHA — keep the two in step when bumping.
 #
-# bc0d21b is `v0.5.0`, which declares the lifecycle types this release emits
+# 41c1ade is `v0.5.0` (the merge of agent-bus#13), which declares the lifecycle types this release emits
 # (task.pending-approval, task.workflow-started, task.dead-lettered, run.started,
 # run.ended). The bump is required, not cosmetic: under AGENT_BUS_STRICT_VOCAB=enforce an
 # undeclared type is rejected rather than warned about, and tests/test_bus_emitter_live.py
 # writes every type through this pinned client.
 bus = [
-    "agent-bus @ git+https://github.com/TadMSTR/agent-bus@bc0d21b5fae576f45de97f0ab02c3d4ae870791a",
+    "agent-bus @ git+https://github.com/TadMSTR/agent-bus@41c1adea50d1b2cc5f9fc5849569adc4348af635",
 ]
 dev = ["ruff==0.16.0", "coverage>=7.0", "pytest>=8.0", "pytest-cov>=5.0"]
 
