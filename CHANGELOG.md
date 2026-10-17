@@ -5,6 +5,45 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.0] - 2026-10-16
+
+Build plan `operator-panel-2026-09-p3-lifecycle-events`, Phase 3. vikunja#553.
+
+### Changed
+
+- **`task.dispatched` → `task.pending-approval`** in `request_approval`. The task had not
+  been dispatched anywhere; it was waiting for the operator.
+- **`task.workflow_started` → `task.workflow-started`** (vikunja#553). agent-bus v0.5.0
+  declares both for one release.
+- **`task.approved` is emitted in `approve_and_write`**, the one place it is written, so
+  the Temporal and refused-audit branches and the routing-failed retry path no longer
+  write `approved` silently.
+- Every status-writing event carries `from_status` / `to_status`; `bus_metadata` also
+  carries `build_name` / `audit_round` when the task has them.
+- The `bus` extra pins agent-bus v0.5.0.
+
+### Added
+
+- `task.dead-lettered` in `move_to_dead_letter` (vikunja#557's silent drops).
+- `run.started` when a run record is written, `run.ended` (with `reaped`, never an exit
+  code) when one is closed.
+- `task.completed` and `task.workflow-started` on the routing-failed retry path, which
+  wrote those statuses with no event.
+- `.coderabbit.yaml` with `inheritance: true`.
+
+### Security
+
+- **`bus_log` never raises** (security audit F-05; CodeRabbit CR-01 on #7). Several emits
+  now sit between a state write and the work that follows it. Before this fix a raising
+  client could leave an approved task unlaunched, a dead run unswept, or a dead letter
+  without its Matrix alert. The failure is logged at error. The real client is
+  `cli._bus_client`, and `test_bus_emitter_live.py` now identifies it there.
+
+### Removed
+
+- The stuck-run sweep's own `task.failed`. The close goes through task-queue-mcp's API,
+  and task-queue-mcp v0.14.0 emits it, with `actor` and `on_behalf_of`.
+
 ## [1.4.0] - 2026-08-29
 
 Build plan `agent-workflow-interop-2026-08`, Phase 5.2–5.5. Tickets vikunja#560, #561.

@@ -56,9 +56,31 @@ counter reporting success for something nobody observed succeed. The CloudCLI pl
 which is a long-lived process and *can* observe its own children exit, records a real
 code for the runs it starts.
 
+Writing a record emits `run.started` to agent-bus, and closing one (`reap_runs`) emits
+`run.ended` with `reaped`. Neither carries an exit code. Readers of "live runs" should use
+the two events rather than these files.
+
 `pid_start_ticks` is field 22 of `/proc/<pid>/stat`, recorded so a recycled pid cannot
 keep a finished run counted as live — a concurrency cap that has silently stopped issuing
 launches looks exactly like a quiet queue.
+
+## Events
+
+The dispatcher reports the statuses it writes to the queue YAML itself, through
+`agent_bus_client`, each with `from_status` / `to_status`:
+
+| Event | When |
+|---|---|
+| `task.approved` | `approve_and_write`, the one place it writes `approved` |
+| `task.pending-approval` | `request_approval` (was mislabelled `task.dispatched` before v1.5.0) |
+| `task.routing-failed` | a routing attempt failed and will be retried |
+| `task.failed`, then `task.dead-lettered` | retries exhausted; the task moves to `dead-letters/` |
+| `task.completed` | a `notify` task found in `submitted` or `routing-failed` is closed |
+| `task.workflow-started` | a Temporal workflow was started (was `task.workflow_started`, vikunja#553) |
+| `run.started` / `run.ended` | a run record was written / closed |
+
+Transitions that go through task-queue-mcp's HTTP API (the stuck-run sweep) are reported
+by task-queue-mcp, not here; reporting them twice would double-count.
 
 ## Backpressure
 

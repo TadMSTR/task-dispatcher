@@ -235,7 +235,8 @@ jobs:
   # This is the gate that would have caught `task.workflow_started`, emitted here for
   # months while absent from agent-bus's vocabulary. It reached the cross-agent log by
   # accident (see the test's docstring); agent-bus v0.4.0 made that accident a rejection
-  # under AGENT_BUS_STRICT_VOCAB=enforce.
+  # under AGENT_BUS_STRICT_VOCAB=enforce. (Renamed `task.workflow-started` in v1.5.0,
+  # vikunja#553; agent-bus declares both spellings for one release.)
   bus-vocabulary:
     runs-on: ubuntu-latest
     steps:

@@ -93,13 +93,20 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 # — they enumerate the `task.*` lifecycle events and miss `task.workflow_started`, which is
 # emitted from the Temporal branch of process_submitted(). That undercount is exactly what
 # the parity check exists to catch, and it caught it on the first run.
+#
+# v1.5.0 (operator-panel part 3): `task.dispatched` → `task.pending-approval`,
+# `task.workflow_started` → `task.workflow-started` (vikunja#553), and three new types,
+# `task.dead-lettered`, `run.started`, `run.ended`.
 DISPATCHER_EVENTS = [
+    "run.ended",
+    "run.started",
     "task.approved",
     "task.completed",
-    "task.dispatched",
+    "task.dead-lettered",
     "task.failed",
+    "task.pending-approval",
     "task.routing-failed",
-    "task.workflow_started",
+    "task.workflow-started",
 ]
 
 # Run in a child so AGENT_BUS_COMMS_DIR is set before agent_bus_client resolves it at
@@ -112,10 +119,13 @@ from task_dispatcher import cli
 # produces "the stub is active" rather than a bare ModuleNotFoundError from line 4. The
 # stub being active IS the defect; the missing distribution is only its cause, and a
 # failure message that names the cause and not the defect is how this got missed once.
-if cli.bus_log.__module__ == "task_dispatcher.cli":
-    print(json.dumps({"bus_log_module": cli.bus_log.__module__}))
+# Since v1.5.0 cli.bus_log is a never-raise guard (audit F-05) and the client it wraps
+# is cli._bus_client: None when the `except ImportError` branch ran.
+client = cli._bus_client
+if client is None:
+    print(json.dumps({"bus_log_module": None}))
     sys.exit(
-        "cli.bus_log is the no-op stub from the `except ImportError` branch — the agent-bus "
+        "cli._bus_client is None, from the `except ImportError` branch — the agent-bus "
         "event stream is DEAD. The `bus` extra did not resolve."
     )
 
@@ -133,8 +143,8 @@ emitted = [
 ]
 
 print(json.dumps({
-    "bus_log_module": cli.bus_log.__module__,
-    "bus_log_name": cli.bus_log.__qualname__,
+    "bus_log_module": client.__module__,
+    "bus_log_name": client.__qualname__,
     "returned": emitted,
     "log_event_module": log_event.__module__,
 }))
@@ -190,20 +200,15 @@ def run() -> None:
 
         out = json.loads(r.stdout.strip().splitlines()[-1])
 
-        # THE CENTRAL ASSERTION. A bus_log defined in task_dispatcher.cli is the stub from
-        # the `except ImportError` branch; the real one comes from agent_bus_client.
+        # THE CENTRAL ASSERTION. The client cli.bus_log wraps must be agent_bus_client's
+        # log_event. (cli.bus_log itself is a guard defined in cli since v1.5.0.)
         check(
             out["bus_log_module"] == "agent_bus_client",
-            f"cli.bus_log.__module__ is agent_bus_client (got {out['bus_log_module']!r}"
-            + (
-                " — this is the no-op stub, the `bus` extra did not resolve)"
-                if out["bus_log_module"] == "task_dispatcher.cli"
-                else ")"
-            ),
+            f"cli._bus_client.__module__ is agent_bus_client (got {out['bus_log_module']!r})",
         )
         check(
-            out["bus_log_name"] != "bus_log",
-            f"is not the stub's `bus_log` (got qualname {out['bus_log_name']!r})",
+            out["bus_log_name"] == "log_event",
+            f"cli._bus_client is log_event (got qualname {out['bus_log_name']!r})",
         )
         # The stub returns None for everything. Real log_event returns the event dict.
         check(
