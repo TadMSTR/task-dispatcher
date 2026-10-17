@@ -31,6 +31,14 @@ Build plan `operator-panel-2026-09-p3-lifecycle-events`, Phase 3. vikunja#553.
   wrote those statuses with no event.
 - `.coderabbit.yaml` with `inheritance: true`.
 
+### Security
+
+- **`bus_log` never raises** (security audit F-05; CodeRabbit CR-01 on #7). Several emits
+  now sit between a state write and the work that follows it. Before this fix a raising
+  client could leave an approved task unlaunched, a dead run unswept, or a dead letter
+  without its Matrix alert. The failure is logged at error. The real client is
+  `cli._bus_client`, and `test_bus_emitter_live.py` now identifies it there.
+
 ### Removed
 
 - The stuck-run sweep's own `task.failed`. The close goes through task-queue-mcp's API,

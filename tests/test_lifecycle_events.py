@@ -17,6 +17,11 @@ import json
 
 import pytest
 
+from task_dispatcher import cli as _cli
+
+# Captured at import, before the autouse isolate fixture stubs it (conftest's pattern).
+_REAL_BUS_LOG = _cli.bus_log
+
 
 def _events(bus):
     return [e for e, _ in bus]
@@ -208,3 +213,54 @@ def test_every_status_writing_site_passes_to_status():
     assert task_events
     missing = [(e, ln) for e, ln, ok in task_events if not ok]
     assert not missing, f"task.* emits without to_status: {missing}"
+
+
+# ── F-05: an emit failure never changes what the dispatcher does next ────────
+
+
+@pytest.fixture
+def raising_client(dispatcher, monkeypatch):
+    calls = []
+
+    def boom(event_type, **kw):
+        calls.append(event_type)
+        raise OSError("bus log unwritable")
+
+    monkeypatch.setattr(dispatcher, "_bus_client", boom)
+    # The isolate fixture stubs bus_log; put the real guard back so this tests it.
+    monkeypatch.setattr(dispatcher, "bus_log", _REAL_BUS_LOG)
+    return calls
+
+
+def test_the_guard_swallows_and_logs(dispatcher, raising_client, caplog):
+    assert dispatcher.bus_log("task.approved", source="d", summary="s", metadata={}) is None
+    assert raising_client == ["task.approved"]
+    assert "bus event task.approved not written" in caplog.text
+
+
+def test_approve_and_write_completes_when_the_bus_raises(dispatcher, write_task, raising_client):
+    path, task = write_task(status="submitted")
+    dispatcher.approve_and_write(path, task, "auto")
+    assert dispatcher.load_yaml(path)["status"] == "approved"
+    assert raising_client == ["task.approved"]
+
+
+def test_dead_letter_alert_still_fires_when_the_bus_raises(
+    dispatcher, write_task, raising_client, monkeypatch, queue
+):
+    """CodeRabbit CR-01 on #7: the dead-letter emit raising used to drop the alert."""
+    sent = []
+    monkeypatch.setattr(dispatcher, "matrix_notify", lambda room, t, b: sent.append(room))
+    path, task = write_task()
+    dispatcher.move_to_dead_letter(path, task, "reason")
+    assert sent == ["alerts"]
+    assert (queue / "dead-letters" / path.name).exists()
+
+
+def test_closing_a_record_still_returns_it_when_the_bus_raises(
+    dispatcher, raising_client, tmp_path
+):
+    rec = {"run_id": "r", "task_id": "t", "agent": "developer"}
+    out = dispatcher._close_record(tmp_path / "developer-t.json", rec, "pid-gone")
+    assert out["reaped"] == "pid-gone"
+    assert raising_client == ["run.ended"]

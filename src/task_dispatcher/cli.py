@@ -29,11 +29,35 @@ import yaml
 # installed via the `bus` extra (pip install task-dispatcher[bus]). When it is not
 # installed, event logging degrades to a no-op rather than failing the tick.
 try:
-    from agent_bus_client import log_event as bus_log
+    from agent_bus_client import log_event as _bus_client
 except ImportError:
+    _bus_client = None  # no-op if client missing (safe degradation)
 
-    def bus_log(*a, **kw):
-        pass  # no-op if client missing (safe degradation)
+
+def bus_log(event_type: str, **kw):
+    """Emit one bus event. Never raises: an event is a report, not part of the decision.
+
+    WHY A GUARD (security audit 2026-10-16 F-05; CodeRabbit CR-01 on #7). Since v1.5.0
+    several emits sit between a state write and the work that follows it:
+    - `task.approved` is right after the `approved` write and before the launch;
+    - `run.ended` is inside reap_runs, before sweep_dead_runs;
+    - `task.dead-lettered` comes before the Matrix alert.
+    agent_bus_client.log_event raises on a full disk, a permissions slip, or under
+    AGENT_BUS_STRICT_VOCAB=enforce. Unguarded, a raise would leave an approved task that
+    never launches, a dead run that is never swept, or a dead letter nobody is told about.
+    Every other producer in this build swallows its own emit failures; this one now does
+    too. The failure is logged at error, so it is not silent.
+
+    Identification of the real client (tests/test_bus_emitter_live.py) reads
+    `_bus_client`, the function this wraps, not this wrapper's `__module__`.
+    """
+    if _bus_client is None:
+        return None
+    try:
+        return _bus_client(event_type, **kw)
+    except Exception as exc:
+        log.error("bus event %s not written: %s: %s", event_type, type(exc).__name__, exc)
+        return None
 
 
 def bus_metadata(
