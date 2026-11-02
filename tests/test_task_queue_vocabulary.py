@@ -98,6 +98,10 @@ SHARED_VOCABULARY = {
     "VALID_WORKFLOW_MODES": "VALID_WORKFLOW_MODES",
     "TERMINAL_STATUSES": "TERMINAL_STATUSES",
     "SELF_TERMINAL_TASK_TYPES": "SELF_TERMINAL_TASK_TYPES",
+    # The agents a `pre_audit` fixer task may target (audit-fixer-2026-11 p2). The MCP
+    # refuses the task at submit for any other agent and the fixer launcher refuses it
+    # again here, so the two lists must be the same list.
+    "FIXER_AGENTS": "FIXER_AGENTS",
 }
 
 FAILURES: list[str] = []
@@ -112,7 +116,11 @@ def check(cond: bool, label: str) -> None:
 
 
 def literal_sets(source: str, origin: str) -> dict[str, set]:
-    """Extract module-level `NAME = {...}` string-set literals without executing anything."""
+    """Extract module-level `NAME = {...}` string-set literals without executing anything.
+
+    `NAME = frozenset({...})` counts too: the call is matched by shape (a bare
+    `frozenset` name, one set-literal argument), and only its argument is evaluated.
+    """
     found: dict[str, set] = {}
     for node in ast.parse(source).body:
         if not isinstance(node, ast.Assign) or len(node.targets) != 1:
@@ -120,8 +128,18 @@ def literal_sets(source: str, origin: str) -> dict[str, set]:
         target = node.targets[0]
         if not isinstance(target, ast.Name):
             continue
+        expr = node.value
+        if (
+            isinstance(expr, ast.Call)
+            and isinstance(expr.func, ast.Name)
+            and expr.func.id == "frozenset"
+            and len(expr.args) == 1
+            and not expr.keywords
+            and isinstance(expr.args[0], ast.Set)
+        ):
+            expr = expr.args[0]
         try:
-            value = ast.literal_eval(node.value)
+            value = ast.literal_eval(expr)
         except (ValueError, TypeError, SyntaxError):
             continue
         if isinstance(value, set) and all(isinstance(v, str) for v in value):

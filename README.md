@@ -22,7 +22,8 @@ Every two minutes it:
    if its task is still `in-progress` it is swept to `failed` through the control API's
    operator route.
 5. Launches the target agent headlessly — subject to the concurrency caps — or notifies
-   and waits for a human.
+   and waits for a human. Two task types launch whatever their `workflow_mode`: an
+   `audit` for security, and a `pre_audit` fixer task (see [The fixer launcher](#the-fixer-launcher)).
 6. Archives expired tasks and retries ones whose routing failed.
 
 ## Run records
@@ -63,6 +64,54 @@ the two events rather than these files.
 `pid_start_ticks` is field 22 of `/proc/<pid>/stat`, recorded so a recycled pid cannot
 keep a finished run counted as live — a concurrency cap that has silently stopped issuing
 launches looks exactly like a quiet queue.
+
+`launched_by` is `dispatcher` for a generic headless launch, `dispatcher-audit` for a
+security audit and `dispatcher-fixer` for a fixer session.
+
+## The fixer launcher
+
+Since v1.6.0 (audit-fixer-2026-11 p2). When a build finishes, the build agent writes a
+handoff file and queues a `pre_audit` task to itself. On the next tick `launch_fixer()`
+starts a fresh session of that agent to run the pre-audit loop (`shared-build-fixer`),
+with no operator Start. It runs before the `workflow_mode` test, as the audit launcher
+does, and takes a concurrency slot. With `DISPATCHER_MAX_RUNS_PER_AGENT=1`, a relay
+(`h1`, `h2`) waits until the session that queued it has exited.
+
+The handoff path is **built**, never read from the task:
+`~/.claude/comms/artifacts/fixer-handoffs/<build_name>/r<audit_round>-h<handoff_seq>.md`.
+Before anything is approved or launched, every one of these must hold. Otherwise the task
+goes to `routing-failed` with the reason:
+
+| Check | Why |
+|---|---|
+| `task_type: pre_audit`, `source_agent == target_agent`, the agent is in `FIXER_AGENTS` (developer, sysadmin, fleet) and in the roster without `run_as_user` | an agent queues only its own fixer, and only a build agent has one |
+| `build_name` matches `[A-Za-z0-9_-]{1,128}`, `audit_round` is an int 1–20, `handoff_seq` is an int 0–2, no `originating_task_id`, task id is a UUID | the path and the prompt are built from these |
+| No symlink at any component under the root; resolves under it; a regular file of at most 512 KiB; the inode opened (`O_NOFOLLOW`, `O_NONBLOCK`) is the one checked | `~/.claude/comms` is writable by every agent |
+| Front matter (closed within 16 KiB, no YAML merge keys): `build_name`, `round`, `handoff_seq` and `agent` equal the task's | a file at the right path proves nothing about who wrote it |
+| Front matter `build_task` is a live `build` task of the same `build_name` for the same agent | binds the handoff to a real build of that agent |
+| Every repo in the plan's `**Repos:**` header is in the handoff's `repos:` (by `name`: `repo` or `owner-repo`, case-insensitive). The plan is found by `build_name` under `build-plans/`, never by a path the handoff names | a repo the build session left out would be invisible to the gate (audit R2-04) |
+| `/usr/local/sbin/forge/fixer-precompact-guard.py` and its directory are root-owned and not group- or world-writable | a fixer session must not compact, and without the guard it compacts silently |
+| The agent's `.env` gives `SCOPED_MCP_BEARER_TOKEN`, and Anthropic credentials are usable | as for every launch |
+
+A plan with no `**Repos:**` line (every plan before this one) does not block. The prompt
+says `Repos: unverified`, and the fixer carries that into the audit request's Known Risks.
+
+The prompt is fixed text plus validated values. It contains no `summary` and no
+description:
+
+```
+Run shared-build-fixer. Task ID: <id>. Build: <build_name>. Round: <N>. Handoff: r<N>-h<k>.md. Repos: <verified|unverified>.
+```
+
+The environment gets `FORGE_LAUNCH_KIND=fixer` as well as the usual `FORGE_WORKFLOW_MODE`,
+`FORGE_RUN_ID` and `FORGE_TASK_ID`. The log is
+`~/.pm2/logs/fixer-<agent>-<build_name>-r<N>-h<k>.log`.
+
+**What this does not stop.** Every agent except steward runs as one uid. A process with
+that uid can read another agent's token, or write a queue file and a handoff directly, and
+so launch a fixer of another agent on a file it wrote. It cannot point the session outside
+`fixer-handoffs/`, at another build's live task, or put free text in the prompt. Agent
+isolation is the fix for the rest.
 
 ## Events
 

@@ -69,6 +69,14 @@ apart is the same class of bug as the vocabulary drift the tests here already gu
 invariant in README.md. `control_api_update()` returning False must leave the task
 untouched; there is no fallback and adding one would undo the point.
 
+**A fixer is checked before it is approved, and its handoff path is built, never read.**
+`launch_fixer()` writes `approved` only after every check passes, so a refused fixer goes
+straight to `routing-failed` and never sits approved in its agent's work list. Both call
+paths, the submitted tick and the routing-failed retry, go through that one function; the
+retry path must never fall through to operator pickup for a `pre_audit` task. Its prompt
+carries validated values only. `FIXER_AGENTS` is a second copy of task-queue-mcp's, and
+`tests/test_task_queue_vocabulary.py` asserts they are equal.
+
 **`--version` is answered in `_console()`, before `cli` is imported.** Because importing
 `cli` loads the roster and raises when it cannot, and `--version` is the deploy
 drift-check — it has to answer on exactly the misconfigured hosts where importing would

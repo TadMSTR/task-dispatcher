@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import re
+import stat
 import subprocess
 import sys
 import uuid
@@ -100,6 +101,7 @@ def bus_metadata(
         "risk_level": task.get("risk_level"),
         "build_name": task.get("build_name"),
         "audit_round": task.get("audit_round"),
+        "handoff_seq": task.get("handoff_seq"),
     }
     return {k: v for k, v in fields.items() if v is not None}
 
@@ -156,6 +158,7 @@ VALID_TASK_TYPES = {
     "docs",
     "ticket_audit",
     "ticket_audit_complete",
+    "pre_audit",
 }
 VALID_WORKFLOW_MODES = {"semi-auto", "auto", "manual-then-auto"}
 TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
@@ -1059,10 +1062,12 @@ MAX_CONCURRENT_RUNS = _int_env("DISPATCHER_MAX_CONCURRENT_RUNS", 4)
 # scoped-mcp bearer token (identity IS the token) and a task-queue actor name, so the
 # second one is not a second worker — it is the same worker racing itself.
 MAX_RUNS_PER_AGENT = _int_env("DISPATCHER_MAX_RUNS_PER_AGENT", 1)
-# The two launch kinds that start a local `claude` session and therefore consume a slot.
+# The launch kinds that start a local `claude` session and therefore consume a slot.
 # `temporal` does not — it hands work to a Temporal worker and returns — and
-# `operator-pickup` launches nothing at all.
-LAUNCHING_KINDS = {"headless", "audit"}
+# `operator-pickup` launches nothing at all. `fixer` takes a slot like the others, and the
+# per-agent cap is what makes a relay wait: the fixer session that queued h<k+1> holds
+# the agent's one slot until it exits.
+LAUNCHING_KINDS = {"headless", "audit", "fixer"}
 
 
 def launch_kind(task: dict, target_agent: str) -> str:
@@ -1077,13 +1082,18 @@ def launch_kind(task: dict, target_agent: str) -> str:
 
     Note the ordering is load-bearing and matches the dispatch branch it was extracted
     from: an audit outranks workflow_mode, which is why an audit launches headlessly
-    even in semi-auto.
+    even in semi-auto. A fixer (`pre_audit`) outranks it for the same reason: the build
+    session that queued it has stopped, and the pre-audit loop is the next step whatever
+    mode the build ran in. Every other check on a fixer is in launch_fixer(), which
+    refuses rather than falling through to operator pickup.
     """
     task_type = task.get("task_type")
     if task_type == "workflow":
         return "temporal"
     if task_type == "audit" and target_agent == "security":
         return "audit"
+    if task_type == "pre_audit":
+        return "fixer"
     # DO NOT rewrite this as `!= "semi-auto"` — see the comment at the dispatch branch.
     if task.get("workflow_mode", "semi-auto") == "auto":
         return "headless"
@@ -1733,6 +1743,439 @@ def launch_security_audit(path: Path, task: dict, *, retry: bool = False) -> boo
     return True
 
 
+# --- The fixer launcher (audit-fixer-2026-11 p2) ---------------------------------------
+#
+# THE FOURTH LAUNCHER. A build agent finishes a build, writes a handoff file and queues a
+# `pre_audit` task to itself; this launches a fresh session of that agent to run the
+# pre-audit loop (shared-build-fixer). Modelled on launch_security_audit, with more
+# checks, because the input it trusts is weaker:
+#
+#   - The handoff path is BUILT from the task's validated build_name, audit_round and
+#     handoff_seq, never read from the payload. There is no path input to contain.
+#   - ~/.claude/comms is writable by every agent (`write: all` in workspace-policy.yml),
+#     so a file sitting at the built path proves nothing about who wrote it. Its front
+#     matter must name this task's build, round, seq and agent, and a live `build` task of
+#     that build addressed to that agent.
+#   - The plan's **Repos:** line, found by build_name under build-plans/ and never by a
+#     path the handoff names, must be covered by the handoff's repos: (audit R2-04). A plan
+#     without the line launches with `Repos: unverified`, which the fixer reports.
+#   - The PreCompact guard must be installed. A fixer session must not compact (Ted,
+#     2026-11-02), and without the guard it compacts silently.
+#
+# task-queue-mcp checks the task's own fields at submit time and binds source_agent to the
+# caller's token. They are checked again here because a queue file can be written without
+# submit_task (#324). Same-uid limit, stated rather than overclaimed: every agent except
+# steward runs as ted, so a process that reads another agent's token, or writes a queue
+# file and a handoff directly, can still launch a fixer of that agent on a file it wrote.
+# What it cannot do is point the session at a path outside fixer-handoffs/, at another
+# build's live task, or put a byte of free text into the prompt. Agent isolation
+# (#1193 (id 1276)) is the fix for the rest.
+
+# Kept in step by hand with task-queue-mcp's src/tools/queue.py FIXER_AGENTS;
+# tests/test_task_queue_vocabulary.py asserts they are equal.
+FIXER_AGENTS = frozenset({"developer", "sysadmin", "fleet"})
+FIXER_AUDIT_ROUND_MAX = 20
+FIXER_HANDOFF_SEQ_MAX = 2  # pre-audit-gate.py --max-relays
+FIXER_HANDOFF_MAX = 512 * 1024  # the fixer skill's `show` cap
+# The front matter is parsed only up to its closing `---`, which must come within this
+# many bytes. Not a line cut: a rendered handoff's front matter runs to ~50 lines (the
+# template keeps its own header keys), and a 40-line cut would split `repos:`.
+FIXER_FRONT_MAX = 16 * 1024
+FIXER_REPOS_MAX = 32
+FIXER_GUARD_PATH = Path("/usr/local/sbin/forge/fixer-precompact-guard.py")
+FIXER_GUARD_OWNER_UID = 0  # a module constant so the tests, which are not root, can set it
+_FIXER_BUILD_NAME_RE = re.compile(r"[A-Za-z0-9_-]{1,128}")
+_PLAN_REPO_RE = re.compile(r"[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}")
+_PLAN_REPOS_PREFIX = "**Repos:**"
+_MERGE_TAG = "tag:yaml.org,2002:merge"
+
+
+class FixerRefused(Exception):
+    """A fixer task failed a check. The message is the routing-failure reason."""
+
+
+class _NoMergeSafeLoader(yaml.SafeLoader):
+    """SafeLoader without merge keys (host-forge-scripts lib/safe_yaml.py, R3-01).
+
+    A chain of anchors each merging the last copies O(n²) pairs inside yaml.load, before
+    any size check a caller applies afterwards. The front matter is capped at 16 KiB, but
+    that is still a few hundred links; refusing `<<` costs nothing for a file the template
+    wrote, which has none.
+    """
+
+    def flatten_mapping(self, node):
+        for key_node, _ in node.value:
+            if key_node.tag == _MERGE_TAG:
+                raise yaml.constructor.ConstructorError(
+                    None, None, "YAML merge keys (<<) are refused", key_node.start_mark
+                )
+        super().flatten_mapping(node)
+
+
+def fixer_handoff_root() -> Path:
+    # Path.home() at call time, like launch_security_audit's audit root, so a test can
+    # redirect HOME. Changing the root means changing audit-round-ledger.py's
+    # DEFAULT_HANDOFFS in host-forge-scripts first; that is where it is defined.
+    return Path.home() / ".claude" / "comms" / "artifacts" / "fixer-handoffs"
+
+
+def build_plans_root() -> Path:
+    return Path.home() / ".claude" / "comms" / "artifacts" / "build-plans"
+
+
+def _bounded_int(value: object, lo: int, hi: int) -> bool:
+    # bool is an int subclass; True must not read as round 1.
+    return isinstance(value, int) and not isinstance(value, bool) and lo <= value <= hi
+
+
+def read_contained(root: Path, parts: list[str], cap: int) -> bytes:
+    """Read root/<parts...>: no symlink at any component under root, a regular file of at
+    most `cap` bytes, inside root once resolved, and the inode that was checked is the one
+    read. Raises FixerRefused.
+
+    Each part is a single path component the caller built from validated values. The
+    lstat walk refuses a link at any level (the build directory as much as the file), the
+    open is O_NOFOLLOW|O_NONBLOCK so a FIFO swapped in is not waited on, and the fstat
+    comparison catches a swap between the walk and the open. The read is capped at
+    cap + 1 from the fd, so a file grown since the lstat is refused rather than read.
+    """
+    try:
+        real_root = root.resolve(strict=True)
+    except (OSError, RuntimeError) as e:
+        raise FixerRefused(f"{root} is missing: {type(e).__name__}") from e
+    cur = root
+    st = None
+    for i, part in enumerate(parts):
+        if part in ("", ".", "..") or "/" in part:
+            raise FixerRefused(f"bad path component {part!r}")
+        cur = cur / part
+        try:
+            st = os.lstat(cur)
+        except OSError as e:
+            raise FixerRefused(f"{cur} does not exist ({type(e).__name__})") from e
+        if stat.S_ISLNK(st.st_mode):
+            raise FixerRefused(f"{cur} is a symlink")
+        if i < len(parts) - 1 and not stat.S_ISDIR(st.st_mode):
+            raise FixerRefused(f"{cur} is not a directory")
+    if st is None or not stat.S_ISREG(st.st_mode):
+        raise FixerRefused(f"{cur} is not a regular file")
+    if st.st_size > cap:
+        raise FixerRefused(f"{cur} is larger than {cap} bytes")
+    try:
+        cur.resolve(strict=True).relative_to(real_root)
+    except (OSError, RuntimeError, ValueError) as e:
+        raise FixerRefused(f"{cur} is outside {real_root}") from e
+    try:
+        fd = os.open(cur, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError as e:
+        raise FixerRefused(f"{cur} could not be opened ({type(e).__name__})") from e
+    try:
+        fst = os.fstat(fd)
+        if (fst.st_dev, fst.st_ino) != (st.st_dev, st.st_ino) or not stat.S_ISREG(fst.st_mode):
+            raise FixerRefused(f"{cur} changed while being opened")
+        chunks: list[bytes] = []
+        total = 0
+        while total <= cap:
+            chunk = os.read(fd, cap + 1 - total)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+        if total > cap:
+            raise FixerRefused(f"{cur} grew past {cap} bytes while being read")
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
+def parse_front_matter(data: bytes) -> dict:
+    """The handoff's front matter as a mapping. Raises FixerRefused.
+
+    The same delimiters pre-audit-gate.py's front_matter() accepts: the file starts with
+    `---\\n` and the block ends at the next `\\n---\\n`.
+    """
+    text = data[: FIXER_FRONT_MAX + 8].decode("utf-8", "replace")
+    if not text.startswith("---\n"):
+        raise FixerRefused("handoff has no front matter")
+    end = text.find("\n---\n", 4)
+    if end < 0 or end > FIXER_FRONT_MAX:
+        raise FixerRefused(f"handoff front matter is not closed within {FIXER_FRONT_MAX} bytes")
+    try:
+        fm = yaml.load(text[4:end], Loader=_NoMergeSafeLoader)
+    except (yaml.YAMLError, RecursionError) as e:
+        raise FixerRefused(f"handoff front matter does not parse ({type(e).__name__})") from e
+    if not isinstance(fm, dict):
+        raise FixerRefused("handoff front matter is not a mapping")
+    return fm
+
+
+def find_plan(build_name: str) -> list[str] | None:
+    """The path parts, under build_plans_root(), of the one plan for this build, or None.
+
+    Looked up by build_name, never by a path the handoff names: build-plans/<build>/plan.md
+    for a single-plan build, build-plans/<programme>/<build>/plan.md for a programme part.
+    Archive directories are skipped; a plan in one belongs to a finalized build, whose
+    build task the launcher has already refused as terminal. Two matches is a refusal, not
+    a guess. Raises FixerRefused for that.
+    """
+    root = build_plans_root()
+    candidates = [[build_name, "plan.md"]]
+    try:
+        children = sorted(root.iterdir())
+    except OSError:
+        return None
+    for child in children:
+        name = child.name
+        if name.startswith((".", "_")) or name == "archive" or name == build_name:
+            continue
+        if child.is_symlink() or not child.is_dir():
+            continue
+        candidates.append([name, build_name, "plan.md"])
+    found = [c for c in candidates if os.path.lexists(root.joinpath(*c))]
+    if len(found) > 1:
+        raise FixerRefused(
+            f"more than one plan for build {build_name}: " + ", ".join("/".join(c) for c in found)
+        )
+    return found[0] if found else None
+
+
+def plan_repos(build_name: str) -> list[str] | None:
+    """The plan's **Repos:** list (`owner/repo` each), or None when the build has no plan
+    or the plan has no such line (every plan before audit-fixer-2026-11 p2).
+
+    Only the header is read: the lines before the first `## ` heading. A **Repos:** line in
+    a plan's body is an example, not the build's repo set. Raises FixerRefused for a
+    malformed line, which is the plan author's error and must not read as "unverified".
+    """
+    parts = find_plan(build_name)
+    if parts is None:
+        return None
+    text = read_contained(build_plans_root(), parts, FIXER_HANDOFF_MAX).decode("utf-8", "replace")
+    for line in text.split("\n"):
+        if line.startswith("## "):
+            break
+        if line.startswith(_PLAN_REPOS_PREFIX):
+            raw = [r.strip().strip("`").strip() for r in line[len(_PLAN_REPOS_PREFIX) :].split(",")]
+            repos = [r for r in raw if r]
+            if not repos or len(repos) > FIXER_REPOS_MAX:
+                raise FixerRefused(f"plan **Repos:** line for {build_name} lists no repos")
+            bad = [r for r in repos if not _PLAN_REPO_RE.fullmatch(r)]
+            if bad:
+                raise FixerRefused(
+                    f"plan **Repos:** line for {build_name} has a malformed entry "
+                    f"(want owner/repo): {bad[0][:80]!r}"
+                )
+            return repos
+    return None
+
+
+def repo_names_for(plan_repo: str) -> set[str]:
+    """The handoff `repos:` names that cover a plan's `owner/repo`: `repo` or `owner-repo`,
+    case-insensitively. host-forge/scripts is `host-forge-scripts` in a handoff and
+    TadMSTR/task-queue-mcp is `task-queue-mcp`. pre-audit-gate.py --expect-repos uses the
+    same rule."""
+    owner, repo = plan_repo.lower().split("/", 1)
+    return {repo, f"{owner}-{repo}"}
+
+
+def handoff_repo_names(fm: dict) -> set[str]:
+    entries = fm.get("repos")
+    if not isinstance(entries, list) or not entries or len(entries) > FIXER_REPOS_MAX:
+        raise FixerRefused(f"handoff repos: is not a list of 1..{FIXER_REPOS_MAX} entries")
+    names = set()
+    for e in entries:
+        name = e.get("name") if isinstance(e, dict) else None
+        if isinstance(name, str) and 0 < len(name) <= 200:
+            names.add(name.lower())
+    return names
+
+
+def fixer_guard_problem() -> str | None:
+    """Why the PreCompact guard can't be relied on, or None if it is installed properly:
+    a regular file owned by root and not group- or world-writable, in a directory that is
+    the same. A guard someone else can rewrite is no guard."""
+    for p, want_dir in ((FIXER_GUARD_PATH.parent, True), (FIXER_GUARD_PATH, False)):
+        try:
+            st = os.lstat(p)
+        except OSError:
+            return f"{p} is not installed"
+        kind_ok = stat.S_ISDIR(st.st_mode) if want_dir else stat.S_ISREG(st.st_mode)
+        if not kind_ok:
+            return f"{p} is not a regular {'directory' if want_dir else 'file'}"
+        if st.st_uid != FIXER_GUARD_OWNER_UID:
+            return f"{p} is not owned by uid {FIXER_GUARD_OWNER_UID}"
+        if st.st_mode & 0o022:
+            return f"{p} is group- or world-writable"
+    return None
+
+
+def check_fixer_task(task: dict) -> tuple[str, str, int, int]:
+    """(task_id, agent, round, seq) for a well-formed fixer task. Raises FixerRefused."""
+    if task.get("task_type") != "pre_audit":
+        raise FixerRefused(f"not a pre_audit task: {task.get('task_type')!r}")
+    agent = task.get("target_agent")
+    if not isinstance(agent, str) or task.get("source_agent") != agent:
+        raise FixerRefused("pre_audit task is not addressed to its submitter")
+    if agent not in FIXER_AGENTS:
+        raise FixerRefused(f"pre_audit target {agent[:40]!r} is not a build agent")
+    entry = LAUNCH_POLICY.get(agent)
+    if entry is None:
+        raise FixerRefused(f"{agent} is not in the launch roster")
+    if entry["run_as_user"] is not None:
+        # Every fixer agent runs as the dispatcher's own user today. A run-as agent would
+        # need its launcher to carry the fixer prompt and FORGE_LAUNCH_KIND, which it
+        # doesn't; refuse rather than launch it the generic way.
+        raise FixerRefused(f"{agent} is a run-as agent; the fixer launcher does not support it")
+    task_id = task.get("id")
+    if not isinstance(task_id, str) or not TASK_ID_RE.fullmatch(task_id):
+        # The fixer claims its task by this id and Stops if it doesn't match, so a session
+        # launched with a placeholder could only exit.
+        raise FixerRefused("pre_audit task id is not a UUID")
+    build_name = task.get("build_name")
+    if not isinstance(build_name, str) or not _FIXER_BUILD_NAME_RE.fullmatch(build_name):
+        raise FixerRefused("pre_audit build_name is missing or malformed")
+    rnd = task.get("audit_round")
+    if not _bounded_int(rnd, 1, FIXER_AUDIT_ROUND_MAX):
+        raise FixerRefused(f"pre_audit audit_round is not an integer 1-{FIXER_AUDIT_ROUND_MAX}")
+    seq = task.get("handoff_seq")
+    if not _bounded_int(seq, 0, FIXER_HANDOFF_SEQ_MAX):
+        raise FixerRefused(f"pre_audit handoff_seq is not an integer 0-{FIXER_HANDOFF_SEQ_MAX}")
+    if task.get("payload", {}).get("originating_task_id") is not None:
+        raise FixerRefused("pre_audit task carries originating_task_id")
+    if task.get("workflow_mode", "semi-auto") not in VALID_WORKFLOW_MODES:
+        raise FixerRefused("pre_audit workflow_mode is not in the vocabulary")
+    return task_id, agent, rnd, seq
+
+
+def check_fixer_handoff(build_name: str, agent: str, rnd: int, seq: int) -> dict:
+    """The handoff's front matter, once it is bound to this task. Raises FixerRefused.
+
+    Mismatch reasons name the field, never the value: the value is whatever the file's
+    writer put there, and it reaches a task's history and the dispatcher log.
+    """
+    data = read_contained(
+        fixer_handoff_root(), [build_name, f"r{rnd}-h{seq}.md"], FIXER_HANDOFF_MAX
+    )
+    fm = parse_front_matter(data)
+    want = {"build_name": build_name, "round": rnd, "handoff_seq": seq, "agent": agent}
+    for field, value in want.items():
+        got = fm.get(field)
+        if type(got) is not type(value) or got != value:
+            raise FixerRefused(f"handoff front matter {field} does not match the task")
+    build_task = fm.get("build_task")
+    if not isinstance(build_task, str) or not TASK_ID_RE.fullmatch(build_task):
+        raise FixerRefused("handoff build_task is not a task id")
+    parent = find_task_by_id(build_task)
+    if parent is None:
+        raise FixerRefused(f"handoff build_task {build_task[:8]} is not in the queue")
+    if (
+        parent.get("task_type") != "build"
+        or parent.get("build_name") != build_name
+        or parent.get("target_agent") != agent
+    ):
+        raise FixerRefused(
+            f"handoff build_task {build_task[:8]} is not a build task of {build_name} for {agent}"
+        )
+    if parent.get("status") not in VALID_STATUSES - TERMINAL_STATUSES:
+        raise FixerRefused(f"handoff build_task {build_task[:8]} is not live")
+    return fm
+
+
+def launch_fixer(path: Path, task: dict, *, approval_note: str, retry: bool = False) -> bool:
+    """Check a `pre_audit` task and its handoff, approve it, and launch the fixer session.
+
+    Returns True if a session was launched. On any failed check the task goes to
+    handle_routing_failure with the reason and nothing is approved or launched; the caller
+    `continue`s. Both call paths, the submitted tick and the routing-failed retry, come
+    through here: launch_security_audit's history is what two copies of a launcher do.
+
+    Approval is written here, after every check and before Popen, so the session finds its
+    task `approved` and can claim it. On the submitted path the caller has already applied
+    the backpressure gate. The retry path has not, so it is applied here: a relay must wait
+    for the session that queued it to exit, and a denied retry stays `routing-failed` for
+    the next tick without spending a retry.
+    """
+    try:
+        task_id, agent, rnd, seq = check_fixer_task(task)
+        build_name = task["build_name"]
+        if retry:
+            denial = slot_denial(agent)
+            if denial or auth_outage_active():
+                log.info(
+                    f"{path.name}: fixer retry held — {denial or 'auth outage is live'}; "
+                    f"retry next tick"
+                )
+                return False
+        fm = check_fixer_handoff(build_name, agent, rnd, seq)
+        repos = plan_repos(build_name)
+        if repos is not None:
+            names = handoff_repo_names(fm)
+            missing = [r for r in repos if not (repo_names_for(r) & names)]
+            if missing:
+                raise FixerRefused(
+                    f"plan repos missing from handoff r{rnd}-h{seq}.md repos: {', '.join(missing)}"
+                )
+        guard = fixer_guard_problem()
+        if guard:
+            raise FixerRefused(f"PreCompact guard: {guard}; a fixer session must not compact")
+        project_dir = LAUNCH_POLICY[agent]["project_dir"]
+        if not project_dir.is_dir():
+            raise FixerRefused(f"project dir missing: {project_dir}")
+        child_env = dict(os.environ)
+        child_env.update(load_agent_env(agent))
+        if not child_env.get("SCOPED_MCP_BEARER_TOKEN"):
+            raise FixerRefused(f"SCOPED_MCP_BEARER_TOKEN unresolved for agent '{agent}'")
+        if not anthropic_creds_usable(child_env):  # SMCP-29
+            alert_auth_blocked(agent, task_id)
+            raise FixerRefused("no usable Anthropic credential (OAuth expired / no API key)")
+    except FixerRefused as e:
+        handle_routing_failure(path, task, f"Fixer launch refused: {e}")
+        return False
+
+    workflow_mode = task.get("workflow_mode", "semi-auto")
+    run_id = str(uuid.uuid4())
+    child_env["FORGE_WORKFLOW_MODE"] = child_workflow_mode(workflow_mode)
+    child_env["FORGE_RUN_ID"] = run_id
+    child_env["FORGE_TASK_ID"] = task_id
+    # The fixer skill's Step 0 accepts an unattended start only with this set and the
+    # prompt's task id equal to the task it claims.
+    child_env["FORGE_LAUNCH_KIND"] = "fixer"
+    handoff = f"r{rnd}-h{seq}.md"
+    # Fixed text and validated values only. No `summary`, no description: both are the
+    # submitter's free text, and the dispatcher keeps them out of every prompt.
+    prompt = (
+        f"Run shared-build-fixer. Task ID: {task_id}. Build: {build_name}. Round: {rnd}. "
+        f"Handoff: {handoff}. Repos: {'verified' if repos is not None else 'unverified'}."
+    )
+    log_path = Path.home() / ".pm2" / "logs" / f"fixer-{agent}-{build_name}-r{rnd}-h{seq}.log"
+    approve_and_write(path, task, approval_note)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(log_path, "a") as log_fh:
+        proc = subprocess.Popen(
+            ["claude", "-p", "--dangerously-skip-permissions", prompt],
+            cwd=str(project_dir),
+            stdout=log_fh,
+            stderr=log_fh,
+            env=child_env,
+        )
+    write_run_record(
+        run_id=run_id,
+        task_id=task_id,
+        agent=agent,
+        launched_by="dispatcher-fixer",
+        pid=proc.pid,
+        log_path=log_path,
+        workflow_mode=workflow_mode,
+    )
+    verified = "verified" if repos is not None else "unverified"
+    log.info(
+        f"{path.name}: fixer launched for {build_name} {handoff} (agent={agent}, "
+        f"pid={proc.pid}, run={run_id[:8]}, repos={verified})"
+        + (" — routing-failed retry" if retry else "")
+    )
+    return True
+
+
 def process_submitted(manifests: dict) -> None:
     for path in sorted(TASK_QUEUE_DIR.glob("*.yml")):
         if path.name.startswith("."):
@@ -1924,7 +2367,11 @@ def process_submitted(manifests: dict) -> None:
                         f"retry next tick."
                     )
                     continue
-            approve_and_write(path, task, f"Auto-approved: {approval_reason}")
+            # A fixer is approved inside launch_fixer, after its checks and before its
+            # Popen: a refused fixer must go straight to routing-failed, never sit
+            # `approved` where the agent's next session would pick it up as work.
+            if kind != "fixer":
+                approve_and_write(path, task, f"Auto-approved: {approval_reason}")
             if kind == "temporal":
                 if launch_temporal_workflow(path, task):
                     task["status"] = "in-progress"
@@ -1959,6 +2406,10 @@ def process_submitted(manifests: dict) -> None:
             # like an oversight and has been questioned more than once.
             elif kind == "audit":
                 if not launch_security_audit(path, task):
+                    continue
+            # Also ahead of the workflow_mode check, for the reason given at launch_kind().
+            elif kind == "fixer":
+                if not launch_fixer(path, task, approval_note=f"Auto-approved: {approval_reason}"):
                     continue
             else:
                 workflow_mode = task.get("workflow_mode", "semi-auto")
@@ -2156,6 +2607,12 @@ def process_routing_failed(manifests: dict) -> None:
             if not launch_security_audit(path, task, retry=True):
                 continue
             approve_and_write(path, task, "Routing retry succeeded")
+            continue
+
+        # Never falls through to the generic branch below: a fixer that failed a check
+        # must not end up queued for operator pickup as if it were ordinary work.
+        if task.get("task_type") == "pre_audit":
+            launch_fixer(path, task, approval_note="Routing retry succeeded", retry=True)
             continue
 
         # Generic task: launch headless or queue for operator pickup.
