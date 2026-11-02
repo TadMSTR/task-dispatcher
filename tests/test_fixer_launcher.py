@@ -12,6 +12,7 @@ because the suite does not run as root.
 from __future__ import annotations
 
 import os
+import stat
 from pathlib import Path
 
 import pytest
@@ -742,13 +743,18 @@ def test_read_contained_swap_between_walk_and_open(dispatcher, tmp_path, monkeyp
     (tmp_path / "f").write_text("x")
     real_fstat = os.fstat
 
-    class Other:
-        def __init__(self, st):
-            self.st_dev, self.st_ino, self.st_mode = st.st_dev, st.st_ino + 1, st.st_mode
+    def swapped(fd):
+        # A real stat_result with only st_ino changed, so anything else that calls fstat
+        # while the stub is in place (pytest's own cleanup, on 3.12) still gets every field.
+        st = real_fstat(fd)
+        fields = list(st)
+        fields[stat.ST_INO] = st.st_ino + 1
+        return os.stat_result(fields)
 
-    monkeypatch.setattr(dispatcher.os, "fstat", lambda fd: Other(real_fstat(fd)))
-    with pytest.raises(dispatcher.FixerRefused, match="changed while being opened"):
-        dispatcher.read_contained(tmp_path, ["f"], 10)
+    with monkeypatch.context() as m:
+        m.setattr(dispatcher.os, "fstat", swapped)
+        with pytest.raises(dispatcher.FixerRefused, match="changed while being opened"):
+            dispatcher.read_contained(tmp_path, ["f"], 10)
 
 
 def test_read_contained_open_failure(dispatcher, tmp_path, monkeypatch):
