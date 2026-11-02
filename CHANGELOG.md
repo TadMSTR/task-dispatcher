@@ -5,6 +5,30 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.0] - 2026-11-02
+
+Build plan `audit-fixer-2026-11-p2-fixer-autolaunch`, Phase 2. #1365 (id 1448).
+
+### Added
+
+- **The fixer launcher, `launch_fixer()`.** A `pre_audit` task (task-queue-mcp v0.16.0)
+  launches a fresh headless session of its own agent to run `shared-build-fixer`, with no
+  operator Start. `launch_kind()` returns `fixer` for it ahead of the `workflow_mode` test,
+  and `fixer` is in `LAUNCHING_KINDS`, so it takes a concurrency slot and a relay waits for
+  the session that queued it. The handoff path is built from the task's `build_name`,
+  `audit_round` and `handoff_seq`. Before it approves anything, the launcher refuses the
+  task unless the handoff is a regular file with no link under the root, its front matter
+  names this task's build, round, seq and agent and a live `build` task of that build for
+  that agent, every repo on the plan's `**Repos:**` line is in the handoff's `repos:`, and
+  the PreCompact guard is installed root-owned. The prompt carries validated values only,
+  the environment gets `FORGE_LAUNCH_KIND=fixer`, and the run record says
+  `launched_by: dispatcher-fixer`. The routing-failed retry path calls the same function,
+  with the same per-agent cap.
+- `pre_audit` in `VALID_TASK_TYPES`, and `FIXER_AGENTS`, both asserted equal to
+  task-queue-mcp's by `tests/test_task_queue_vocabulary.py`, which now also reads
+  `frozenset({...})` literals.
+- `handoff_seq` in bus event metadata.
+
 ## [1.5.0] - 2026-10-16
 
 Build plan `operator-panel-2026-09-p3-lifecycle-events`, Phase 3. vikunja#553.
