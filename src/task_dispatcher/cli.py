@@ -2023,6 +2023,13 @@ def plan_repos(build_name: str) -> list[str] | None:
     a plan's body is an example, not the build's repo set. Raises FixerRefused for a
     malformed line, which is the plan author's error and must not read as "unverified".
     """
+    # SECURITY[accepted]: the plan is in build-plans/, which every agent's uid can write, so
+    # the agent whose fixer this launches can narrow the line (or delete it, which launches
+    # as `Repos: unverified`) and the check then covers less. Not a boundary against that
+    # uid: it could equally write the handoff and the queue file. The line guards against an
+    # honest h0 that leaves a repo out (R2-04), and the audit request's Repos Changed still
+    # goes to security. Same-uid residual, #1193 (id 1276). Ted, 2026-11-02 (pre-audit
+    # HA-61, audit-fixer-2026-11-p2-fixer-autolaunch); knowledge-base accepted-risks.md.
     parts = find_plan(build_name)
     if parts is None:
         return None
