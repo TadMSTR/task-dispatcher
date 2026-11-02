@@ -1811,6 +1811,15 @@ class _NoMergeSafeLoader(yaml.SafeLoader):
     wrote, which has none.
     """
 
+    def compose_node(self, parent, index):
+        # Aliases too: a template-written handoff has none, and refusing them removes the
+        # many-aliases-of-one-large-node shape along with merge chains (IV-80).
+        if self.check_event(yaml.events.AliasEvent):
+            raise yaml.composer.ComposerError(
+                None, None, "YAML aliases are refused", self.peek_event().start_mark
+            )
+        return super().compose_node(parent, index)
+
     def flatten_mapping(self, node):
         for key_node, _ in node.value:
             if key_node.tag == _MERGE_TAG:
@@ -1864,7 +1873,7 @@ def _check_root_chain(root: Path) -> None:
             raise FixerRefused(f"{cur} is not owned by this user")
 
 
-def read_contained(root: Path, parts: list[str], cap: int) -> bytes:
+def read_contained(root: Path, parts: list[str], cap: int, what: str = "file") -> bytes:
     """Read root/<parts...>: no symlink at any component under root, a regular file of at
     most `cap` bytes, inside root once resolved, and the inode that was checked is the one
     read. Raises FixerRefused.
@@ -1874,41 +1883,46 @@ def read_contained(root: Path, parts: list[str], cap: int) -> bytes:
     open is O_NOFOLLOW|O_NONBLOCK so a FIFO swapped in is not waited on, and the fstat
     comparison catches a swap between the walk and the open. The read is capped at
     cap + 1 from the fd, so a file grown since the lstat is refused rather than read.
+
+    Reasons name `what` and the component's position, never the path: a component can be
+    an agent-written directory name (a build-plans programme), and the reason reaches the
+    task history and, on dead-letter, a markdown Matrix alert (OE-01, OV-19).
     """
     try:
         real_root = root.resolve(strict=True)
     except (OSError, RuntimeError) as e:
-        raise FixerRefused(f"{root} is missing: {type(e).__name__}") from e
+        raise FixerRefused(f"the {what} root is missing ({type(e).__name__})") from e
     cur = root
     st = None
     for i, part in enumerate(parts):
+        at = f"the {what} path, component {i + 1} of {len(parts)},"
         if part in ("", ".", "..") or "/" in part:
-            raise FixerRefused(f"bad path component {part!r}")
+            raise FixerRefused(f"{at} is not a single path component")
         cur = cur / part
         try:
             st = os.lstat(cur)
         except OSError as e:
-            raise FixerRefused(f"{cur} does not exist ({type(e).__name__})") from e
+            raise FixerRefused(f"{at} does not exist ({type(e).__name__})") from e
         if stat.S_ISLNK(st.st_mode):
-            raise FixerRefused(f"{cur} is a symlink")
+            raise FixerRefused(f"{at} is a symlink")
         if i < len(parts) - 1 and not stat.S_ISDIR(st.st_mode):
-            raise FixerRefused(f"{cur} is not a directory")
+            raise FixerRefused(f"{at} is not a directory")
     if st is None or not stat.S_ISREG(st.st_mode):
-        raise FixerRefused(f"{cur} is not a regular file")
+        raise FixerRefused(f"the {what} is not a regular file")
     if st.st_size > cap:
-        raise FixerRefused(f"{cur} is larger than {cap} bytes")
+        raise FixerRefused(f"the {what} is larger than {cap} bytes")
     try:
         cur.resolve(strict=True).relative_to(real_root)
     except (OSError, RuntimeError, ValueError) as e:
-        raise FixerRefused(f"{cur} is outside {real_root}") from e
+        raise FixerRefused(f"the {what} is outside its root") from e
     try:
         fd = os.open(cur, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
     except OSError as e:
-        raise FixerRefused(f"{cur} could not be opened ({type(e).__name__})") from e
+        raise FixerRefused(f"the {what} could not be opened ({type(e).__name__})") from e
     try:
         fst = os.fstat(fd)
         if (fst.st_dev, fst.st_ino) != (st.st_dev, st.st_ino) or not stat.S_ISREG(fst.st_mode):
-            raise FixerRefused(f"{cur} changed while being opened")
+            raise FixerRefused(f"the {what} changed while being opened")
         chunks: list[bytes] = []
         total = 0
         while total <= cap:
@@ -1918,7 +1932,7 @@ def read_contained(root: Path, parts: list[str], cap: int) -> bytes:
             chunks.append(chunk)
             total += len(chunk)
         if total > cap:
-            raise FixerRefused(f"{cur} grew past {cap} bytes while being read")
+            raise FixerRefused(f"the {what} grew past {cap} bytes while being read")
         return b"".join(chunks)
     finally:
         os.close(fd)
@@ -1960,8 +1974,13 @@ def find_plan(build_name: str) -> list[str] | None:
     """
     root = build_plans_root()
     _check_root_chain(root.parent)
-    if not os.path.lexists(root):
+    try:
+        os.lstat(root)
+    except FileNotFoundError:
         return None
+    except OSError as e:
+        # os.path.lexists() would read this as "no plan" and launch unverified (SH-15).
+        raise FixerRefused(f"build-plans is unreadable ({type(e).__name__})") from e
     _check_root_chain(root)
 
     def present(parts: list[str]) -> bool:
@@ -2033,7 +2052,8 @@ def plan_repos(build_name: str) -> list[str] | None:
     parts = find_plan(build_name)
     if parts is None:
         return None
-    text = read_contained(build_plans_root(), parts, FIXER_HANDOFF_MAX).decode("utf-8", "replace")
+    text = read_contained(build_plans_root(), parts, FIXER_HANDOFF_MAX, "plan")
+    text = text.decode("utf-8", "replace")
     header = []
     for line in text.split("\n"):
         if line.startswith("## "):
@@ -2162,7 +2182,7 @@ def check_fixer_handoff(build_name: str, agent: str, rnd: int, seq: int) -> dict
     """
     _check_root_chain(fixer_handoff_root())
     data = read_contained(
-        fixer_handoff_root(), [build_name, f"r{rnd}-h{seq}.md"], FIXER_HANDOFF_MAX
+        fixer_handoff_root(), [build_name, f"r{rnd}-h{seq}.md"], FIXER_HANDOFF_MAX, "handoff"
     )
     fm = parse_front_matter(data)
     want = {"build_name": build_name, "round": rnd, "handoff_seq": seq, "agent": agent}
@@ -2188,6 +2208,71 @@ def check_fixer_handoff(build_name: str, agent: str, rnd: int, seq: int) -> dict
     if not isinstance(status, str) or status not in VALID_STATUSES - TERMINAL_STATUSES:
         raise FixerRefused(f"handoff build_task {build_task[:8]} is not live")
     return fm
+
+
+# Inherited names a fixer's environment must take from the agent's .env or not at all.
+FIXER_SCRUBBED_ENV = ("SCOPED_MCP_BEARER_TOKEN",)
+
+
+def open_fixer_log(log_path: Path) -> int:
+    """An append fd on the fixer's session log, mode 0600. Raises FixerRefused.
+
+    Every directory from $HOME down to the log is lstat-checked: a real directory (not a
+    link) owned by this uid. It must not be group- or world-writable unless an ancestor
+    already shuts out every other uid (mode & 0o077 == 0): on forge ~/.pm2 is 0700, so
+    PM2's own 0775 ~/.pm2/logs under it is reachable by no one else. A directory that is
+    missing is created and then chmod 0700, because mkdir's mode is masked by the umask
+    (FW-07, FW-12); an existing one is never changed (~/.pm2/logs is PM2's). The file is
+    opened O_NOFOLLOW, created 0600 and fchmod 0600, so a re-run never keeps a looser mode.
+    """
+    home = Path.home()
+    uid = os.getuid()
+    shielded = False
+    for cur in [
+        home,
+        *[
+            home.joinpath(*log_path.parent.relative_to(home).parts[: i + 1])
+            for i in range(len(log_path.parent.relative_to(home).parts))
+        ],
+    ]:
+        try:
+            st = os.lstat(cur)
+        except FileNotFoundError:
+            try:
+                os.mkdir(cur, 0o700)
+                os.chmod(cur, 0o700, follow_symlinks=False)
+                st = os.lstat(cur)
+            except OSError as e:
+                raise FixerRefused(
+                    f"log directory could not be created ({type(e).__name__})"
+                ) from e
+        except OSError as e:
+            raise FixerRefused(f"log directory is unreadable ({type(e).__name__})") from e
+        if not stat.S_ISDIR(st.st_mode):
+            raise FixerRefused("a log directory component is not a directory (or is a link)")
+        if st.st_uid != uid:
+            raise FixerRefused("a log directory is not owned by this user")
+        if st.st_mode & 0o022 and not shielded:
+            raise FixerRefused("a log directory is group/world-writable and reachable by others")
+        shielded = shielded or not st.st_mode & 0o077
+    try:
+        fd = os.open(
+            log_path,
+            os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+            0o600,
+        )
+    except OSError as e:
+        raise FixerRefused(f"session log could not be opened ({type(e).__name__})") from e
+    try:
+        fst = os.fstat(fd)
+        if not stat.S_ISREG(fst.st_mode) or fst.st_uid != uid:
+            raise FixerRefused("session log is not a regular file owned by this user")
+        os.fchmod(fd, 0o600)
+        os.set_blocking(fd, True)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
 
 
 def launch_fixer(path: Path, task: dict, *, approval_note: str, retry: bool = False) -> bool:
@@ -2233,12 +2318,21 @@ def launch_fixer(path: Path, task: dict, *, approval_note: str, retry: bool = Fa
         # SECURITY[deferred]: dict(os.environ) is the same broad passthrough as the headless
         # launcher's (MDISP-4; audit 2026-07-12/dispatcher-auth-and-notify-2026-07 F-1).
         child_env = dict(os.environ)
+        # The bearer token is the agent's identity. One the dispatcher inherited must not
+        # stand in for an agent .env that lacks it (SC-43): the presence check below has to
+        # see the agent's own token or nothing.
+        for name in FIXER_SCRUBBED_ENV:
+            child_env.pop(name, None)
         child_env.update(load_agent_env(agent))
         if not child_env.get("SCOPED_MCP_BEARER_TOKEN"):
             raise FixerRefused(f"SCOPED_MCP_BEARER_TOKEN unresolved for agent '{agent}'")
         if not anthropic_creds_usable(child_env):  # SMCP-29
             alert_auth_blocked(agent, task_id)
             raise FixerRefused("no usable Anthropic credential (OAuth expired / no API key)")
+        log_path = Path.home() / ".pm2" / "logs" / f"fixer-{agent}-{build_name}-r{rnd}-h{seq}.log"
+        # Opened before the approval, so a log path that can't be used is a refusal like any
+        # other check, not an approved task that never launched (OV-18).
+        log_fd = open_fixer_log(log_path)
     except FixerRefused as e:
         handle_routing_failure(path, task, f"Fixer launch refused: {e}")
         return False
@@ -2268,17 +2362,22 @@ def launch_fixer(path: Path, task: dict, *, approval_note: str, retry: bool = Fa
         f"Run shared-build-fixer. Task ID: {task_id}. Build: {build_name}. Round: {rnd}. "
         f"Handoff: {handoff}. Repos: {'verified' if repos is not None else 'unverified'}."
     )
-    log_path = Path.home() / ".pm2" / "logs" / f"fixer-{agent}-{build_name}-r{rnd}-h{seq}.log"
     approve_and_write(path, task, approval_note)
-    log_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    with open(log_path, "a") as log_fh:
+    try:
         proc = subprocess.Popen(
             ["claude", "-p", "--dangerously-skip-permissions", prompt],
             cwd=str(project_dir),
-            stdout=log_fh,
-            stderr=log_fh,
+            stdout=log_fd,
+            stderr=log_fd,
             env=child_env,
         )
+    except Exception as e:
+        # Approved but not launched: route it to failure, so the retry path picks it up and
+        # it is never left `approved` with no session (OV-18).
+        handle_routing_failure(path, task, f"Fixer session failed to start ({type(e).__name__})")
+        return False
+    finally:
+        os.close(log_fd)
     write_run_record(
         run_id=run_id,
         task_id=task_id,
@@ -2408,7 +2507,12 @@ def process_submitted(manifests: dict) -> None:
         # submitted by an agent that never read FORGE_WORKFLOW_MODE at all — an agent
         # started by hand, or one whose skill omits the inheritance line. Same helper as
         # sites 1 and 2 by construction, so the two directions cannot disagree.
-        originating_task_id = task.get("payload", {}).get("originating_task_id")
+        # A payload that is not a mapping (null, a list, a string) reaches launch_fixer and
+        # the other checks instead of raising out of the tick here (IV-52).
+        payload = task.get("payload")
+        originating_task_id = (
+            payload.get("originating_task_id") if isinstance(payload, dict) else None
+        )
         if originating_task_id:
             parent = find_task_by_id(originating_task_id)
             if parent:

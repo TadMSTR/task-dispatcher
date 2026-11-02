@@ -36,6 +36,9 @@ for _agent in ("developer", "security", "steward", "sysadmin", "writer", "resear
     (_HOME / ".claude" / "projects" / _agent).mkdir(parents=True)
 (_HOME / ".claude" / "comms" / "artifacts" / "audit-requests").mkdir(parents=True)
 os.environ["HOME"] = str(_HOME)
+# An inherited override would make the suite read the live roster instead of the fixture
+# copy below: a dispatcher-launched session has it set to ~/scripts/agent-launch.yml.
+os.environ.pop("AGENT_LAUNCH_POLICY", None)
 
 # The roster is resolved from $HOME/scripts/agent-launch.yml at import and must exist.
 # Use the repo's fixture copy, which exercises the real default resolution rather than the

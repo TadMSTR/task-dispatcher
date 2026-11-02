@@ -12,8 +12,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `build-plans/` or plan entry, a plan found only under an `archive`, `.*`, `_*` or linked
   directory, more than 2048 entries, two plans, or two `**Repos:**` lines in the header now
   go to `routing-failed`. Before, the first four launched `Repos: unverified` with the
-  repo check skipped. A missing `build-plans/`, or a plan with no `**Repos:**` line, still
-  launches unverified: those are the only two.
+  repo check skipped. Three cases still launch unverified, and only these: no
+  `build-plans/` at all, no plan for this build anywhere under it, or a plan with no
+  `**Repos:**` line. `build-plans/` that exists but can't be `lstat`ed is a refusal, not
+  the first case.
 - **The roots are pinned.** Every directory from `$HOME` down to `fixer-handoffs/` and
   `build-plans/` must be a real directory owned by this user or root; a link swapped in for
   one is refused instead of followed. The PreCompact guard check walks every directory from
@@ -27,9 +29,24 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (`2026-02-30`), or any other exception from a check now ends in `routing-failed` with the
   exception's type name.
 - **Refusal reasons name the field, not the value,** for `task_type`, `target_agent`, a
-  malformed `**Repos:**` entry (its position) and duplicate plans (a count). These reasons
-  reach Matrix on dead-letter.
-- The fixer session-log directory is created `0700`.
+  malformed `**Repos:**` entry (its position) and duplicate plans (a count). A refused
+  handoff or plan read names the file and the component's position, never the path: a
+  `build-plans/` programme directory is agent-named. These reasons reach Matrix on
+  dead-letter.
+- **The session log is checked before the task is approved.** Every directory from `$HOME`
+  down to `~/.pm2/logs` must be a real directory owned by this user, and not group- or
+  world-writable unless an ancestor already shuts out every other user (forge's `~/.pm2` is
+  `0700`). A directory the launcher creates is `chmod 0700` after `mkdir`, whatever the
+  umask; an existing one is never changed. The log is opened `O_NOFOLLOW|O_NONBLOCK`, so a
+  planted link or FIFO is refused instead of followed or waited on, and it is created and
+  `fchmod`ed `0600`. A log that can't be opened is a refusal like any other check.
+- **A session that fails to start after approval goes to `routing-failed`,** not left
+  `approved` with nothing running.
+- **A non-mapping `payload` no longer raises on the submitted tick** before the fixer's
+  own check sees it.
+- **An inherited `SCOPED_MCP_BEARER_TOKEN` is dropped** before the agent's `.env` is
+  applied, so the presence check sees the agent's own token or none.
+- **YAML aliases are refused** in the handoff front matter, as merge keys already were.
 
 ## [1.6.0] - 2026-11-02
 

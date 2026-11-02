@@ -29,6 +29,10 @@ def home(monkeypatch, tmp_path):
     (home / ".claude" / "comms" / "artifacts" / "fixer-handoffs").mkdir(parents=True)
     (home / ".claude" / "comms" / "artifacts" / "build-plans").mkdir(parents=True)
     (home / ".pm2" / "logs").mkdir(parents=True)
+    # forge's shape: $HOME not group-writable, ~/.pm2 0700, PM2's own ~/.pm2/logs 0775.
+    home.chmod(0o701)
+    (home / ".pm2").chmod(0o700)
+    (home / ".pm2" / "logs").chmod(0o775)
     monkeypatch.setenv("HOME", str(home))
     return home
 
@@ -699,7 +703,7 @@ def test_read_contained_missing_root(dispatcher, tmp_path):
 
 @pytest.mark.parametrize("part", ["", ".", "..", "a/b"])
 def test_read_contained_bad_component(dispatcher, tmp_path, part):
-    with pytest.raises(dispatcher.FixerRefused, match="bad path component"):
+    with pytest.raises(dispatcher.FixerRefused, match="not a single path component"):
         dispatcher.read_contained(tmp_path, [part, "f"], 10)
 
 
@@ -1039,3 +1043,246 @@ def test_routing_failed_retry_held_during_auth_outage(
     dispatcher.process_routing_failed({})
     assert launches == []
     assert yaml.safe_load(path.read_text())["status"] == "routing-failed"
+
+
+# --- pre-audit pass 2 (audit-fixer-2026-11-p2 round 1): each fails on b1b00ce -----------
+
+
+@pytest.mark.parametrize(
+    "plant",
+    ["symlink", "fifo", "directory", "oversize"],
+)
+def test_plan_refusal_reasons_carry_no_programme_dir_name(
+    dispatcher, queue, ready, failures, launches, approvals, tmp_path, plant
+):
+    """OE-01/OV-19: a programme directory name is agent-written and the reason reaches a
+    markdown Matrix alert on dead-letter. The reason names the plan, never its path."""
+    plans = ready / ".claude" / "comms" / "artifacts" / "build-plans"
+    for p in plans.rglob("plan.md"):
+        p.unlink()
+    name = "**pwn**<img src=x onerror=alert(1)>"
+    d = plans / name / BUILD
+    d.mkdir(parents=True)
+    target = d / "plan.md"
+    if plant == "symlink":
+        real = tmp_path / "elsewhere.md"
+        real.write_text("**Repos:** TadMSTR/task-queue-mcp\n")
+        target.symlink_to(real)
+    elif plant == "fifo":
+        os.mkfifo(target)
+    elif plant == "directory":
+        target.mkdir()
+    else:
+        target.write_text("x" * (dispatcher.FIXER_HANDOFF_MAX + 1))
+    refused(launch(dispatcher, queue), failures, launches, approvals, "")
+    assert "pwn" not in failures[0] and "<img" not in failures[0], failures[0]
+    assert str(plans) not in failures[0]
+
+
+def test_read_contained_reasons_name_the_position_not_the_value(dispatcher, tmp_path):
+    (tmp_path / "secret-name").mkdir()
+    (tmp_path / "secret-name" / "f").symlink_to("/etc/hostname")
+    with pytest.raises(dispatcher.FixerRefused) as e:
+        dispatcher.read_contained(tmp_path, ["secret-name", "f"], 10, "plan")
+    assert "secret-name" not in str(e.value) and str(tmp_path) not in str(e.value)
+    assert "component 2 of 2" in str(e.value)
+
+
+def test_new_log_dirs_are_0700_under_a_loose_umask(
+    dispatcher, queue, ready, failures, launches, approvals
+):
+    """FW-07/FW-12: mkdir's mode is masked by the umask, and parents=True made ~/.pm2 with
+    it. Both levels the launcher creates end 0700."""
+    (ready / ".pm2" / "logs").rmdir()
+    (ready / ".pm2").rmdir()
+    old = os.umask(0o002)
+    try:
+        assert launch(dispatcher, queue) is True, failures
+    finally:
+        os.umask(old)
+    for d in (ready / ".pm2", ready / ".pm2" / "logs"):
+        assert stat.S_IMODE(d.stat().st_mode) == 0o700, d
+
+
+@pytest.mark.parametrize("which", ["", ".pm2"])
+def test_a_group_writable_log_dir_others_can_reach_is_refused_before_approval(
+    dispatcher, queue, ready, failures, launches, approvals, which
+):
+    (ready / which).chmod(0o775)
+    if which == "":
+        (ready / ".pm2").chmod(0o755)
+    refused(launch(dispatcher, queue), failures, launches, approvals, "group/world-writable")
+
+
+def test_pm2s_own_0775_logs_under_a_0700_pm2_launches(
+    dispatcher, queue, ready, failures, launches, approvals
+):
+    """The live shape on forge. Refusing it would refuse every fixer."""
+    assert stat.S_IMODE((ready / ".pm2" / "logs").stat().st_mode) == 0o775
+    assert launch(dispatcher, queue) is True, failures
+    assert stat.S_IMODE((ready / ".pm2" / "logs").stat().st_mode) == 0o775
+
+
+def test_a_log_dir_owned_by_another_uid_is_refused(
+    dispatcher, queue, ready, failures, launches, approvals, monkeypatch
+):
+    real_lstat = os.lstat
+    logs = ready / ".pm2" / "logs"
+
+    def lstat(p, *a, **k):
+        st = real_lstat(p, *a, **k)
+        if Path(p) == logs:
+            return os.stat_result(
+                (
+                    st.st_mode,
+                    st.st_ino,
+                    st.st_dev,
+                    st.st_nlink,
+                    os.getuid() + 1,
+                    st.st_gid,
+                    st.st_size,
+                    st.st_atime,
+                    st.st_mtime,
+                    st.st_ctime,
+                )
+            )
+        return st
+
+    monkeypatch.setattr(dispatcher.os, "lstat", lstat)
+    refused(launch(dispatcher, queue), failures, launches, approvals, "not owned by this user")
+
+
+def test_a_linked_log_dir_is_refused_before_approval(
+    dispatcher, queue, ready, failures, launches, approvals, tmp_path
+):
+    logs = ready / ".pm2" / "logs"
+    logs.rmdir()
+    other = tmp_path / "other-logs"
+    other.mkdir(mode=0o700)
+    logs.symlink_to(other)
+    refused(launch(dispatcher, queue), failures, launches, approvals, "not a directory")
+
+
+@pytest.mark.parametrize("plant", ["symlink", "fifo"])
+def test_a_planted_log_file_is_refused_before_approval(
+    dispatcher, queue, ready, failures, launches, approvals, tmp_path, plant
+):
+    log = ready / ".pm2" / "logs" / f"fixer-developer-{BUILD}-r1-h0.log"
+    if plant == "symlink":
+        (tmp_path / "victim").write_text("")
+        log.symlink_to(tmp_path / "victim")
+    else:
+        os.mkfifo(log)
+    refused(launch(dispatcher, queue), failures, launches, approvals, "session log")
+
+
+def test_an_existing_loose_log_file_is_tightened_to_0600(
+    dispatcher, queue, ready, failures, launches, approvals
+):
+    log = ready / ".pm2" / "logs" / f"fixer-developer-{BUILD}-r1-h0.log"
+    log.write_text("earlier run\n")
+    log.chmod(0o644)
+    assert launch(dispatcher, queue) is True, failures
+    assert stat.S_IMODE(log.stat().st_mode) == 0o600
+
+
+def test_popen_failure_after_approval_routes_to_failure(
+    dispatcher, queue, ready, failures, approvals, monkeypatch
+):
+    """OV-18: an approved task whose session never started must not stay `approved`."""
+
+    def boom(*a, **k):
+        raise FileNotFoundError("claude")
+
+    monkeypatch.setattr(dispatcher.subprocess, "Popen", boom)
+    assert launch(dispatcher, queue) is False
+    assert approvals == ["Auto-approved: test"]
+    assert len(failures) == 1 and "failed to start (FileNotFoundError)" in failures[0]
+
+
+@pytest.mark.parametrize("payload", [None, [], "x", 3])
+def test_non_mapping_payload_through_the_tick_routes_to_failure(
+    dispatcher, ready, launches, write_task, payload
+):
+    """IV-52: the submitted tick read payload.get() before launch_fixer saw the task."""
+    path, _ = _queue_fixer(write_task, payload=payload)
+    dispatcher.process_submitted({})
+    assert launches == []
+    data = yaml.safe_load(path.read_text())
+    assert data["status"] == "routing-failed"
+    assert "payload is not a mapping" in data["retry_policy"]["last_failure_reason"]
+
+
+def test_build_plans_lstat_error_is_refused_not_read_as_absent(
+    dispatcher, queue, ready, failures, launches, approvals, monkeypatch
+):
+    """SH-15: os.path.lexists() read a PermissionError on build-plans/ as "no plan"."""
+    root = dispatcher.build_plans_root()
+    real_lstat = os.lstat
+
+    def lstat(p, *a, **k):
+        if Path(p) == root:
+            raise PermissionError(13, "denied")
+        return real_lstat(p, *a, **k)
+
+    monkeypatch.setattr(dispatcher.os, "lstat", lstat)
+    refused(launch(dispatcher, queue), failures, launches, approvals, "build-plans is unreadable")
+
+
+def test_an_inherited_bearer_token_does_not_stand_in_for_the_agents(
+    dispatcher, queue, ready, failures, launches, approvals, monkeypatch
+):
+    """SC-43: the presence check must see the agent's own token, not the dispatcher's."""
+    monkeypatch.setenv("SCOPED_MCP_BEARER_TOKEN", "the-dispatchers-own")
+    monkeypatch.setattr(dispatcher, "load_agent_env", lambda a: {})
+    refused(launch(dispatcher, queue), failures, launches, approvals, "unresolved")
+
+
+def test_the_agents_token_replaces_an_inherited_one(
+    dispatcher, queue, ready, failures, launches, approvals, monkeypatch
+):
+    monkeypatch.setenv("SCOPED_MCP_BEARER_TOKEN", "the-dispatchers-own")
+    assert launch(dispatcher, queue) is True, failures
+    assert launches[0]["env"]["SCOPED_MCP_BEARER_TOKEN"] == "t"
+
+
+def _hostile_front_matter() -> dict[str, str]:
+    """IV-80's required shapes, each inside the 16 KiB front-matter cap."""
+    # Block nesting on one line: each `- ` / `? ` opens a level two bytes wide.
+    block_seq = "a:\n  " + "- " * 7000 + "x\n"
+    complex_keys = "a:\n  " + "? " * 7000 + "x\n"
+    laughs = (
+        "a: &a ["
+        + ",".join(["x" * 20] * 20)
+        + "]\n"
+        + "".join(f"b{i}: [*a, *a, *a, *a, *a, *a, *a, *a]\n" for i in range(400))
+    )
+    chain = "k0: &k0 {v: 1}\n" + "".join(f"k{i}: &k{i}\n  <<: *k{i - 1}\n" for i in range(1, 600))
+    flow = "a: " + "[" * 8000 + "]" * 8000 + "\n"
+    return {
+        "block-seq": block_seq,
+        "complex-keys": complex_keys,
+        "laughs": laughs,
+        "merge-chain": chain,
+        "flow": flow,
+    }
+
+
+@pytest.mark.parametrize("shape", sorted(_hostile_front_matter()))
+def test_hostile_yaml_shapes_are_refused_quickly(
+    dispatcher, queue, ready, failures, launches, approvals, shape
+):
+    import time
+
+    body = _hostile_front_matter()[shape]
+    assert len(body) < dispatcher.FIXER_FRONT_MAX, (shape, len(body))
+    (_handoff_dir(ready) / "r1-h0.md").write_text("---\n" + body + "---\n")
+    t0 = time.monotonic()
+    result = launch(dispatcher, queue)
+    assert time.monotonic() - t0 < 5, shape
+    refused(result, failures, launches, approvals, "")
+
+
+def test_yaml_aliases_are_refused(dispatcher):
+    with pytest.raises(dispatcher.FixerRefused, match="does not parse"):
+        dispatcher.parse_front_matter(b"---\na: &x [1]\nb: *x\n---\n")

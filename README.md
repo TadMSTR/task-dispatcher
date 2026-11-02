@@ -93,7 +93,7 @@ goes to `routing-failed` with the reason:
 | `/usr/local/sbin/forge/fixer-precompact-guard.py` and every directory from `/` down to it are root-owned and not group- or world-writable | a fixer session must not compact, and without the guard it compacts silently |
 | The agent's `.env` gives `SCOPED_MCP_BEARER_TOKEN`, and Anthropic credentials are usable | as for every launch |
 
-A build with no plan anywhere under `build-plans/`, or a plan with no `**Repos:**` line (every plan before this one), does not block. Those are the only two. The prompt
+No `build-plans/` at all, a build with no plan anywhere under it, or a plan with no `**Repos:**` line (every plan before this one), does not block. Those are the only three. The prompt
 says `Repos: unverified`, and the fixer carries that into the audit request's Known Risks.
 
 The prompt is fixed text plus validated values. It contains no `summary` and no
@@ -105,7 +105,8 @@ Run shared-build-fixer. Task ID: <id>. Build: <build_name>. Round: <N>. Handoff:
 
 The environment gets `FORGE_LAUNCH_KIND=fixer` as well as the usual `FORGE_WORKFLOW_MODE`,
 `FORGE_RUN_ID` and `FORGE_TASK_ID`. The log is
-`~/.pm2/logs/fixer-<agent>-<build_name>-r<N>-h<k>.log`.
+`~/.pm2/logs/fixer-<agent>-<build_name>-r<N>-h<k>.log`, mode `0600`, opened before the task is approved: a
+log path that is a link, a FIFO, or under a directory other users can write is a refusal.
 
 **What this does not stop.** Every agent except steward runs as one uid. A process with
 that uid can read another agent's token, or write a queue file and a handoff directly, and
