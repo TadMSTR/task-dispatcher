@@ -1757,8 +1757,9 @@ def launch_security_audit(path: Path, task: dict, *, retry: bool = False) -> boo
 #     matter must name this task's build, round, seq and agent, and a live `build` task of
 #     that build addressed to that agent.
 #   - The plan's **Repos:** line, found by build_name under build-plans/ and never by a
-#     path the handoff names, must be covered by the handoff's repos: (audit R2-04). A plan
-#     without the line launches with `Repos: unverified`, which the fixer reports.
+#     path the handoff names, must be covered by the handoff's repos: (audit R2-04). A build
+#     with no plan, or a plan without the line, launches with `Repos: unverified`, which
+#     the fixer reports; anything else that hides the plan is a refusal.
 #   - The PreCompact guard must be installed. A fixer session must not compact (Ted,
 #     2026-11-02), and without the guard it compacts silently.
 #
@@ -1784,6 +1785,13 @@ FIXER_FRONT_MAX = 16 * 1024
 FIXER_REPOS_MAX = 32
 FIXER_GUARD_PATH = Path("/usr/local/sbin/forge/fixer-precompact-guard.py")
 FIXER_GUARD_OWNER_UID = 0  # a module constant so the tests, which are not root, can set it
+# Every directory from here down to the guard's must be owned by FIXER_GUARD_OWNER_UID and
+# not group- or world-writable: one writable ancestor lets its owner swap the subtree. "/"
+# in production; a module constant so the tests can root the chain in a tmp dir.
+FIXER_GUARD_TRUST_ROOT = Path("/")
+# find_plan reads at most this many entries of build-plans/ (138 today) before it refuses:
+# the directory is agent-writable, and an unbounded listing is a tick an agent can stall.
+FIXER_PLAN_DIRS_MAX = 2048
 _FIXER_BUILD_NAME_RE = re.compile(r"[A-Za-z0-9_-]{1,128}")
 _PLAN_REPO_RE = re.compile(r"[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}")
 _PLAN_REPOS_PREFIX = "**Repos:**"
@@ -1826,6 +1834,34 @@ def build_plans_root() -> Path:
 def _bounded_int(value: object, lo: int, hi: int) -> bool:
     # bool is an int subclass; True must not read as round 1.
     return isinstance(value, int) and not isinstance(value, bool) and lo <= value <= hi
+
+
+def _check_root_chain(root: Path) -> None:
+    """Refuse a root reached through a link or through a directory someone else owns.
+
+    Walks every component from $HOME down to `root` with lstat: each must be a real
+    directory owned by this uid (or root). Without it, a link swapped in for
+    fixer-handoffs/ or build-plans/ (or comms/ above them) moves the whole read somewhere
+    else, and the resolve-based containment check below passes against the moved target.
+    """
+    home = Path.home()
+    try:
+        rel = root.relative_to(home)
+    except ValueError as e:
+        raise FixerRefused(f"{root} is not under {home}") from e
+    cur = home
+    for part in ("", *rel.parts):
+        if part in (".", ".."):
+            raise FixerRefused(f"bad root component {part!r}")
+        cur = cur / part if part else cur
+        try:
+            st = os.lstat(cur)
+        except OSError as e:
+            raise FixerRefused(f"{cur} is missing: {type(e).__name__}") from e
+        if not stat.S_ISDIR(st.st_mode):
+            raise FixerRefused(f"{cur} is not a directory (a link, or another file type)")
+        if st.st_uid not in (os.getuid(), 0):
+            raise FixerRefused(f"{cur} is not owned by this user")
 
 
 def read_contained(root: Path, parts: list[str], cap: int) -> bytes:
@@ -1902,7 +1938,9 @@ def parse_front_matter(data: bytes) -> dict:
         raise FixerRefused(f"handoff front matter is not closed within {FIXER_FRONT_MAX} bytes")
     try:
         fm = yaml.load(text[4:end], Loader=_NoMergeSafeLoader)
-    except (yaml.YAMLError, RecursionError) as e:
+    except (yaml.YAMLError, RecursionError, ValueError, TypeError) as e:
+        # SafeLoader raises ValueError on a timestamp-shaped scalar that is no real date
+        # (2026-02-30), and the caller's contract is FixerRefused, never a stray exception.
         raise FixerRefused(f"handoff front matter does not parse ({type(e).__name__})") from e
     if not isinstance(fm, dict):
         raise FixerRefused("handoff front matter is not a mapping")
@@ -1914,29 +1952,67 @@ def find_plan(build_name: str) -> list[str] | None:
 
     Looked up by build_name, never by a path the handoff names: build-plans/<build>/plan.md
     for a single-plan build, build-plans/<programme>/<build>/plan.md for a programme part.
-    Archive directories are skipped; a plan in one belongs to a finalized build, whose
-    build task the launcher has already refused as terminal. Two matches is a refusal, not
-    a guess. Raises FixerRefused for that.
+    `archive`, `.*` and `_*` directories and links are not searched (a plan in an archive
+    belongs to a finalized build). None means no plan exists anywhere: a plan found only
+    under a directory that is not searched, two plans, an unreadable directory, or more
+    than FIXER_PLAN_DIRS_MAX entries is a refusal (FixerRefused), never a quiet
+    "unverified".
     """
     root = build_plans_root()
-    candidates = [[build_name, "plan.md"]]
-    try:
-        children = sorted(root.iterdir())
-    except OSError:
+    _check_root_chain(root.parent)
+    if not os.path.lexists(root):
         return None
-    for child in children:
-        name = child.name
-        if name.startswith((".", "_")) or name == "archive" or name == build_name:
-            continue
-        if child.is_symlink() or not child.is_dir():
-            continue
-        candidates.append([name, build_name, "plan.md"])
-    found = [c for c in candidates if os.path.lexists(root.joinpath(*c))]
+    _check_root_chain(root)
+
+    def present(parts: list[str]) -> bool:
+        try:
+            os.lstat(root.joinpath(*parts))
+        except FileNotFoundError:
+            return False
+        except OSError as e:
+            raise FixerRefused(
+                f"build-plans entry for {build_name} is unreadable ({type(e).__name__})"
+            ) from e
+        return True
+
+    candidates = [[build_name, "plan.md"]]
+    skipped: list[list[str]] = []
+    try:
+        with os.scandir(root) as it:
+            for n, entry in enumerate(it):
+                if n >= FIXER_PLAN_DIRS_MAX:
+                    raise FixerRefused(
+                        f"build-plans has more than {FIXER_PLAN_DIRS_MAX} entries; not searched"
+                    )
+                name = entry.name
+                if name == build_name:
+                    continue
+                if not entry.is_dir(follow_symlinks=False):
+                    if entry.is_symlink():
+                        skipped.append([name, build_name, "plan.md"])
+                    continue
+                parts = [name, build_name, "plan.md"]
+                if name.startswith((".", "_")) or name == "archive":
+                    skipped.append(parts)
+                else:
+                    candidates.append(parts)
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        raise FixerRefused(f"build-plans is unreadable ({type(e).__name__})") from e
+    found = [c for c in candidates if present(c)]
     if len(found) > 1:
+        # A count, not the names: directory names are agent-written, and this reason
+        # reaches the task history and, on dead-letter, a Matrix alert.
+        raise FixerRefused(f"{len(found)} plans for build {build_name}; expected one")
+    if found:
+        return found[0]
+    if any(present(c) for c in skipped):
         raise FixerRefused(
-            f"more than one plan for build {build_name}: " + ", ".join("/".join(c) for c in found)
+            f"the only plan for build {build_name} is under an archive, hidden or linked "
+            "directory, which is not searched"
         )
-    return found[0] if found else None
+    return None
 
 
 def plan_repos(build_name: str) -> list[str] | None:
@@ -1951,21 +2027,29 @@ def plan_repos(build_name: str) -> list[str] | None:
     if parts is None:
         return None
     text = read_contained(build_plans_root(), parts, FIXER_HANDOFF_MAX).decode("utf-8", "replace")
+    header = []
     for line in text.split("\n"):
         if line.startswith("## "):
             break
-        if line.startswith(_PLAN_REPOS_PREFIX):
-            raw = [r.strip().strip("`").strip() for r in line[len(_PLAN_REPOS_PREFIX) :].split(",")]
-            repos = [r for r in raw if r]
-            if not repos or len(repos) > FIXER_REPOS_MAX:
-                raise FixerRefused(f"plan **Repos:** line for {build_name} lists no repos")
-            bad = [r for r in repos if not _PLAN_REPO_RE.fullmatch(r)]
-            if bad:
-                raise FixerRefused(
-                    f"plan **Repos:** line for {build_name} has a malformed entry "
-                    f"(want owner/repo): {bad[0][:80]!r}"
-                )
-            return repos
+        header.append(line)
+    repos_lines = [ln for ln in header if ln.startswith(_PLAN_REPOS_PREFIX)]
+    if len(repos_lines) > 1:
+        # The first line alone would leave the second's repos out of the check.
+        raise FixerRefused(f"plan header for {build_name} has {len(repos_lines)} **Repos:** lines")
+    if repos_lines:
+        line = repos_lines[0]
+        raw = [r.strip().strip("`").strip() for r in line[len(_PLAN_REPOS_PREFIX) :].split(",")]
+        repos = [r for r in raw if r]
+        if not repos or len(repos) > FIXER_REPOS_MAX:
+            raise FixerRefused(f"plan **Repos:** line for {build_name} lists no repos")
+        bad = [i for i, r in enumerate(repos, 1) if not _PLAN_REPO_RE.fullmatch(r)]
+        if bad:
+            # The position, not the value: the plan is agent-written (OE-01).
+            raise FixerRefused(
+                f"plan **Repos:** line for {build_name} has a malformed entry "
+                f"(want owner/repo) at position {bad[0]}"
+            )
+        return repos
     return None
 
 
@@ -1992,9 +2076,17 @@ def handoff_repo_names(fm: dict) -> set[str]:
 
 def fixer_guard_problem() -> str | None:
     """Why the PreCompact guard can't be relied on, or None if it is installed properly:
-    a regular file owned by root and not group- or world-writable, in a directory that is
-    the same. A guard someone else can rewrite is no guard."""
-    for p, want_dir in ((FIXER_GUARD_PATH.parent, True), (FIXER_GUARD_PATH, False)):
+    a regular file owned by root and not group- or world-writable, and every directory
+    from FIXER_GUARD_TRUST_ROOT down to it the same. A guard someone else can rewrite, or
+    whose directory chain someone else can swap, is no guard."""
+    try:
+        rel = FIXER_GUARD_PATH.parent.relative_to(FIXER_GUARD_TRUST_ROOT)
+    except ValueError:
+        return f"{FIXER_GUARD_PATH} is not under {FIXER_GUARD_TRUST_ROOT}"
+    chain = [FIXER_GUARD_TRUST_ROOT]
+    for part in rel.parts:
+        chain.append(chain[-1] / part)
+    for p, want_dir in [(d, True) for d in chain] + [(FIXER_GUARD_PATH, False)]:
         try:
             st = os.lstat(p)
         except OSError:
@@ -2012,12 +2104,13 @@ def fixer_guard_problem() -> str | None:
 def check_fixer_task(task: dict) -> tuple[str, str, int, int]:
     """(task_id, agent, round, seq) for a well-formed fixer task. Raises FixerRefused."""
     if task.get("task_type") != "pre_audit":
-        raise FixerRefused(f"not a pre_audit task: {task.get('task_type')!r}")
+        raise FixerRefused("not a pre_audit task")
     agent = task.get("target_agent")
     if not isinstance(agent, str) or task.get("source_agent") != agent:
         raise FixerRefused("pre_audit task is not addressed to its submitter")
     if agent not in FIXER_AGENTS:
-        raise FixerRefused(f"pre_audit target {agent[:40]!r} is not a build agent")
+        # The field, not the value: queue files are agent-writable (OE-01).
+        raise FixerRefused("pre_audit target_agent is not a build agent")
     entry = LAUNCH_POLICY.get(agent)
     if entry is None:
         raise FixerRefused(f"{agent} is not in the launch roster")
@@ -2040,8 +2133,15 @@ def check_fixer_task(task: dict) -> tuple[str, str, int, int]:
     seq = task.get("handoff_seq")
     if not _bounded_int(seq, 0, FIXER_HANDOFF_SEQ_MAX):
         raise FixerRefused(f"pre_audit handoff_seq is not an integer 0-{FIXER_HANDOFF_SEQ_MAX}")
-    if task.get("payload", {}).get("originating_task_id") is not None:
+    payload = task.get("payload", {})
+    if not isinstance(payload, dict):
+        raise FixerRefused("pre_audit payload is not a mapping")
+    if payload.get("originating_task_id") is not None:
         raise FixerRefused("pre_audit task carries originating_task_id")
+    if task.get("requires_approval") is True:
+        # task-queue-mcp refuses this at submit; a hand-written file gets the same answer
+        # here, not an operator approval that would skip every check below.
+        raise FixerRefused("pre_audit task asks for requires_approval")
     if task.get("workflow_mode", "semi-auto") not in VALID_WORKFLOW_MODES:
         raise FixerRefused("pre_audit workflow_mode is not in the vocabulary")
     return task_id, agent, rnd, seq
@@ -2053,6 +2153,7 @@ def check_fixer_handoff(build_name: str, agent: str, rnd: int, seq: int) -> dict
     Mismatch reasons name the field, never the value: the value is whatever the file's
     writer put there, and it reaches a task's history and the dispatcher log.
     """
+    _check_root_chain(fixer_handoff_root())
     data = read_contained(
         fixer_handoff_root(), [build_name, f"r{rnd}-h{seq}.md"], FIXER_HANDOFF_MAX
     )
@@ -2076,7 +2177,8 @@ def check_fixer_handoff(build_name: str, agent: str, rnd: int, seq: int) -> dict
         raise FixerRefused(
             f"handoff build_task {build_task[:8]} is not a build task of {build_name} for {agent}"
         )
-    if parent.get("status") not in VALID_STATUSES - TERMINAL_STATUSES:
+    status = parent.get("status")
+    if not isinstance(status, str) or status not in VALID_STATUSES - TERMINAL_STATUSES:
         raise FixerRefused(f"handoff build_task {build_task[:8]} is not live")
     return fm
 
@@ -2121,6 +2223,8 @@ def launch_fixer(path: Path, task: dict, *, approval_note: str, retry: bool = Fa
         project_dir = LAUNCH_POLICY[agent]["project_dir"]
         if not project_dir.is_dir():
             raise FixerRefused(f"project dir missing: {project_dir}")
+        # SECURITY[deferred]: dict(os.environ) is the same broad passthrough as the headless
+        # launcher's (MDISP-4; audit 2026-07-12/dispatcher-auth-and-notify-2026-07 F-1).
         child_env = dict(os.environ)
         child_env.update(load_agent_env(agent))
         if not child_env.get("SCOPED_MCP_BEARER_TOKEN"):
@@ -2130,6 +2234,16 @@ def launch_fixer(path: Path, task: dict, *, approval_note: str, retry: bool = Fa
             raise FixerRefused("no usable Anthropic credential (OAuth expired / no API key)")
     except FixerRefused as e:
         handle_routing_failure(path, task, f"Fixer launch refused: {e}")
+        return False
+    except Exception as e:
+        # Any other exception from a check is malformed input reaching code that expected
+        # a shape (OV-18, OV-33). It must still end in routing-failed: escaping here would
+        # abort the whole tick, every tick, on this one file.
+        handle_routing_failure(
+            path,
+            task,
+            f"Fixer launch refused: a check failed on malformed input ({type(e).__name__})",
+        )
         return False
 
     workflow_mode = task.get("workflow_mode", "semi-auto")
@@ -2149,7 +2263,7 @@ def launch_fixer(path: Path, task: dict, *, approval_note: str, retry: bool = Fa
     )
     log_path = Path.home() / ".pm2" / "logs" / f"fixer-{agent}-{build_name}-r{rnd}-h{seq}.log"
     approve_and_write(path, task, approval_note)
-    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     with open(log_path, "a") as log_fh:
         proc = subprocess.Popen(
             ["claude", "-p", "--dangerously-skip-permissions", prompt],
@@ -2341,6 +2455,14 @@ def process_submitted(manifests: dict) -> None:
             needs_approval = RISK_ORDER.get(risk, 0) > RISK_ORDER.get(max_auto, 0)
             approval_reason = f"risk={risk} vs max_auto_risk={max_auto} (fallback)"
 
+        if task.get("task_type") == "pre_audit":
+            # A fixer never goes to the operator-approval pipeline: an approval there would
+            # leave it `approved` with none of launch_fixer's checks run, the state the
+            # launcher exists to prevent (IV-81). launch_fixer is its gate, and it refuses
+            # requires_approval itself.
+            needs_approval = False
+            approval_reason = "pre_audit: checked by launch_fixer"
+
         log.info(f"{path.name}: approval={needs_approval} — {approval_reason}")
 
         if needs_approval:
@@ -2485,7 +2607,9 @@ def process_routing_failed(manifests: dict) -> None:
     """Retry tasks that failed routing but haven't exhausted their retry budget.
 
     These tasks sit in "routing-failed" status between retries (not "submitted"),
-    so they skip the approval pipeline — they were already approved.  When the
+    so they skip the approval pipeline — they were already approved, except a refused
+    `pre_audit` fixer, which is never approved before launch_fixer's checks pass and is
+    retried through launch_fixer again.  When the
     retry window passes, this function picks them up and attempts routing directly,
     jumping to the post-approval dispatch logic.
 

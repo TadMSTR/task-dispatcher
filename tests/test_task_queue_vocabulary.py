@@ -210,6 +210,54 @@ def check_shared_dirnames() -> None:
         )
 
 
+# The numeric bounds a `pre_audit` task is checked against on both sides (audit-fixer-2026-11
+# p2, HA-29): dispatcher constant → MCP constant. The MCP refuses at submit, the launcher
+# refuses again, so a bound raised on one side only is a task one side accepts and the
+# other refuses forever. pre-audit-gate.py's --max-relays default (2) is the third copy of
+# HANDOFF_SEQ_MAX; it lives in a private repo this public CI cannot read, so that pair is
+# kept by the cross-reference comments on each constant.
+SHARED_BOUNDS = {
+    "FIXER_HANDOFF_SEQ_MAX": "HANDOFF_SEQ_MAX",
+    "FIXER_AUDIT_ROUND_MAX": "AUDIT_ROUND_MAX",
+}
+
+
+def literal_ints(source: str) -> dict[str, int]:
+    """Module-level `NAME = <int literal>` assignments (bools excluded)."""
+    found: dict[str, int] = {}
+    for node in ast.parse(source).body:
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+            continue
+        target = node.targets[0]
+        value = node.value
+        if (
+            isinstance(target, ast.Name)
+            and isinstance(value, ast.Constant)
+            and type(value.value) is int
+        ):
+            found[target.id] = value.value
+    return found
+
+
+def check_shared_bounds() -> None:
+    disp = literal_ints(DISPATCHER.read_text())
+    mcp = literal_ints(fetch_upstream())
+    for disp_name, mcp_name in sorted(SHARED_BOUNDS.items()):
+        ours, theirs = disp.get(disp_name), mcp.get(mcp_name)
+        if ours is None:
+            check(False, f"{disp_name} is missing or not an int literal in cli.py")
+            continue
+        if theirs is None:
+            check(False, f"{mcp_name} is missing from task-queue-mcp — renamed upstream?")
+            continue
+        check(
+            ours == theirs,
+            f"{disp_name} == {mcp_name} ({ours})"
+            if ours == theirs
+            else f"{disp_name}={ours} != {mcp_name}={theirs}",
+        )
+
+
 def fetch_upstream() -> str:
     try:
         # SECURITY[accepted]: urllib follows redirects by default; no redirect handling is
@@ -275,6 +323,7 @@ def main() -> int:
             check(False, f"{disp_name} != {mcp_name} — " + "; ".join(detail))
 
     check_shared_dirnames()
+    check_shared_bounds()
 
     print()
     if FAILURES:

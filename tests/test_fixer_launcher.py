@@ -43,6 +43,9 @@ def guard(dispatcher, monkeypatch, tmp_path):
     g.chmod(0o755)
     monkeypatch.setattr(dispatcher, "FIXER_GUARD_PATH", g)
     monkeypatch.setattr(dispatcher, "FIXER_GUARD_OWNER_UID", os.getuid())
+    # The chain from here down to the guard is checked too; /tmp above it is world-writable.
+    tmp_path.chmod(0o755)
+    monkeypatch.setattr(dispatcher, "FIXER_GUARD_TRUST_ROOT", tmp_path)
     return g
 
 
@@ -498,7 +501,8 @@ def test_two_plans_for_one_build_is_refused(
     dispatcher, queue, ready, failures, launches, approvals
 ):
     write_plan(ready, "**Repos:** TadMSTR/task-queue-mcp", programme="other-programme")
-    refused(launch(dispatcher, queue), failures, launches, approvals, "more than one plan")
+    refused(launch(dispatcher, queue), failures, launches, approvals, "2 plans for build")
+    assert "other-programme" not in failures[0], "programme dir names are agent-written"
 
 
 def test_archived_plan_is_not_a_second_match(
@@ -791,14 +795,231 @@ def test_find_plan_with_no_build_plans_root(dispatcher, home):
     assert dispatcher.find_plan(BUILD) is None
 
 
-def test_find_plan_skips_files_and_links_at_the_top(dispatcher, home, tmp_path):
+def test_find_plan_skips_files_at_the_top(dispatcher, home):
     root = home / ".claude" / "comms" / "artifacts" / "build-plans"
     (root / "loose-file.md").write_text("x")
+    assert dispatcher.find_plan(BUILD) is None
+
+
+def test_plan_only_under_a_linked_programme_is_refused_not_unverified(dispatcher, home, tmp_path):
+    # Before the fix this read as "no plan", and the fixer launched `Repos: unverified`.
+    root = home / ".claude" / "comms" / "artifacts" / "build-plans"
     elsewhere = tmp_path / "elsewhere-programme"
     (elsewhere / BUILD).mkdir(parents=True)
     (elsewhere / BUILD / "plan.md").write_text("**Repos:** a/b\n")
     (root / "linked-programme").symlink_to(elsewhere, target_is_directory=True)
-    assert dispatcher.find_plan(BUILD) is None
+    with pytest.raises(dispatcher.FixerRefused, match="not searched"):
+        dispatcher.find_plan(BUILD)
+
+
+@pytest.mark.parametrize("skipped", ["_drafts", ".hidden", "archive"])
+def test_plan_only_under_a_skipped_programme_is_refused(dispatcher, home, skipped):
+    write_plan(home, "**Repos:** a/b", programme=skipped)
+    with pytest.raises(dispatcher.FixerRefused, match="not searched"):
+        dispatcher.find_plan(BUILD)
+
+
+def test_unreadable_build_plans_is_refused_not_unverified(dispatcher, home, monkeypatch):
+    def boom(path):
+        raise PermissionError(13, "denied")
+
+    monkeypatch.setattr(dispatcher.os, "scandir", boom)
+    with pytest.raises(dispatcher.FixerRefused, match="unreadable"):
+        dispatcher.find_plan(BUILD)
+
+
+def test_unreadable_plan_entry_is_refused(dispatcher, home, monkeypatch):
+    write_plan(home, "**Repos:** a/b")
+    real = dispatcher.os.lstat
+
+    def lstat(p, *a, **k):
+        if str(p).endswith("plan.md"):
+            raise PermissionError(13, "denied")
+        return real(p, *a, **k)
+
+    monkeypatch.setattr(dispatcher.os, "lstat", lstat)
+    with pytest.raises(dispatcher.FixerRefused, match="unreadable"):
+        dispatcher.find_plan(BUILD)
+
+
+def test_flooded_build_plans_is_refused(dispatcher, home, monkeypatch):
+    root = home / ".claude" / "comms" / "artifacts" / "build-plans"
+    monkeypatch.setattr(dispatcher, "FIXER_PLAN_DIRS_MAX", 5)
+    for i in range(6):
+        (root / f"p{i}").mkdir()
+    with pytest.raises(dispatcher.FixerRefused, match="more than 5 entries"):
+        dispatcher.find_plan(BUILD)
+
+
+@pytest.mark.parametrize("which", ["comms", "artifacts", "build-plans", "fixer-handoffs"])
+def test_linked_root_or_ancestor_is_refused(
+    dispatcher, queue, ready, failures, launches, approvals, tmp_path, which
+):
+    # FW-25: a link swapped in for the root (or a directory above it, under $HOME) used to
+    # be followed, and the containment check passed against the link's target.
+    base = ready / ".claude" / "comms"
+    target = {"comms": base, "artifacts": base / "artifacts"}.get(which, base / "artifacts" / which)
+    moved = tmp_path / f"moved-{which}"
+    target.rename(moved)
+    target.symlink_to(moved, target_is_directory=True)
+    refused(launch(dispatcher, queue), failures, launches, approvals, "not a directory")
+
+
+def test_two_repos_lines_in_the_plan_header_are_refused(
+    dispatcher, queue, ready, failures, launches, approvals
+):
+    write_plan(
+        ready, "**Repos:** TadMSTR/task-queue-mcp, host-forge/scripts\n**Repos:** x/hidden-repo"
+    )
+    refused(launch(dispatcher, queue), failures, launches, approvals, "2 **Repos:** lines")
+
+
+@pytest.mark.parametrize("bad", ["<b>x</b>/y", "a/b\nc", "x" * 101 + "/y", "a/b/c", "'a'/b"])
+def test_malformed_repos_entry_reason_does_not_echo_the_value(
+    dispatcher, queue, ready, failures, launches, approvals, bad
+):
+    write_plan(ready, f"**Repos:** TadMSTR/task-queue-mcp, {bad}".replace("\n", " "))
+    refused(launch(dispatcher, queue), failures, launches, approvals, "at position 2")
+    assert bad.replace("\n", " ") not in failures[0]
+
+
+@pytest.mark.parametrize(
+    ("override", "field"),
+    [
+        ({"task_type": "<img src=x>"}, "<img"),
+        ({"source_agent": "<b>x", "target_agent": "<b>x"}, "<b>"),
+    ],
+)
+def test_task_field_reasons_do_not_echo_values(
+    dispatcher, queue, ready, failures, launches, approvals, override, field
+):
+    refused(launch(dispatcher, queue, fixer_task(**override)), failures, launches, approvals, "")
+    assert field not in failures[0]
+
+
+@pytest.mark.parametrize("payload", [None, [], "x", 3])
+def test_non_mapping_payload_is_refused_not_raised(
+    dispatcher, queue, ready, failures, launches, approvals, payload
+):
+    refused(
+        launch(dispatcher, queue, fixer_task(payload=payload)),
+        failures,
+        launches,
+        approvals,
+        "payload is not a mapping",
+    )
+
+
+def test_requires_approval_is_refused(dispatcher, queue, ready, failures, launches, approvals):
+    refused(
+        launch(dispatcher, queue, fixer_task(requires_approval=True)),
+        failures,
+        launches,
+        approvals,
+        "requires_approval",
+    )
+
+
+@pytest.mark.parametrize("status", [["in-progress"], {"a": 1}, 3, None])
+def test_unhashable_or_odd_build_task_status_is_refused_not_raised(
+    dispatcher, queue, ready, failures, launches, approvals, build_task, status
+):
+    path, task = build_task
+    task["status"] = status
+    path.write_text(yaml.safe_dump(task, sort_keys=False))
+    refused(launch(dispatcher, queue), failures, launches, approvals, "is not live")
+
+
+@pytest.mark.parametrize("scalar", ["2026-02-30", "2026-13-01", "2026-02-30 25:61:00"])
+def test_impossible_timestamp_in_front_matter_is_refused_not_raised(
+    dispatcher, queue, ready, failures, launches, approvals, scalar
+):
+    p = write_handoff(ready)
+    p.write_text(p.read_text().replace("artifact-type: handoff", f"created: {scalar}", 1))
+    refused(launch(dispatcher, queue), failures, launches, approvals, "does not parse")
+
+
+def test_any_other_check_exception_still_routes_to_failure(
+    dispatcher, queue, ready, failures, launches, approvals, monkeypatch
+):
+    def boom(*a, **k):
+        raise KeyError("x")
+
+    monkeypatch.setattr(dispatcher, "plan_repos", boom)
+    refused(launch(dispatcher, queue), failures, launches, approvals, "malformed input (KeyError)")
+
+
+@pytest.mark.parametrize("bad", ["group", "world", "owner"])
+def test_guard_ancestor_chain_is_checked(
+    dispatcher, queue, ready, failures, launches, approvals, guard, monkeypatch, bad
+):
+    # FW-35: the leaf and its directory were checked; an ancestor above them was not.
+    mid = guard.parent / "mid"
+    mid.mkdir()
+    g2 = mid / "inner"
+    g2.mkdir()
+    leaf = g2 / guard.name
+    leaf.write_text("#!/usr/bin/env python3\n")
+    leaf.chmod(0o755)
+    g2.chmod(0o755)
+    mid.chmod({"group": 0o775, "world": 0o757, "owner": 0o755}[bad])
+    monkeypatch.setattr(dispatcher, "FIXER_GUARD_PATH", leaf)
+    if bad == "owner":
+        real = dispatcher.os.lstat
+
+        def lstat(p, *a, **k):
+            st = real(p, *a, **k)
+            if Path(p) == mid:
+                return os.stat_result(
+                    (
+                        st.st_mode,
+                        st.st_ino,
+                        st.st_dev,
+                        st.st_nlink,
+                        st.st_uid + 1,
+                        st.st_gid,
+                        st.st_size,
+                        st.st_atime,
+                        st.st_mtime,
+                        st.st_ctime,
+                    )
+                )
+            return st
+
+        monkeypatch.setattr(dispatcher.os, "lstat", lstat)
+    refused(launch(dispatcher, queue), failures, launches, approvals, "PreCompact guard")
+    assert str(mid) in failures[0]
+
+
+def test_tick_never_sends_a_pre_audit_to_operator_approval(
+    dispatcher, queue, ready, write_task, monkeypatch, launches
+):
+    # IV-81: a pre_audit with requires_approval: true (or high risk) went to
+    # request_approval ahead of launch_kind, and an operator approval left it `approved`
+    # with no check run. It must reach launch_fixer, which refuses it.
+    asked: list = []
+    monkeypatch.setattr(dispatcher, "request_approval", lambda *a, **k: asked.append(a))
+    routed: list = []
+    monkeypatch.setattr(
+        dispatcher, "handle_routing_failure", lambda p, t, reason: routed.append(reason)
+    )
+    write_task(**fixer_task(requires_approval=True, risk_level="critical"))
+    dispatcher.process_submitted(dispatcher.load_manifests())
+    assert asked == [], "a pre_audit must never be sent for operator approval"
+    assert launches == []
+    assert routed and "requires_approval" in routed[0]
+
+
+def test_log_dir_is_created_0700(dispatcher, queue, ready, failures, launches, approvals):
+    logs = ready / ".pm2" / "logs"
+    logs.rmdir()
+    (ready / ".pm2").rmdir()
+    old = os.umask(0o002)
+    try:
+        assert launch(dispatcher, queue) is True, failures
+    finally:
+        os.umask(old)
+    assert stat.S_IMODE(logs.stat().st_mode) == 0o700
 
 
 def test_project_dir_missing_is_refused(

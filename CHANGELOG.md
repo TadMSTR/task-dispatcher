@@ -5,6 +5,32 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed (audit-fixer-2026-11 p2 pre-audit, round 1)
+- **The fixer launcher refuses what it used to read as "no plan".** An unreadable
+  `build-plans/` or plan entry, a plan found only under an `archive`, `.*`, `_*` or linked
+  directory, more than 2048 entries, two plans, or two `**Repos:**` lines in the header now
+  go to `routing-failed`. Before, the first four launched `Repos: unverified` with the
+  repo check skipped. A missing `build-plans/`, or a plan with no `**Repos:**` line, still
+  launches unverified: those are the only two.
+- **The roots are pinned.** Every directory from `$HOME` down to `fixer-handoffs/` and
+  `build-plans/` must be a real directory owned by this user or root; a link swapped in for
+  one is refused instead of followed. The PreCompact guard check walks every directory from
+  `/` down to the guard, not only its own directory.
+- **A `pre_audit` task never goes to operator approval.** One with `requires_approval:
+  true`, a `needs_approval` source or a high risk used to take the approval branch ahead of
+  `launch_kind`, and an operator approval left it `approved` with none of the checks run.
+  It now reaches `launch_fixer`, which refuses `requires_approval: true` itself.
+- **Malformed input routes to failure instead of aborting the tick.** A non-mapping
+  `payload`, an unhashable build-task `status`, an impossible timestamp in the front matter
+  (`2026-02-30`), or any other exception from a check now ends in `routing-failed` with the
+  exception's type name.
+- **Refusal reasons name the field, not the value,** for `task_type`, `target_agent`, a
+  malformed `**Repos:**` entry (its position) and duplicate plans (a count). These reasons
+  reach Matrix on dead-letter.
+- The fixer session-log directory is created `0700`.
+
 ## [1.6.0] - 2026-11-02
 
 Build plan `audit-fixer-2026-11-p2-fixer-autolaunch`, Phase 2. #1365 (id 1448).

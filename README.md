@@ -85,15 +85,15 @@ goes to `routing-failed` with the reason:
 | Check | Why |
 |---|---|
 | `task_type: pre_audit`, `source_agent == target_agent`, the agent is in `FIXER_AGENTS` (developer, sysadmin, fleet) and in the roster without `run_as_user` | an agent queues only its own fixer, and only a build agent has one |
-| `build_name` matches `[A-Za-z0-9_-]{1,128}`, `audit_round` is an int 1–20, `handoff_seq` is an int 0–2, no `originating_task_id`, task id is a UUID | the path and the prompt are built from these |
-| No symlink at any component under the root; resolves under it; a regular file of at most 512 KiB; the inode opened (`O_NOFOLLOW`, `O_NONBLOCK`) is the one checked | `~/.claude/comms` is writable by every agent |
+| `build_name` matches `[A-Za-z0-9_-]{1,128}`, `audit_round` is an int 1–20, `handoff_seq` is an int 0–2, no `originating_task_id`, `requires_approval` is not true, task id is a UUID | the path and the prompt are built from these; an operator approval would skip every check here |
+| Every directory from `$HOME` down to the root is a real directory owned by this user or root; no symlink at any component under the root; resolves under it; a regular file of at most 512 KiB; the inode opened (`O_NOFOLLOW`, `O_NONBLOCK`) is the one checked | `~/.claude/comms` is writable by every agent |
 | Front matter (closed within 16 KiB, no YAML merge keys): `build_name`, `round`, `handoff_seq` and `agent` equal the task's | a file at the right path proves nothing about who wrote it |
 | Front matter `build_task` is a live `build` task of the same `build_name` for the same agent | binds the handoff to a real build of that agent |
-| Every repo in the plan's `**Repos:**` header is in the handoff's `repos:` (by `name`: `repo` or `owner-repo`, case-insensitive). The plan is found by `build_name` under `build-plans/`, never by a path the handoff names | a repo the build session left out would be invisible to the gate (audit R2-04) |
-| `/usr/local/sbin/forge/fixer-precompact-guard.py` and its directory are root-owned and not group- or world-writable | a fixer session must not compact, and without the guard it compacts silently |
+| Every repo in the plan's `**Repos:**` header is in the handoff's `repos:` (by `name`: `repo` or `owner-repo`, case-insensitive). The plan is found by `build_name` under `build-plans/` (top-level children, at most 2048 entries, never `archive`, `.*`, `_*` or links), never by a path the handoff names. Two plans, two `**Repos:**` lines, a plan only under a directory that is not searched, or an unreadable `build-plans/` is a refusal | a repo the build session left out would be invisible to the gate (audit R2-04) |
+| `/usr/local/sbin/forge/fixer-precompact-guard.py` and every directory from `/` down to it are root-owned and not group- or world-writable | a fixer session must not compact, and without the guard it compacts silently |
 | The agent's `.env` gives `SCOPED_MCP_BEARER_TOKEN`, and Anthropic credentials are usable | as for every launch |
 
-A plan with no `**Repos:**` line (every plan before this one) does not block. The prompt
+A build with no plan anywhere under `build-plans/`, or a plan with no `**Repos:**` line (every plan before this one), does not block. Those are the only two. The prompt
 says `Repos: unverified`, and the fixer carries that into the audit request's Known Risks.
 
 The prompt is fixed text plus validated values. It contains no `summary` and no
