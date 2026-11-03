@@ -726,25 +726,60 @@ def test_read_contained_link_hidden_from_lstat_is_caught_by_nofollow(
     outside = tmp_path / "outside.md"
     outside.write_text("x")
     (root / "f.md").symlink_to(outside)
-    monkeypatch.setattr(dispatcher.os, "lstat", os.stat)
+    monkeypatch.setattr(dispatcher, "_lstat_at", lambda dir_fd, name: os.stat(name, dir_fd=dir_fd))
     with pytest.raises(dispatcher.FixerRefused, match="could not be opened"):
         dispatcher.read_contained(root, ["f.md"], 10)
 
 
-def test_read_contained_resolving_outside_the_root_is_refused(dispatcher, tmp_path, monkeypatch):
+def test_read_contained_root_reached_through_a_link_is_refused(dispatcher, tmp_path):
+    """Containment is by construction now (an fd chain from /), not by resolve(): a root
+    that is itself a link, or sits under one, is refused before anything is read."""
+    real = tmp_path / "real"
+    real.mkdir()
+    (real / "f.md").write_text("x")
+    (tmp_path / "link").symlink_to(real)
+    with pytest.raises(dispatcher.FixerRefused, match="a component is a link"):
+        dispatcher.read_contained(tmp_path / "link", ["f.md"], 10)
+    with pytest.raises(dispatcher.FixerRefused, match="a component is a link"):
+        dispatcher.read_contained(tmp_path / "link" / ".", ["f.md"], 10)
+
+
+def test_read_contained_a_root_swapped_after_pinning_is_not_followed(
+    dispatcher, tmp_path, monkeypatch
+):
+    """FW-25: the swap the path-based walk let through. The root is replaced by a link to
+    another directory after it was checked; the read must stay on the checked one."""
     root = tmp_path / "root"
     root.mkdir()
-    (root / "f.md").write_text("x")
-    real_resolve = Path.resolve
+    (root / "d").mkdir()
+    (root / "d" / "f.md").write_bytes(b"good")
+    evil = tmp_path / "evil"
+    (evil / "d").mkdir(parents=True)
+    (evil / "d" / "f.md").write_bytes(b"evil")
+    real_pin = dispatcher._pin_root
 
-    def resolve(self, strict=False):
-        if self.name == "f.md":
-            return tmp_path / "elsewhere" / "f.md"
-        return real_resolve(self, strict=strict)
+    def pin_then_swap(r, what):
+        fd = real_pin(r, what)
+        root.rename(tmp_path / "moved")
+        root.symlink_to(evil)
+        return fd
 
-    monkeypatch.setattr(Path, "resolve", resolve)
-    with pytest.raises(dispatcher.FixerRefused, match="is outside"):
-        dispatcher.read_contained(root, ["f.md"], 10)
+    monkeypatch.setattr(dispatcher, "_pin_root", pin_then_swap)
+    assert dispatcher.read_contained(root, ["d", "f.md"], 10) == b"good"
+
+
+def test_close_errors_do_not_replace_the_result(dispatcher, tmp_path, monkeypatch):
+    """OV-59: an os.close failure in cleanup must not replace the read or the refusal."""
+    (tmp_path / "f").write_bytes(b"ok")
+
+    _real_close = os.close
+
+    def bad_close(fd):
+        _real_close(fd)  # the fd really is closed; only the report is an error
+        raise OSError(5, "EIO")
+
+    monkeypatch.setattr(dispatcher.os, "close", bad_close)
+    assert dispatcher.read_contained(tmp_path, ["f"], 10) == b"ok"
 
 
 def test_read_contained_swap_between_walk_and_open(dispatcher, tmp_path, monkeypatch):
@@ -834,14 +869,15 @@ def test_unreadable_build_plans_is_refused_not_unverified(dispatcher, home, monk
 
 def test_unreadable_plan_entry_is_refused(dispatcher, home, monkeypatch):
     write_plan(home, "**Repos:** a/b")
-    real = dispatcher.os.lstat
+    real = dispatcher.os.stat
 
-    def lstat(p, *a, **k):
-        if str(p).endswith("plan.md"):
+    def fd_stat(p, *a, **k):
+        # find_plan probes candidates relative to the pinned build-plans fd (FW-25).
+        if str(p).endswith("plan.md") and k.get("dir_fd") is not None:
             raise PermissionError(13, "denied")
         return real(p, *a, **k)
 
-    monkeypatch.setattr(dispatcher.os, "lstat", lstat)
+    monkeypatch.setattr(dispatcher.os, "stat", fd_stat)
     with pytest.raises(dispatcher.FixerRefused, match="unreadable"):
         dispatcher.find_plan(BUILD)
 
@@ -1286,3 +1322,37 @@ def test_hostile_yaml_shapes_are_refused_quickly(
 def test_yaml_aliases_are_refused(dispatcher):
     with pytest.raises(dispatcher.FixerRefused, match="does not parse"):
         dispatcher.parse_front_matter(b"---\na: &x [1]\nb: *x\n---\n")
+
+
+@pytest.mark.parametrize("name", ["TASK_QUEUE_TOKEN", "GITHOST_MCP_AUTH_TOKEN"])
+def test_other_inherited_agent_credentials_are_dropped(
+    dispatcher, queue, ready, failures, launches, approvals, monkeypatch, name
+):
+    """SC-43: the dispatcher's own copy of a per-agent credential never reaches a fixer."""
+    monkeypatch.setenv(name, "the-dispatchers-own")
+    assert launch(dispatcher, queue) is True, failures
+    assert name not in launches[0]["env"]
+
+
+def test_a_poison_queue_file_does_not_abort_the_tick(dispatcher, ready, launches, write_task):
+    """OV-33: an unhashable risk_level raised out of process_submitted and stopped every
+    task after it, every tick. It now goes to failure and the next task still runs."""
+    bad_path, _ = write_task(
+        id="cccccccc-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+        task_type="build",
+        source_agent="research",
+        target_agent="developer",
+        status="submitted",
+        risk_level=["high"],
+        requires_approval=None,  # so the risk fallback reads risk_level
+        summary="poison",
+    )
+    good_path, _ = _queue_fixer(write_task)
+    dispatcher.process_submitted({})
+    assert len(launches) == 1
+    assert yaml.safe_load(good_path.read_text())["status"] == "approved"
+    bad = yaml.safe_load(bad_path.read_text())
+    assert bad["status"] == "routing-failed"
+    assert (
+        "Dispatcher error while routing (TypeError)" in bad["retry_policy"]["last_failure_reason"]
+    )

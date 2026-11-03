@@ -1845,80 +1845,132 @@ def _bounded_int(value: object, lo: int, hi: int) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and lo <= value <= hi
 
 
-def _check_root_chain(root: Path) -> None:
-    """Refuse a root reached through a link or through a directory someone else owns.
+_DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 
-    Walks every component from $HOME down to `root` with lstat: each must be a real
-    directory owned by this uid (or root). Without it, a link swapped in for
-    fixer-handoffs/ or build-plans/ (or comms/ above them) moves the whole read somewhere
-    else, and the resolve-based containment check below passes against the moved target.
+
+def _close(fd: int) -> None:
+    # Cleanup must not replace the result or the refusal it follows (OV-59).
+    with contextlib.suppress(OSError):
+        os.close(fd)
+
+
+def _lstat_at(dir_fd: int, name: str) -> os.stat_result:
+    return os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+
+
+def _pin_root(root: Path, what: str) -> int:
+    """An fd on `root`, reached one component at a time from `/`. Raises FixerRefused.
+
+    Each component is opened O_DIRECTORY|O_NOFOLLOW relative to the fd of the one above
+    it and fstat-checked: a real directory owned by this uid or root. Everything below
+    is then opened relative to the returned fd, so a link swapped in for fixer-handoffs/,
+    build-plans/ or any directory above them after the check is never followed (FW-25):
+    there is no second path-based resolution to redirect.
     """
+    root = Path(os.path.abspath(root))
+    uid = os.getuid()
+    try:
+        fd = os.open("/", _DIR_FLAGS)
+    except OSError as e:
+        raise FixerRefused(f"the {what} root could not be opened ({type(e).__name__})") from e
+    try:
+        for part in root.parts[1:]:
+            if part in (".", ".."):
+                raise FixerRefused(f"the {what} root has a {part!r} component")
+            try:
+                nfd = os.open(part, _DIR_FLAGS, dir_fd=fd)
+            except FileNotFoundError as e:
+                raise FixerRefused(f"the {what} root is missing") from e
+            except OSError as e:
+                # ELOOP / ENOTDIR: a link or another file type where a directory belongs.
+                raise FixerRefused(
+                    f"the {what} root could not be opened: a component is a link or not a "
+                    f"directory ({type(e).__name__})"
+                ) from e
+            _close(fd)
+            fd = nfd
+            st = os.fstat(fd)
+            if not stat.S_ISDIR(st.st_mode):
+                raise FixerRefused(f"the {what} root has a component that is not a directory")
+            if st.st_uid not in (uid, 0):
+                raise FixerRefused(f"the {what} root has a component not owned by this user")
+    except BaseException:
+        _close(fd)
+        raise
+    return fd
+
+
+def _check_root_chain(root: Path) -> None:
+    """Refuse a root that is not under $HOME, or is reached through a link or through a
+    directory someone else owns (_pin_root's rules)."""
     home = Path.home()
     try:
-        rel = root.relative_to(home)
+        root.relative_to(home)
     except ValueError as e:
-        raise FixerRefused(f"{root} is not under {home}") from e
-    cur = home
-    for part in ("", *rel.parts):
-        if part in (".", ".."):
-            raise FixerRefused(f"bad root component {part!r}")
-        cur = cur / part if part else cur
-        try:
-            st = os.lstat(cur)
-        except OSError as e:
-            raise FixerRefused(f"{cur} is missing: {type(e).__name__}") from e
-        if not stat.S_ISDIR(st.st_mode):
-            raise FixerRefused(f"{cur} is not a directory (a link, or another file type)")
-        if st.st_uid not in (os.getuid(), 0):
-            raise FixerRefused(f"{cur} is not owned by this user")
+        raise FixerRefused("a root is not under $HOME") from e
+    _close(_pin_root(root, "build-plans or handoff"))
 
 
 def read_contained(root: Path, parts: list[str], cap: int, what: str = "file") -> bytes:
-    """Read root/<parts...>: no symlink at any component under root, a regular file of at
-    most `cap` bytes, inside root once resolved, and the inode that was checked is the one
-    read. Raises FixerRefused.
+    """The bytes of root/parts[0]/.../parts[-1], read without following a link and capped
+    at `cap`. Raises FixerRefused.
 
-    Each part is a single path component the caller built from validated values. The
-    lstat walk refuses a link at any level (the build directory as much as the file), the
-    open is O_NOFOLLOW|O_NONBLOCK so a FIFO swapped in is not waited on, and the fstat
-    comparison catches a swap between the walk and the open. The read is capped at
-    cap + 1 from the fd, so a file grown since the lstat is refused rather than read.
+    Each part is a single path component the caller built from validated values. The root
+    is pinned by an fd chain from `/` (_pin_root), every component below it is checked and
+    opened relative to its parent's fd with O_NOFOLLOW, so containment holds by
+    construction rather than by a resolve() that a swapped link could redirect (FW-25).
+    The final open is O_NOFOLLOW|O_NONBLOCK, so a FIFO is not waited on, and the fstat
+    comparison catches a swap between the check and the open. The read is capped at
+    cap + 1 from the fd, so a file grown since the check is refused rather than read.
 
     Reasons name `what` and the component's position, never the path: a component can be
     an agent-written directory name (a build-plans programme), and the reason reaches the
     task history and, on dead-letter, a markdown Matrix alert (OE-01, OV-19).
     """
-    try:
-        real_root = root.resolve(strict=True)
-    except (OSError, RuntimeError) as e:
-        raise FixerRefused(f"the {what} root is missing ({type(e).__name__})") from e
-    cur = root
-    st = None
     for i, part in enumerate(parts):
-        at = f"the {what} path, component {i + 1} of {len(parts)},"
         if part in ("", ".", "..") or "/" in part:
-            raise FixerRefused(f"{at} is not a single path component")
-        cur = cur / part
+            raise FixerRefused(
+                f"the {what} path, component {i + 1} of {len(parts)}, is not a single path "
+                "component"
+            )
+    dfd = _pin_root(root, what)
+    try:
+        for i, part in enumerate(parts[:-1]):
+            at = f"the {what} path, component {i + 1} of {len(parts)},"
+            try:
+                st = _lstat_at(dfd, part)
+            except OSError as e:
+                raise FixerRefused(f"{at} does not exist ({type(e).__name__})") from e
+            if stat.S_ISLNK(st.st_mode):
+                raise FixerRefused(f"{at} is a symlink")
+            if not stat.S_ISDIR(st.st_mode):
+                raise FixerRefused(f"{at} is not a directory")
+            try:
+                nfd = os.open(part, _DIR_FLAGS, dir_fd=dfd)
+            except OSError as e:
+                raise FixerRefused(f"{at} could not be opened ({type(e).__name__})") from e
+            _close(dfd)
+            dfd = nfd
+        name = parts[-1]
+        at = f"the {what} path, component {len(parts)} of {len(parts)},"
         try:
-            st = os.lstat(cur)
+            st = _lstat_at(dfd, name)
         except OSError as e:
             raise FixerRefused(f"{at} does not exist ({type(e).__name__})") from e
         if stat.S_ISLNK(st.st_mode):
             raise FixerRefused(f"{at} is a symlink")
-        if i < len(parts) - 1 and not stat.S_ISDIR(st.st_mode):
-            raise FixerRefused(f"{at} is not a directory")
-    if st is None or not stat.S_ISREG(st.st_mode):
-        raise FixerRefused(f"the {what} is not a regular file")
-    if st.st_size > cap:
-        raise FixerRefused(f"the {what} is larger than {cap} bytes")
-    try:
-        cur.resolve(strict=True).relative_to(real_root)
-    except (OSError, RuntimeError, ValueError) as e:
-        raise FixerRefused(f"the {what} is outside its root") from e
-    try:
-        fd = os.open(cur, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
-    except OSError as e:
-        raise FixerRefused(f"the {what} could not be opened ({type(e).__name__})") from e
+        if not stat.S_ISREG(st.st_mode):
+            raise FixerRefused(f"the {what} is not a regular file")
+        if st.st_size > cap:
+            raise FixerRefused(f"the {what} is larger than {cap} bytes")
+        try:
+            fd = os.open(
+                name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=dfd
+            )
+        except OSError as e:
+            raise FixerRefused(f"the {what} could not be opened ({type(e).__name__})") from e
+    finally:
+        _close(dfd)
     try:
         fst = os.fstat(fd)
         if (fst.st_dev, fst.st_ino) != (st.st_dev, st.st_ino) or not stat.S_ISREG(fst.st_mode):
@@ -1935,7 +1987,7 @@ def read_contained(root: Path, parts: list[str], cap: int, what: str = "file") -
             raise FixerRefused(f"the {what} grew past {cap} bytes while being read")
         return b"".join(chunks)
     finally:
-        os.close(fd)
+        _close(fd)
 
 
 def parse_front_matter(data: bytes) -> dict:
@@ -1981,11 +2033,19 @@ def find_plan(build_name: str) -> list[str] | None:
     except OSError as e:
         # os.path.lexists() would read this as "no plan" and launch unverified (SH-15).
         raise FixerRefused(f"build-plans is unreadable ({type(e).__name__})") from e
-    _check_root_chain(root)
+    # Listed and probed through a pinned fd, not by path (FW-25). The plan itself is read
+    # by read_contained, which pins the root again and walks without following links.
+    rfd = _pin_root(root, "build-plans")
+    try:
+        return _find_plan_in(rfd, build_name)
+    finally:
+        _close(rfd)
 
+
+def _find_plan_in(rfd: int, build_name: str) -> list[str] | None:
     def present(parts: list[str]) -> bool:
         try:
-            os.lstat(root.joinpath(*parts))
+            os.stat("/".join(parts), dir_fd=rfd, follow_symlinks=False)
         except FileNotFoundError:
             return False
         except OSError as e:
@@ -1997,7 +2057,7 @@ def find_plan(build_name: str) -> list[str] | None:
     candidates = [[build_name, "plan.md"]]
     skipped: list[list[str]] = []
     try:
-        with os.scandir(root) as it:
+        with os.scandir(rfd) as it:
             for n, entry in enumerate(it):
                 if n >= FIXER_PLAN_DIRS_MAX:
                     raise FixerRefused(
@@ -2210,8 +2270,14 @@ def check_fixer_handoff(build_name: str, agent: str, rnd: int, seq: int) -> dict
     return fm
 
 
-# Inherited names a fixer's environment must take from the agent's .env or not at all.
-FIXER_SCRUBBED_ENV = ("SCOPED_MCP_BEARER_TOKEN",)
+# Inherited names a fixer's environment must take from the agent's .env or not at all:
+# the per-agent credentials the run-as launcher also guards by name (see launch_headless).
+# One the dispatcher happens to carry must not stand in for the agent's own (SC-43).
+FIXER_SCRUBBED_ENV = (
+    "SCOPED_MCP_BEARER_TOKEN",
+    "TASK_QUEUE_TOKEN",
+    "GITHOST_MCP_AUTH_TOKEN",
+)
 
 
 def open_fixer_log(log_path: Path) -> int:
@@ -2270,7 +2336,7 @@ def open_fixer_log(log_path: Path) -> int:
         os.fchmod(fd, 0o600)
         os.set_blocking(fd, True)
     except BaseException:
-        os.close(fd)
+        _close(fd)
         raise
     return fd
 
@@ -2377,7 +2443,7 @@ def launch_fixer(path: Path, task: dict, *, approval_note: str, retry: bool = Fa
         handle_routing_failure(path, task, f"Fixer session failed to start ({type(e).__name__})")
         return False
     finally:
-        os.close(log_fd)
+        _close(log_fd)
     write_run_record(
         run_id=run_id,
         task_id=task_id,
@@ -2398,286 +2464,308 @@ def launch_fixer(path: Path, task: dict, *, approval_note: str, retry: bool = Fa
 
 def process_submitted(manifests: dict) -> None:
     for path in sorted(TASK_QUEUE_DIR.glob("*.yml")):
-        if path.name.startswith("."):
-            continue
+        task = None
         try:
-            task = load_yaml(path)
-        except Exception as e:
-            log.warning(f"Failed to parse {path.name}: {e}")
-            continue
-
-        if task.get("status") != "submitted":
-            continue
-
-        if not is_eligible(task):
-            log.debug(f"{path.name}: retry not yet eligible, skipping")
-            continue
-
-        # Fail loudly on a value neither side of the vocabulary recognises, rather than
-        # falling through to a default branch (vikunja#324). A task_type nothing routes
-        # used to reach find_agent() and dead-letter with "No agent found", which reads
-        # as a missing manifest capability; an unknown workflow_mode was worse, because
-        # every branch below tests equality against "auto" and anything else silently
-        # became operator-pickup. Both now say what actually happened.
-        task_type = task.get("task_type")
-        if task_type not in VALID_TASK_TYPES | DISPATCHER_ONLY_TASK_TYPES:
-            handle_routing_failure(
-                path,
-                task,
-                f"Unknown task_type {task_type!r} — not in task-queue-mcp's vocabulary "
-                f"({sorted(VALID_TASK_TYPES)}). Queue file written outside submit_task?",
-            )
-            continue
-        submitted_mode = task.get("workflow_mode", "semi-auto")
-        if submitted_mode not in VALID_WORKFLOW_MODES:
-            handle_routing_failure(
-                path,
-                task,
-                f"Unknown workflow_mode {submitted_mode!r} — not in task-queue-mcp's "
-                f"vocabulary ({sorted(VALID_WORKFLOW_MODES)}). Refusing to guess: "
-                f"treating it as semi-auto would silently gate an auto chain, and as auto "
-                f"would silently launch an ungated session.",
-            )
-            continue
-
-        # A self-terminal type has no session and no target work list. submit_task writes
-        # it straight to `completed`, so reaching here in `submitted` means the queue file
-        # came from somewhere else. Record and close it rather than launching an agent to
-        # read a notification — which is the entire point of vikunja#507.
-        if task_type in SELF_TERMINAL_TASK_TYPES:
-            task["status"] = "completed"
-            task.setdefault("result", {})
-            task["result"]["output"] = task.get("payload", {}).get("description")
-            task["result"]["completed_by"] = f"dispatcher ({task_type})"
-            task["result"]["completed_at"] = now_iso()
-            append_history(
-                task, "completed", "dispatcher", "Notification delivered — no session required"
-            )
-            atomic_write(path, task)
-            log.info(f"{path.name}: → completed ({task_type}, no launch)")
-            bus_log(
-                "task.completed",
-                source="dispatcher",
-                summary=f"Notification delivered: {task.get('summary', path.stem)}",
-                target=task.get("target_agent", ""),
-                artifact_path=str(path),
-                metadata=bus_metadata(task, from_status="submitted", to_status="completed"),
-            )
-            # The room name is the ONE value here that is not just rendered — it selects
-            # a destination. This branch returns before the routing block, so unlike the
-            # semi-auto notify below, `target_agent` has NOT been through find_agent() or
-            # a manifest lookup. Constrain it to a room we know, rather than passing a
-            # queue file's string straight into a send call.
-            notify_room = task.get("target_agent", "")
-            if notify_room not in AGENT_PROJECT_DIRS:
-                notify_room = "alerts"
-            # SECURITY[accepted]: summary interpolated into a Matrix notification title —
-            # Markdown injection possible but not HTML/JSON injection. Same disposition as
-            # the semi-auto branch below; trust model is internal agents, not adversarial.
-            # Audit: 2026-06-08/workflow-qol-2026-06 INFO-2. Recorded here rather than
-            # inherited silently, so this instance is visible to the next audit.
-            matrix_notify(
-                notify_room,
-                f"[notify] {task.get('summary', path.stem)}",
-                f"From: {task.get('source_agent', 'unknown')}\n"
-                f"No action required — this notification is already closed.",
-            )
-            continue
-
-        log.info(f"Processing submitted task: {path.name}")
-        target = task.get("target_agent", "auto")
-
-        # Resolve auto-routing
-        if target == "auto":
-            resolved = find_agent(task, manifests)
-            if resolved is None:
-                msg = f"No agent found for task_type={task.get('task_type')}"
-                log.warning(f"{path.name}: {msg}")
-                handle_routing_failure(path, task, msg)
+            if path.name.startswith("."):
                 continue
-            task["target_agent"] = resolved
-            log.info(f"{path.name}: auto-routed to {resolved}")
+            try:
+                task = load_yaml(path)
+            except Exception as e:
+                log.warning(f"Failed to parse {path.name}: {e}")
+                continue
 
-        target_agent = task["target_agent"]
+            if task.get("status") != "submitted":
+                continue
 
-        # Inherit workflow_mode from parent task if originating_task_id is set.
-        # This ensures auto-mode pipelines stay in auto across agent handoff boundaries.
-        #
-        # PROPAGATION SITE 3 of 3, and the one that is easy to forget: it covers a task
-        # submitted by an agent that never read FORGE_WORKFLOW_MODE at all — an agent
-        # started by hand, or one whose skill omits the inheritance line. Same helper as
-        # sites 1 and 2 by construction, so the two directions cannot disagree.
-        # A payload that is not a mapping (null, a list, a string) reaches launch_fixer and
-        # the other checks instead of raising out of the tick here (IV-52).
-        payload = task.get("payload")
-        originating_task_id = (
-            payload.get("originating_task_id") if isinstance(payload, dict) else None
-        )
-        if originating_task_id:
-            parent = find_task_by_id(originating_task_id)
-            if parent:
-                parent_mode = parent.get("workflow_mode")
-                if parent_mode:
-                    task["workflow_mode"] = child_workflow_mode(parent_mode)
-                    log.info(
-                        f"{path.name}: inherited workflow_mode={task['workflow_mode']} "
-                        f"from parent {originating_task_id[:8]} (parent mode={parent_mode})"
+            if not is_eligible(task):
+                log.debug(f"{path.name}: retry not yet eligible, skipping")
+                continue
+
+            # Fail loudly on a value neither side of the vocabulary recognises, rather than
+            # falling through to a default branch (vikunja#324). A task_type nothing routes
+            # used to reach find_agent() and dead-letter with "No agent found", which reads
+            # as a missing manifest capability; an unknown workflow_mode was worse, because
+            # every branch below tests equality against "auto" and anything else silently
+            # became operator-pickup. Both now say what actually happened.
+            task_type = task.get("task_type")
+            if task_type not in VALID_TASK_TYPES | DISPATCHER_ONLY_TASK_TYPES:
+                handle_routing_failure(
+                    path,
+                    task,
+                    f"Unknown task_type {task_type!r} — not in task-queue-mcp's vocabulary "
+                    f"({sorted(VALID_TASK_TYPES)}). Queue file written outside submit_task?",
+                )
+                continue
+            submitted_mode = task.get("workflow_mode", "semi-auto")
+            if submitted_mode not in VALID_WORKFLOW_MODES:
+                handle_routing_failure(
+                    path,
+                    task,
+                    f"Unknown workflow_mode {submitted_mode!r} — not in task-queue-mcp's "
+                    f"vocabulary ({sorted(VALID_WORKFLOW_MODES)}). Refusing to guess: "
+                    f"treating it as semi-auto would silently gate an auto chain, and as auto "
+                    f"would silently launch an ungated session.",
+                )
+                continue
+
+            # A self-terminal type has no session and no target work list. submit_task writes
+            # it straight to `completed`, so reaching here in `submitted` means the queue file
+            # came from somewhere else. Record and close it rather than launching an agent to
+            # read a notification — which is the entire point of vikunja#507.
+            if task_type in SELF_TERMINAL_TASK_TYPES:
+                task["status"] = "completed"
+                task.setdefault("result", {})
+                task["result"]["output"] = task.get("payload", {}).get("description")
+                task["result"]["completed_by"] = f"dispatcher ({task_type})"
+                task["result"]["completed_at"] = now_iso()
+                append_history(
+                    task, "completed", "dispatcher", "Notification delivered — no session required"
+                )
+                atomic_write(path, task)
+                log.info(f"{path.name}: → completed ({task_type}, no launch)")
+                bus_log(
+                    "task.completed",
+                    source="dispatcher",
+                    summary=f"Notification delivered: {task.get('summary', path.stem)}",
+                    target=task.get("target_agent", ""),
+                    artifact_path=str(path),
+                    metadata=bus_metadata(task, from_status="submitted", to_status="completed"),
+                )
+                # The room name is the ONE value here that is not just rendered — it selects
+                # a destination. This branch returns before the routing block, so unlike the
+                # semi-auto notify below, `target_agent` has NOT been through find_agent() or
+                # a manifest lookup. Constrain it to a room we know, rather than passing a
+                # queue file's string straight into a send call.
+                notify_room = task.get("target_agent", "")
+                if notify_room not in AGENT_PROJECT_DIRS:
+                    notify_room = "alerts"
+                # SECURITY[accepted]: summary interpolated into a Matrix notification title —
+                # Markdown injection possible but not HTML/JSON injection. Same disposition as
+                # the semi-auto branch below; trust model is internal agents, not adversarial.
+                # Audit: 2026-06-08/workflow-qol-2026-06 INFO-2. Recorded here rather than
+                # inherited silently, so this instance is visible to the next audit.
+                matrix_notify(
+                    notify_room,
+                    f"[notify] {task.get('summary', path.stem)}",
+                    f"From: {task.get('source_agent', 'unknown')}\n"
+                    f"No action required — this notification is already closed.",
+                )
+                continue
+
+            log.info(f"Processing submitted task: {path.name}")
+            target = task.get("target_agent", "auto")
+
+            # Resolve auto-routing
+            if target == "auto":
+                resolved = find_agent(task, manifests)
+                if resolved is None:
+                    msg = f"No agent found for task_type={task.get('task_type')}"
+                    log.warning(f"{path.name}: {msg}")
+                    handle_routing_failure(path, task, msg)
+                    continue
+                task["target_agent"] = resolved
+                log.info(f"{path.name}: auto-routed to {resolved}")
+
+            target_agent = task["target_agent"]
+
+            # Inherit workflow_mode from parent task if originating_task_id is set.
+            # This ensures auto-mode pipelines stay in auto across agent handoff boundaries.
+            #
+            # PROPAGATION SITE 3 of 3, and the one that is easy to forget: it covers a task
+            # submitted by an agent that never read FORGE_WORKFLOW_MODE at all — an agent
+            # started by hand, or one whose skill omits the inheritance line. Same helper as
+            # sites 1 and 2 by construction, so the two directions cannot disagree.
+            # A payload that is not a mapping (null, a list, a string) reaches launch_fixer and
+            # the other checks instead of raising out of the tick here (IV-52).
+            payload = task.get("payload")
+            originating_task_id = (
+                payload.get("originating_task_id") if isinstance(payload, dict) else None
+            )
+            if originating_task_id:
+                parent = find_task_by_id(originating_task_id)
+                if parent:
+                    parent_mode = parent.get("workflow_mode")
+                    if parent_mode:
+                        task["workflow_mode"] = child_workflow_mode(parent_mode)
+                        log.info(
+                            f"{path.name}: inherited workflow_mode={task['workflow_mode']} "
+                            f"from parent {originating_task_id[:8]} (parent mode={parent_mode})"
+                        )
+                else:
+                    log.warning(
+                        f"{path.name}: originating_task_id={originating_task_id[:8]} not found; "
+                        f"keeping workflow_mode={task.get('workflow_mode', 'semi-auto')}"
                     )
+
+            manifest = manifests.get(target_agent)
+            risk = task.get("risk_level", "low")
+
+            # Determine max auto risk from manifest
+            if manifest:
+                max_auto = manifest.get("max_auto_risk", "low")
             else:
+                max_auto = "low"
                 log.warning(
-                    f"{path.name}: originating_task_id={originating_task_id[:8]} not found; "
-                    f"keeping workflow_mode={task.get('workflow_mode', 'semi-auto')}"
+                    f"{path.name}: no manifest for agent '{target_agent}', defaulting to low"
                 )
 
-        manifest = manifests.get(target_agent)
-        risk = task.get("risk_level", "low")
+            source_agent = task.get("submitted_by") or task.get("source_agent", "")
+            interaction_perms = (manifest or {}).get("interaction_permissions", {})
+            auto_approved_agents = interaction_perms.get("auto_approved", [])
+            needs_approval_agents = interaction_perms.get("needs_approval", [])
 
-        # Determine max auto risk from manifest
-        if manifest:
-            max_auto = manifest.get("max_auto_risk", "low")
-        else:
-            max_auto = "low"
-            log.warning(f"{path.name}: no manifest for agent '{target_agent}', defaulting to low")
+            bypass = task.get("bypass_approval", False)
+            explicit_approval = task.get("requires_approval")
 
-        source_agent = task.get("submitted_by") or task.get("source_agent", "")
-        interaction_perms = (manifest or {}).get("interaction_permissions", {})
-        auto_approved_agents = interaction_perms.get("auto_approved", [])
-        needs_approval_agents = interaction_perms.get("needs_approval", [])
-
-        bypass = task.get("bypass_approval", False)
-        explicit_approval = task.get("requires_approval")
-
-        if bypass:
-            needs_approval = False
-            approval_reason = "bypass_approval=true (system override)"
-        elif explicit_approval is True:
-            needs_approval = True
-            approval_reason = "requires_approval=true (explicit)"
-        elif explicit_approval is False:
-            needs_approval = False
-            approval_reason = "requires_approval=false (explicit)"
-        elif source_agent and source_agent in auto_approved_agents:
-            needs_approval = False
-            approval_reason = f"source '{source_agent}' in target manifest auto_approved list"
-        elif source_agent and source_agent in needs_approval_agents:
-            needs_approval = True
-            approval_reason = f"source '{source_agent}' in target manifest needs_approval list"
-        else:
-            needs_approval = RISK_ORDER.get(risk, 0) > RISK_ORDER.get(max_auto, 0)
-            approval_reason = f"risk={risk} vs max_auto_risk={max_auto} (fallback)"
-
-        if task.get("task_type") == "pre_audit":
-            # A fixer never goes to the operator-approval pipeline: an approval there would
-            # leave it `approved` with none of launch_fixer's checks run, the state the
-            # launcher exists to prevent (IV-81). launch_fixer is its gate, and it refuses
-            # requires_approval itself.
-            needs_approval = False
-            approval_reason = "pre_audit: checked by launch_fixer"
-
-        log.info(f"{path.name}: approval={needs_approval} — {approval_reason}")
-
-        if needs_approval:
-            request_approval(path, task, risk, max_auto, approval_reason, target_agent)
-        else:
-            # BACKPRESSURE (Phase 4). Placed ahead of the approval write on purpose: a
-            # task denied a launch cannot stay `submitted` once `approved` is on disk,
-            # and staying `submitted` is exactly the contract — no new status is
-            # invented here, because a status is a three-repo vocabulary and adding one
-            # on a single side is the drift this build closes. The task is simply
-            # re-read from scratch on the next tick.
-            kind = launch_kind(task, target_agent)
-            if kind in LAUNCHING_KINDS:
-                if auth_outage_active():
-                    log.info(
-                        f"{path.name}: auth outage is live — holding at submitted "
-                        f"rather than burning a launch attempt (retry next tick)"
-                    )
-                    continue
-                denial = slot_denial(target_agent)
-                if denial:
-                    log.info(
-                        f"{path.name}: no launch slot — {denial}. Staying submitted, "
-                        f"retry next tick."
-                    )
-                    continue
-            # A fixer is approved inside launch_fixer, after its checks and before its
-            # Popen: a refused fixer must go straight to routing-failed, never sit
-            # `approved` where the agent's next session would pick it up as work.
-            if kind != "fixer":
-                approve_and_write(path, task, f"Auto-approved: {approval_reason}")
-            if kind == "temporal":
-                if launch_temporal_workflow(path, task):
-                    task["status"] = "in-progress"
-                    append_history(task, "in-progress", "dispatcher", "Temporal workflow submitted")
-                    atomic_write(path, task)
-                    # Hyphenated since v1.5.0 (vikunja#553), like every other task.* type.
-                    # agent-bus declares both spellings for one release.
-                    bus_log(
-                        "task.workflow-started",
-                        source="dispatcher",
-                        summary=f"Temporal workflow started: {task.get('summary', path.stem)}",
-                        target=target_agent,
-                        artifact_path=str(path),
-                        metadata=bus_metadata(
-                            task, from_status="approved", to_status="in-progress"
-                        ),
-                    )
-                    log.info(f"{path.name}: → in-progress (temporal workflow)")
-                    matrix_notify(
-                        "announcements",
-                        f"[temporal] {task.get('summary', path.stem)}",
-                        f"Workflow: "
-                        f"{task.get('payload', {}).get('workflow_type', 'BuildPipelineWorkflow')}"
-                        f" | plan: {task.get('payload', {}).get('plan_name', '?')}",
-                    )
-                continue
-            # NOTE: this branch is evaluated BEFORE the workflow_mode check below, so an
-            # audit task launches headlessly even in semi-auto. That is deliberate — an
-            # audit is a fixed, bounded, read-only procedure the operator has already
-            # implicitly approved by requesting it, and gating it behind a manual resume
-            # would stall every build at the same point. Recorded here because it reads
-            # like an oversight and has been questioned more than once.
-            elif kind == "audit":
-                if not launch_security_audit(path, task):
-                    continue
-            # Also ahead of the workflow_mode check, for the reason given at launch_kind().
-            elif kind == "fixer":
-                if not launch_fixer(path, task, approval_note=f"Auto-approved: {approval_reason}"):
-                    continue
+            if bypass:
+                needs_approval = False
+                approval_reason = "bypass_approval=true (system override)"
+            elif explicit_approval is True:
+                needs_approval = True
+                approval_reason = "requires_approval=true (explicit)"
+            elif explicit_approval is False:
+                needs_approval = False
+                approval_reason = "requires_approval=false (explicit)"
+            elif source_agent and source_agent in auto_approved_agents:
+                needs_approval = False
+                approval_reason = f"source '{source_agent}' in target manifest auto_approved list"
+            elif source_agent and source_agent in needs_approval_agents:
+                needs_approval = True
+                approval_reason = f"source '{source_agent}' in target manifest needs_approval list"
             else:
-                workflow_mode = task.get("workflow_mode", "semi-auto")
-                # The `workflow_mode == "auto"` equality test that used to be spelled
-                # here now lives in launch_kind(), with its warning, so the gate above
-                # and this branch cannot disagree about what a mode means. DO NOT
-                # reintroduce a mode test here.
-                if kind == "headless":
-                    log.info(f"{path.name}: workflow_mode=auto — launching headless")
-                    launch_agent_headless(task)
+                needs_approval = RISK_ORDER.get(risk, 0) > RISK_ORDER.get(max_auto, 0)
+                approval_reason = f"risk={risk} vs max_auto_risk={max_auto} (fallback)"
+
+            if task.get("task_type") == "pre_audit":
+                # A fixer never goes to the operator-approval pipeline: an approval there would
+                # leave it `approved` with none of launch_fixer's checks run, the state the
+                # launcher exists to prevent (IV-81). launch_fixer is its gate, and it refuses
+                # requires_approval itself.
+                needs_approval = False
+                approval_reason = "pre_audit: checked by launch_fixer"
+
+            log.info(f"{path.name}: approval={needs_approval} — {approval_reason}")
+
+            if needs_approval:
+                request_approval(path, task, risk, max_auto, approval_reason, target_agent)
+            else:
+                # BACKPRESSURE (Phase 4). Placed ahead of the approval write on purpose: a
+                # task denied a launch cannot stay `submitted` once `approved` is on disk,
+                # and staying `submitted` is exactly the contract — no new status is
+                # invented here, because a status is a three-repo vocabulary and adding one
+                # on a single side is the drift this build closes. The task is simply
+                # re-read from scratch on the next tick.
+                kind = launch_kind(task, target_agent)
+                if kind in LAUNCHING_KINDS:
+                    if auth_outage_active():
+                        log.info(
+                            f"{path.name}: auth outage is live — holding at submitted "
+                            f"rather than burning a launch attempt (retry next tick)"
+                        )
+                        continue
+                    denial = slot_denial(target_agent)
+                    if denial:
+                        log.info(
+                            f"{path.name}: no launch slot — {denial}. Staying submitted, "
+                            f"retry next tick."
+                        )
+                        continue
+                # A fixer is approved inside launch_fixer, after its checks and before its
+                # Popen: a refused fixer must go straight to routing-failed, never sit
+                # `approved` where the agent's next session would pick it up as work.
+                if kind != "fixer":
+                    approve_and_write(path, task, f"Auto-approved: {approval_reason}")
+                if kind == "temporal":
+                    if launch_temporal_workflow(path, task):
+                        task["status"] = "in-progress"
+                        append_history(
+                            task, "in-progress", "dispatcher", "Temporal workflow submitted"
+                        )
+                        atomic_write(path, task)
+                        # Hyphenated since v1.5.0 (vikunja#553), like every other task.* type.
+                        # agent-bus declares both spellings for one release.
+                        bus_log(
+                            "task.workflow-started",
+                            source="dispatcher",
+                            summary=f"Temporal workflow started: {task.get('summary', path.stem)}",
+                            target=target_agent,
+                            artifact_path=str(path),
+                            metadata=bus_metadata(
+                                task, from_status="approved", to_status="in-progress"
+                            ),
+                        )
+                        log.info(f"{path.name}: → in-progress (temporal workflow)")
+                        matrix_notify(
+                            "announcements",
+                            f"[temporal] {task.get('summary', path.stem)}",
+                            "Workflow: "
+                            f"{task.get('payload', {}).get('workflow_type', 'BuildPipelineWorkflow')}"  # noqa: E501
+                            f" | plan: {task.get('payload', {}).get('plan_name', '?')}",
+                        )
+                    continue
+                # NOTE: this branch is evaluated BEFORE the workflow_mode check below, so an
+                # audit task launches headlessly even in semi-auto. That is deliberate — an
+                # audit is a fixed, bounded, read-only procedure the operator has already
+                # implicitly approved by requesting it, and gating it behind a manual resume
+                # would stall every build at the same point. Recorded here because it reads
+                # like an oversight and has been questioned more than once.
+                elif kind == "audit":
+                    if not launch_security_audit(path, task):
+                        continue
+                # Also ahead of the workflow_mode check, for the reason given at launch_kind().
+                elif kind == "fixer":
+                    if not launch_fixer(
+                        path, task, approval_note=f"Auto-approved: {approval_reason}"
+                    ):
+                        continue
                 else:
-                    # semi-auto mode (default): queue for operator pickup, notify agent room
-                    log.info(
-                        f"{path.name}: workflow_mode={workflow_mode} — queued for operator pickup"
+                    workflow_mode = task.get("workflow_mode", "semi-auto")
+                    # The `workflow_mode == "auto"` equality test that used to be spelled
+                    # here now lives in launch_kind(), with its warning, so the gate above
+                    # and this branch cannot disagree about what a mode means. DO NOT
+                    # reintroduce a mode test here.
+                    if kind == "headless":
+                        log.info(f"{path.name}: workflow_mode=auto — launching headless")
+                        launch_agent_headless(task)
+                    else:
+                        # semi-auto mode (default): queue for operator pickup, notify agent room
+                        log.info(
+                            f"{path.name}: workflow_mode={workflow_mode} — "
+                            "queued for operator pickup"
+                        )
+                        task_id = task.get("id", path.stem)
+                        # SECURITY[accepted]: summary interpolated into Matrix notification
+                        # title — Markdown injection possible but not HTML/JSON injection.
+                        # Trust model: internal agents not adversarial. Pre-existing pattern.
+                        # Audit: 2026-06-08/workflow-qol-2026-06 INFO-1.
+                        summary = task.get("summary", path.stem)
+                        source = task.get("source_agent", "unknown")
+                        matrix_notify(
+                            target_agent,
+                            f"[task ready] {summary}",
+                            f"Task ID: {task_id}\nFrom: {source} | Risk: {risk}\n"
+                            f"Resume: Check task queue (id={task_id}) and run shared-build-review.",
+                        )
+                log.info(f"{path.name}: → approved (auto)")
+                matrix_notify(
+                    "announcements",
+                    f"[auto-approved] {task.get('summary', path.stem)}",
+                    f"Agent: {target_agent} | Risk: {risk} | "
+                    f"Mode: {task.get('workflow_mode', 'semi-auto')}",
+                )
+        except Exception as e:
+            # One poison queue file must not abort the tick for every other task, every
+            # tick (OV-33): an unhashable risk_level and the like used to raise out of
+            # here. Route it to failure with the type name only; if even that fails, log
+            # and move on.
+            log.error(f"{path.name}: error while routing ({type(e).__name__}); skipped")
+            if isinstance(task, dict):
+                try:
+                    handle_routing_failure(
+                        path, task, f"Dispatcher error while routing ({type(e).__name__})"
                     )
-                    task_id = task.get("id", path.stem)
-                    # SECURITY[accepted]: summary interpolated into Matrix notification
-                    # title — Markdown injection possible but not HTML/JSON injection.
-                    # Trust model: internal agents not adversarial. Pre-existing pattern.
-                    # Audit: 2026-06-08/workflow-qol-2026-06 INFO-1.
-                    summary = task.get("summary", path.stem)
-                    source = task.get("source_agent", "unknown")
-                    matrix_notify(
-                        target_agent,
-                        f"[task ready] {summary}",
-                        f"Task ID: {task_id}\nFrom: {source} | Risk: {risk}\n"
-                        f"Resume: Check task queue (id={task_id}) and run shared-build-review.",
-                    )
-            log.info(f"{path.name}: → approved (auto)")
-            matrix_notify(
-                "announcements",
-                f"[auto-approved] {task.get('summary', path.stem)}",
-                f"Agent: {target_agent} | Risk: {risk} | "
-                f"Mode: {task.get('workflow_mode', 'semi-auto')}",
-            )
+                except Exception as e2:
+                    log.error(f"{path.name}: routing failure not recorded ({type(e2).__name__})")
 
 
 # --- Phase 3: Archive terminal tasks past TTL ---

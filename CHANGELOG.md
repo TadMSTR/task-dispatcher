@@ -16,9 +16,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `build-plans/` at all, no plan for this build anywhere under it, or a plan with no
   `**Repos:**` line. `build-plans/` that exists but can't be `lstat`ed is a refusal, not
   the first case.
-- **The roots are pinned.** Every directory from `$HOME` down to `fixer-handoffs/` and
-  `build-plans/` must be a real directory owned by this user or root; a link swapped in for
-  one is refused instead of followed. The PreCompact guard check walks every directory from
+- **The roots are pinned.** Every directory from `/` down to `fixer-handoffs/` and
+  `build-plans/` is opened `O_DIRECTORY|O_NOFOLLOW` relative to the one above it and must be
+  a real directory owned by this user or root. The handoff and plan are opened relative to
+  that fd, and `build-plans/` is listed through it, so a link swapped in for a root or any
+  directory above it after the check is never followed: there is no second path lookup. The PreCompact guard check walks every directory from
   `/` down to the guard, not only its own directory.
 - **A `pre_audit` task never goes to operator approval.** One with `requires_approval:
   true`, a `needs_approval` source or a high risk used to take the approval branch ahead of
@@ -44,8 +46,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `approved` with nothing running.
 - **A non-mapping `payload` no longer raises on the submitted tick** before the fixer's
   own check sees it.
-- **An inherited `SCOPED_MCP_BEARER_TOKEN` is dropped** before the agent's `.env` is
-  applied, so the presence check sees the agent's own token or none.
+- **Inherited per-agent credentials are dropped** (`SCOPED_MCP_BEARER_TOKEN`,
+  `TASK_QUEUE_TOKEN`, `GITHOST_MCP_AUTH_TOKEN`) before the agent's `.env` is applied, so a
+  fixer gets the agent's own or none, and the bearer presence check sees the agent's own.
+- **One poison queue file no longer aborts the tick.** `process_submitted` catches any
+  exception per task (an unhashable `risk_level`, say), routes that task to failure with the
+  type name, and goes on to the next. A failed fd close in cleanup no longer replaces the
+  result or the refusal it follows.
 - **YAML aliases are refused** in the handoff front matter, as merge keys already were.
 
 ## [1.6.0] - 2026-11-02
