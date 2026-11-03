@@ -1733,3 +1733,47 @@ def test_a_future_alert_stamp_does_not_silence_the_alert(dispatcher, queue, aler
     monkeypatch.setattr(dispatcher.os, "link", no_link)
     assert dispatcher.main() == 0
     assert len(alerts) == 1 and "Could not be moved: 1." in alerts[0][1]
+
+
+def test_a_naive_alert_stamp_is_read_as_utc_and_still_debounces(
+    dispatcher, queue, alerts, monkeypatch
+):
+    """F-03: the age check compares aware datetimes, so a naive stamp is read as UTC
+    rather than raising and losing the debounce."""
+    from datetime import UTC, datetime
+
+    dispatcher.QUARANTINE_ALERT_STAMP.write_text(datetime.now(UTC).replace(tzinfo=None).isoformat())
+    (queue / "task-900.yml").write_text("- not a mapping\n")
+
+    def no_link(*a, **k):
+        raise PermissionError(13, "denied")
+
+    monkeypatch.setattr(dispatcher.os, "link", no_link)
+    assert dispatcher.main() == 0
+    assert alerts == []
+
+
+def test_a_failed_archive_rename_is_logged_not_quarantined(
+    dispatcher, queue, alerts, write_task, monkeypatch, caplog
+):
+    """F-01: a rename that fails is the filesystem's fault, not the file's. The task stays
+    for the next tick, with no dead letter, no status rewrite and no alert."""
+    from datetime import UTC, datetime, timedelta
+
+    expired, _ = write_task(
+        status="completed",
+        created=(datetime.now(UTC) - timedelta(days=40)).isoformat(),
+        ttl_days=30,
+    )
+
+    def no_rename(self, target):
+        raise PermissionError(13, "denied")
+
+    monkeypatch.setattr(dispatcher.Path, "rename", no_rename)
+    with caplog.at_level("INFO"):
+        assert dispatcher.main() == 0
+    assert yaml.safe_load(expired.read_text())["status"] == "completed"
+    assert not dispatcher.DEAD_LETTER_DIR.exists() or not any(dispatcher.DEAD_LETTER_DIR.iterdir())
+    assert alerts == []
+    assert "could not be archived (PermissionError)" in caplog.text
+    assert "=== task-dispatcher run complete ===" in caplog.text
