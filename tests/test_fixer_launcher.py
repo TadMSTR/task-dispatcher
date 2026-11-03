@@ -1351,8 +1351,98 @@ def test_a_poison_queue_file_does_not_abort_the_tick(dispatcher, ready, launches
     dispatcher.process_submitted({})
     assert len(launches) == 1
     assert yaml.safe_load(good_path.read_text())["status"] == "approved"
-    bad = yaml.safe_load(bad_path.read_text())
-    assert bad["status"] == "routing-failed"
-    assert (
-        "Dispatcher error while routing (TypeError)" in bad["retry_policy"]["last_failure_reason"]
+    _assert_dead_lettered(dispatcher, bad_path, "Dispatcher error while routing (TypeError)")
+
+
+def _assert_dead_lettered(dispatcher, path, reason):
+    assert not path.exists()
+    dead = yaml.safe_load((dispatcher.DEAD_LETTER_DIR / path.name).read_text())
+    assert dead["status"] == "failed"
+    assert reason in dead["failed_reason"]["reason"]
+    assert not any(h.get("status") == "approved" for h in dead["history"])
+
+
+def test_a_poison_file_never_reaches_the_unapproved_retry(
+    dispatcher, ready, launches, write_task, monkeypatch
+):
+    """OV-24: the poison file raised before its approval decision ran. Parked in
+    routing-failed, the retry pass's generic branch approved it (or, under auto, launched
+    it headless) without that decision. It is dead-lettered instead, and the retry pass
+    finds nothing to approve."""
+    approved: list[str] = []
+    monkeypatch.setattr(
+        dispatcher, "approve_and_write", lambda p, t, note: approved.append(t.get("id"))
     )
+    headless: list[str] = []
+    monkeypatch.setattr(dispatcher, "launch_agent_headless", lambda t: headless.append(t["id"]))
+    bad_path, _ = write_task(
+        id="cccccccc-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+        task_type="build",
+        source_agent="research",
+        target_agent="developer",
+        status="submitted",
+        workflow_mode="auto",
+        risk_level=["high"],
+        requires_approval=None,
+        summary="poison",
+    )
+    dispatcher.process_submitted({})
+    dispatcher.process_routing_failed({})
+    _assert_dead_lettered(dispatcher, bad_path, "Dispatcher error while routing (TypeError)")
+    assert approved == [] and headless == []
+
+
+def _poison_routing_failed():
+    return {
+        "unhashable task_type": {"task_type": ["build"]},
+        "unhashable workflow_mode": {"workflow_mode": {"auto": 1}},
+        "retry_policy a list": {"retry_policy": ["x"]},
+        "history not a list": {"task_type": ["build"], "history": "x"},
+    }
+
+
+@pytest.mark.parametrize("shape", sorted(_poison_routing_failed()))
+def test_a_poison_routing_failed_file_does_not_stop_the_retry_drain(
+    dispatcher, ready, launches, write_task, shape
+):
+    """OV-33/OV-18: process_routing_failed had no per-item guard, so a poison file parked
+    there raised every tick and stopped the drain, the dead-letter alert, archive_expired
+    and the run-complete line. Now it is dead-lettered and the next task still retries."""
+    fields = {
+        "id": "00000000-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+        "task_type": "build",
+        "source_agent": "research",
+        "target_agent": "developer",
+        "status": "routing-failed",
+        "summary": "poison",
+        "retry_policy": {"retry_count": 1, "next_retry_at": None},
+    }
+    fields.update(_poison_routing_failed()[shape])
+    bad_path, _ = write_task(**fields)
+    good_path, _ = _queue_fixer(write_task, status="routing-failed")
+    dispatcher.process_routing_failed({})
+    _assert_dead_lettered(dispatcher, bad_path, "Dispatcher error while retrying routing")
+    assert len(launches) == 1
+    assert yaml.safe_load(good_path.read_text())["status"] == "approved"
+
+
+def test_a_poison_routing_failed_file_does_not_stop_the_tick(dispatcher, queue, write_task, caplog):
+    """OV-18: the rest of main() still runs: archive_expired archives an expired task
+    queued after the poison file, and the run-complete liveness line is logged."""
+    from datetime import UTC, datetime, timedelta
+
+    bad, _ = write_task(
+        task_type=["build"],
+        status="routing-failed",
+        retry_policy={"retry_count": 1, "next_retry_at": None},
+    )
+    expired, _ = write_task(
+        status="completed",
+        created=(datetime.now(UTC) - timedelta(days=40)).isoformat(),
+        ttl_days=30,
+    )
+    with caplog.at_level("INFO"):
+        assert dispatcher.main() == 0
+    assert not bad.exists() and not expired.exists()
+    assert (dispatcher.ARCHIVE_DIR / expired.name).exists()
+    assert "=== task-dispatcher run complete ===" in caplog.text

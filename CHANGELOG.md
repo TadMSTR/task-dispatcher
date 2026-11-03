@@ -49,9 +49,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Inherited per-agent credentials are dropped** (`SCOPED_MCP_BEARER_TOKEN`,
   `TASK_QUEUE_TOKEN`, `GITHOST_MCP_AUTH_TOKEN`) before the agent's `.env` is applied, so a
   fixer gets the agent's own or none, and the bearer presence check sees the agent's own.
-- **One poison queue file no longer aborts the tick.** `process_submitted` catches any
-  exception per task (an unhashable `risk_level`, say), routes that task to failure with the
-  type name, and goes on to the next. A failed fd close in cleanup no longer replaces the
+- **One poison queue file no longer aborts the tick.** `process_submitted` and
+  `process_routing_failed` each catch any exception per task (an unhashable `risk_level` or
+  `task_type`, say), dead-letter that task with the type name only, and go on to the next.
+  It is dead-lettered, not parked for a retry: it may have raised before its approval
+  decision ran, and the retry pass approves without one. A failed fd close in cleanup no longer replaces the
   result or the refusal it follows.
 - **YAML aliases are refused** in the handoff front matter, as merge keys already were.
 

@@ -415,7 +415,10 @@ def handle_routing_failure(path: Path, task: dict, reason: str) -> None:
     Between retries the task sits in "routing-failed" status so it does NOT
     re-enter the submitted → approval pipeline on each attempt.  A separate
     process_routing_failed() pass picks up eligible tasks and retries routing
-    directly, bypassing re-approval (the task was already approved).
+    directly, without re-approval. Not every task parked here was approved: a refused
+    `pre_audit` never is (its retry goes back through launch_fixer), and a submitted task
+    find_agent could not route was parked before the approval decision ran. A task that
+    raised while being routed is not parked here at all: dead_letter_after_error takes it.
 
     On exhaustion the task is dead-lettered and moved out of the active queue.
     Failure behavior is documented explicitly so operators understand the outcome:
@@ -1469,7 +1472,9 @@ def launch_temporal_workflow(path: Path, task: dict) -> bool:
 
 
 # --- Dead-letter queue ---
-def move_to_dead_letter(path: Path, task: dict, reason: str) -> None:
+def move_to_dead_letter(
+    path: Path, task: dict, reason: str, outcome: str = "failed after max retries"
+) -> None:
     """Move a permanently failed task to the dead-letters directory and alert."""
     DEAD_LETTER_DIR.mkdir(exist_ok=True)
     task["failed_reason"] = {
@@ -1493,7 +1498,7 @@ def move_to_dead_letter(path: Path, task: dict, reason: str) -> None:
     matrix_notify(
         "alerts",
         f"[dead-letter] {task.get('summary', path.stem)}",
-        f"Task {task.get('id', path.stem)} failed after max retries.\nReason: {reason}",
+        f"Task {task.get('id', path.stem)} {outcome}.\nReason: {reason}",
     )
     log.warning(f"{path.name}: moved to dead-letters (reason={reason})")
 
@@ -2462,6 +2467,42 @@ def launch_fixer(path: Path, task: dict, *, approval_note: str, retry: bool = Fa
     return True
 
 
+def dead_letter_after_error(path: Path, task: object, e: Exception, where: str) -> None:
+    """Dead-letter a queue file that raised while being routed, instead of parking it.
+
+    A file that raises here (an unhashable task_type or risk_level, say) is malformed, not
+    transient, and it may have raised before its approval decision ran. Parking it in
+    routing-failed would hand it to process_routing_failed, whose generic branch approves
+    without that decision, and whose vocabulary guard raised on the same value every tick
+    (OV-24, OV-33). The reason carries the exception type only. If even this fails, log and
+    move on: one file must not stop the tick.
+    """
+    log.error(f"{path.name}: error while {where} ({type(e).__name__}); dead-lettering")
+    if not isinstance(task, dict):
+        return
+    reason = f"Dispatcher error while {where} ({type(e).__name__})"
+    try:
+        if not isinstance(task.get("retry_policy"), dict):
+            task["retry_policy"] = {}
+        task["retry_policy"]["last_failure_reason"] = reason
+        if not isinstance(task.get("history"), list):
+            task["history"] = []
+        from_status = task.get("status")
+        append_history(task, "failed", "dispatcher", reason)
+        task["status"] = "failed"
+        bus_log(
+            "task.failed",
+            source="dispatcher",
+            summary=f"Task failed (dispatcher error, not retried): {reason}",
+            target=task.get("target_agent"),
+            artifact_path=str(path),
+            metadata=bus_metadata(task, from_status=from_status, to_status="failed"),
+        )
+        move_to_dead_letter(path, task, reason, outcome="failed: the dispatcher could not route it")
+    except Exception as e2:
+        log.error(f"{path.name}: dead-letter not recorded ({type(e2).__name__})")
+
+
 def process_submitted(manifests: dict) -> None:
     for path in sorted(TASK_QUEUE_DIR.glob("*.yml")):
         task = None
@@ -2756,16 +2797,8 @@ def process_submitted(manifests: dict) -> None:
         except Exception as e:
             # One poison queue file must not abort the tick for every other task, every
             # tick (OV-33): an unhashable risk_level and the like used to raise out of
-            # here. Route it to failure with the type name only; if even that fails, log
-            # and move on.
-            log.error(f"{path.name}: error while routing ({type(e).__name__}); skipped")
-            if isinstance(task, dict):
-                try:
-                    handle_routing_failure(
-                        path, task, f"Dispatcher error while routing ({type(e).__name__})"
-                    )
-                except Exception as e2:
-                    log.error(f"{path.name}: routing failure not recorded ({type(e2).__name__})")
+            # here. Dead-lettered, not parked for a retry (dead_letter_after_error).
+            dead_letter_after_error(path, task, e, "routing")
 
 
 # --- Phase 3: Archive terminal tasks past TTL ---
@@ -2805,11 +2838,13 @@ def archive_expired() -> None:
 def process_routing_failed(manifests: dict) -> None:
     """Retry tasks that failed routing but haven't exhausted their retry budget.
 
-    These tasks sit in "routing-failed" status between retries (not "submitted"),
-    so they skip the approval pipeline — they were already approved, except a refused
-    `pre_audit` fixer, which is never approved before launch_fixer's checks pass and is
-    retried through launch_fixer again.  When the
-    retry window passes, this function picks them up and attempts routing directly,
+    These tasks sit in "routing-failed" status between retries (not "submitted"), so
+    they skip the approval pipeline. Most were approved before routing failed. Two kinds
+    were not: a refused `pre_audit` fixer, which is never approved before launch_fixer's
+    checks pass and is retried through launch_fixer again, and a submitted task find_agent
+    could not route, which was parked before the approval decision ran. A task that raised
+    while being routed is dead-lettered (dead_letter_after_error), not parked here. When
+    the retry window passes, this function picks them up and attempts routing directly,
     jumping to the post-approval dispatch logic.
 
     If routing succeeds the task transitions normally (in-progress, approved, etc.).
@@ -2825,138 +2860,149 @@ def process_routing_failed(manifests: dict) -> None:
             log.warning(f"Failed to parse {path.name}: {e}")
             continue
 
-        if task.get("status") != "routing-failed":
-            continue
+        # Per item, as in process_submitted (OV-33): a poison file parked here before
+        # that guard existed raised on every tick and stopped the drain, the dead-letter
+        # alert, archive_expired and the run-complete line (OV-18).
+        try:
+            retry_routing_failed(path, task, manifests)
+        except Exception as e:
+            dead_letter_after_error(path, task, e, "retrying routing")
 
-        if not is_eligible(task):
-            log.debug(f"{path.name}: routing-failed retry not yet eligible, skipping")
-            continue
 
-        policy = task.get("retry_policy", {})
-        retry_count = policy.get("retry_count", 0)
-        max_retries = policy.get("max_retries", 3)
-        log.info(
-            f"{path.name}: retrying routing-failed task "
-            f"(attempt {retry_count}/{max_retries}): "
-            f"{policy.get('last_failure_reason', '?')}"
+def retry_routing_failed(path: Path, task: dict, manifests: dict) -> None:
+    """One task of process_routing_failed. Raises are the caller's to dead-letter."""
+    if task.get("status") != "routing-failed":
+        return
+
+    if not is_eligible(task):
+        log.debug(f"{path.name}: routing-failed retry not yet eligible, skipping")
+        return
+
+    policy = task.get("retry_policy", {})
+    retry_count = policy.get("retry_count", 0)
+    max_retries = policy.get("max_retries", 3)
+    log.info(
+        f"{path.name}: retrying routing-failed task "
+        f"(attempt {retry_count}/{max_retries}): "
+        f"{policy.get('last_failure_reason', '?')}"
+    )
+
+    # The same vocabulary guards process_submitted applies. Without them the retry
+    # pass is a way around them: an unknown workflow_mode dead-lettered on the first
+    # tick would come back here five minutes later and fall through the `== "auto"`
+    # test into operator-pickup, quietly reaching the state the guard exists to
+    # refuse. A guard only on the first pass is not a guard.
+    retry_type = task.get("task_type")
+    if retry_type not in VALID_TASK_TYPES | DISPATCHER_ONLY_TASK_TYPES:
+        handle_routing_failure(
+            path,
+            task,
+            f"Unknown task_type {retry_type!r} (routing-failed retry) — not in "
+            f"task-queue-mcp's vocabulary ({sorted(VALID_TASK_TYPES)})",
         )
+        return
+    retry_mode = task.get("workflow_mode", "semi-auto")
+    if retry_mode not in VALID_WORKFLOW_MODES:
+        handle_routing_failure(
+            path,
+            task,
+            f"Unknown workflow_mode {retry_mode!r} (routing-failed retry) — not in "
+            f"task-queue-mcp's vocabulary ({sorted(VALID_WORKFLOW_MODES)})",
+        )
+        return
+    if retry_type in SELF_TERMINAL_TASK_TYPES:
+        task["status"] = "completed"
+        task.setdefault("result", {})
+        task["result"]["output"] = task.get("payload", {}).get("description")
+        task["result"]["completed_by"] = f"dispatcher ({retry_type})"
+        task["result"]["completed_at"] = now_iso()
+        append_history(
+            task,
+            "completed",
+            "dispatcher",
+            "Notification delivered — no session required (routing-failed retry)",
+        )
+        atomic_write(path, task)
+        bus_log(
+            "task.completed",
+            source="dispatcher",
+            summary=f"Notification delivered: {task.get('summary', path.stem)}",
+            target=task.get("target_agent", ""),
+            artifact_path=str(path),
+            metadata=bus_metadata(task, from_status="routing-failed", to_status="completed"),
+        )
+        log.info(f"{path.name}: → completed ({retry_type}, no launch, routing-failed retry)")
+        return
 
-        # The same vocabulary guards process_submitted applies. Without them the retry
-        # pass is a way around them: an unknown workflow_mode dead-lettered on the first
-        # tick would come back here five minutes later and fall through the `== "auto"`
-        # test into operator-pickup, quietly reaching the state the guard exists to
-        # refuse. A guard only on the first pass is not a guard.
-        retry_type = task.get("task_type")
-        if retry_type not in VALID_TASK_TYPES | DISPATCHER_ONLY_TASK_TYPES:
+    # Re-attempt routing: resolve target and dispatch exactly as process_submitted
+    # would after approval, without the approval check. That check did run for most
+    # tasks here, but not for one find_agent could not route on submission (see the
+    # docstring above); pre_audit takes its own branch below.
+    target_agent = task.get("target_agent", "")
+    if not target_agent or target_agent == "auto":
+        resolved = find_agent(task, manifests)
+        if resolved is None:
             handle_routing_failure(
                 path,
                 task,
-                f"Unknown task_type {retry_type!r} (routing-failed retry) — not in "
-                f"task-queue-mcp's vocabulary ({sorted(VALID_TASK_TYPES)})",
+                f"No agent found for task_type={task.get('task_type')} (routing-failed retry)",
             )
-            continue
-        retry_mode = task.get("workflow_mode", "semi-auto")
-        if retry_mode not in VALID_WORKFLOW_MODES:
-            handle_routing_failure(
-                path,
-                task,
-                f"Unknown workflow_mode {retry_mode!r} (routing-failed retry) — not in "
-                f"task-queue-mcp's vocabulary ({sorted(VALID_WORKFLOW_MODES)})",
-            )
-            continue
-        if retry_type in SELF_TERMINAL_TASK_TYPES:
-            task["status"] = "completed"
-            task.setdefault("result", {})
-            task["result"]["output"] = task.get("payload", {}).get("description")
-            task["result"]["completed_by"] = f"dispatcher ({retry_type})"
-            task["result"]["completed_at"] = now_iso()
+            return
+        task["target_agent"] = resolved
+        target_agent = resolved
+
+    if task.get("task_type") == "workflow":
+        if launch_temporal_workflow(path, task):
+            task["status"] = "in-progress"
             append_history(
                 task,
-                "completed",
+                "in-progress",
                 "dispatcher",
-                "Notification delivered — no session required (routing-failed retry)",
+                "Temporal workflow submitted (routing-failed retry)",
             )
             atomic_write(path, task)
             bus_log(
-                "task.completed",
+                "task.workflow-started",
                 source="dispatcher",
-                summary=f"Notification delivered: {task.get('summary', path.stem)}",
-                target=task.get("target_agent", ""),
+                summary=f"Temporal workflow started: {task.get('summary', path.stem)}",
+                target=target_agent,
                 artifact_path=str(path),
-                metadata=bus_metadata(task, from_status="routing-failed", to_status="completed"),
+                metadata=bus_metadata(task, from_status="routing-failed", to_status="in-progress"),
             )
-            log.info(f"{path.name}: → completed ({retry_type}, no launch, routing-failed retry)")
-            continue
+            log.info(f"{path.name}: → in-progress (temporal, routing-failed retry)")
+        return
 
-        # Re-attempt routing: resolve target and dispatch exactly as process_submitted
-        # would after approval — but skip the approval check since it already passed.
-        target_agent = task.get("target_agent", "")
-        if not target_agent or target_agent == "auto":
-            resolved = find_agent(task, manifests)
-            if resolved is None:
-                handle_routing_failure(
-                    path,
-                    task,
-                    f"No agent found for task_type={task.get('task_type')} (routing-failed retry)",
-                )
-                continue
-            task["target_agent"] = resolved
-            target_agent = resolved
-
-        if task.get("task_type") == "workflow":
-            if launch_temporal_workflow(path, task):
-                task["status"] = "in-progress"
-                append_history(
-                    task,
-                    "in-progress",
-                    "dispatcher",
-                    "Temporal workflow submitted (routing-failed retry)",
-                )
-                atomic_write(path, task)
-                bus_log(
-                    "task.workflow-started",
-                    source="dispatcher",
-                    summary=f"Temporal workflow started: {task.get('summary', path.stem)}",
-                    target=target_agent,
-                    artifact_path=str(path),
-                    metadata=bus_metadata(
-                        task, from_status="routing-failed", to_status="in-progress"
-                    ),
-                )
-                log.info(f"{path.name}: → in-progress (temporal, routing-failed retry)")
-            continue
-
-        if task.get("task_type") == "audit" and target_agent == "security":
-            if not launch_security_audit(path, task, retry=True):
-                continue
-            approve_and_write(path, task, "Routing retry succeeded")
-            continue
-
-        # Never falls through to the generic branch below: a fixer that failed a check
-        # must not end up queued for operator pickup as if it were ordinary work.
-        if task.get("task_type") == "pre_audit":
-            launch_fixer(path, task, approval_note="Routing retry succeeded", retry=True)
-            continue
-
-        # Generic task: launch headless or queue for operator pickup.
-        # Equality against "auto" is load-bearing here too — see the note on the matching
-        # branch in process_submitted.
-        workflow_mode = task.get("workflow_mode", "semi-auto")
-        if workflow_mode == "auto":
-            launch_agent_headless(task)
-        else:
-            task_id = task.get("id", path.stem)
-            summary = task.get("summary", path.stem)
-            source = task.get("source_agent", "unknown")
-            risk = task.get("risk_level", "low")
-            matrix_notify(
-                target_agent,
-                f"[task ready] {summary}",
-                f"Task ID: {task_id}\nFrom: {source} | Risk: {risk}\n"
-                f"Resume: Check task queue (id={task_id}) and run shared-build-review.",
-            )
+    if task.get("task_type") == "audit" and target_agent == "security":
+        if not launch_security_audit(path, task, retry=True):
+            return
         approve_and_write(path, task, "Routing retry succeeded")
-        log.info(f"{path.name}: → approved (routing-failed retry, workflow_mode={workflow_mode})")
+        return
+
+    # Never falls through to the generic branch below: a fixer that failed a check
+    # must not end up queued for operator pickup as if it were ordinary work.
+    if task.get("task_type") == "pre_audit":
+        launch_fixer(path, task, approval_note="Routing retry succeeded", retry=True)
+        return
+
+    # Generic task: launch headless or queue for operator pickup.
+    # Equality against "auto" is load-bearing here too — see the note on the matching
+    # branch in process_submitted.
+    workflow_mode = task.get("workflow_mode", "semi-auto")
+    if workflow_mode == "auto":
+        launch_agent_headless(task)
+    else:
+        task_id = task.get("id", path.stem)
+        summary = task.get("summary", path.stem)
+        source = task.get("source_agent", "unknown")
+        risk = task.get("risk_level", "low")
+        matrix_notify(
+            target_agent,
+            f"[task ready] {summary}",
+            f"Task ID: {task_id}\nFrom: {source} | Risk: {risk}\n"
+            f"Resume: Check task queue (id={task_id}) and run shared-build-review.",
+        )
+    approve_and_write(path, task, "Routing retry succeeded")
+    log.info(f"{path.name}: → approved (routing-failed retry, workflow_mode={workflow_mode})")
 
 
 # --- Main ---

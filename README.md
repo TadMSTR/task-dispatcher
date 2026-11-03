@@ -124,7 +124,7 @@ The dispatcher reports the statuses it writes to the queue YAML itself, through
 | `task.approved` | `approve_and_write`, the one place it writes `approved` |
 | `task.pending-approval` | `request_approval` (was mislabelled `task.dispatched` before v1.5.0) |
 | `task.routing-failed` | a routing attempt failed and will be retried |
-| `task.failed`, then `task.dead-lettered` | retries exhausted; the task moves to `dead-letters/` |
+| `task.failed`, then `task.dead-lettered` | retries exhausted, or the task raised while being routed (not retried); the task moves to `dead-letters/` |
 | `task.completed` | a `notify` task found in `submitted` or `routing-failed` is closed |
 | `task.workflow-started` | a Temporal workflow was started (was `task.workflow_started`, vikunja#553) |
 | `run.started` / `run.ended` | a run record was written / closed |

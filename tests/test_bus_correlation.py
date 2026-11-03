@@ -75,8 +75,11 @@ def test_the_expected_number_of_emitter_sites_is_pinned():
     path, which wrote those statuses with no event; the sweep's own task.failed was
     deleted (task-queue-mcp emits it for the API write), and task.approved moved into
     approve_and_write, so it is one site, not two.
+
+    Twelve since audit-fixer-2026-11 p2: +task.failed in dead_letter_after_error, for a
+    task that raised while being routed and is dead-lettered without a retry.
     """
-    assert len(_bus_log_calls(CLI_SOURCE.read_text())) == 11
+    assert len(_bus_log_calls(CLI_SOURCE.read_text())) == 12
 
 
 # ── bus_metadata itself ───────────────────────────────────────────────────────
