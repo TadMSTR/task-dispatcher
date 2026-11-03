@@ -7,6 +7,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.6.1] — 2026-11-03
+
 ### Fixed (audit-fixer-2026-11 p2 pre-audit, round 1)
 - **The fixer launcher refuses what it used to read as "no plan".** An unreadable
   `build-plans/` or plan entry, a plan found only under an `archive`, `.*`, `_*` or linked
