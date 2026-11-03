@@ -5,6 +5,74 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [1.6.1] — 2026-11-03
+
+### Fixed (audit-fixer-2026-11 p2 pre-audit, round 1)
+- **The fixer launcher refuses what it used to read as "no plan".** An unreadable
+  `build-plans/` or plan entry, a plan found only under an `archive`, `.*`, `_*` or linked
+  directory, more than 2048 entries, two plans, or two `**Repos:**` lines in the header now
+  go to `routing-failed`. Before, the first four launched `Repos: unverified` with the
+  repo check skipped. Three cases still launch unverified, and only these: no
+  `build-plans/` at all, no plan at `build-plans/<build>/plan.md` or
+  `build-plans/<programme>/<build>/plan.md` (deeper is not searched), or a plan with no
+  `**Repos:**` line. A linked directory on the way to either is a refusal, not followed. `build-plans/` that exists but can't be `lstat`ed is a refusal, not
+  the first case.
+- **The roots are pinned.** Every directory from `/` down to `fixer-handoffs/` and
+  `build-plans/` is opened `O_DIRECTORY|O_NOFOLLOW` relative to the one above it and must be
+  a real directory owned by this user or root that no other user can write: not
+  world-writable (sticky or not), and not group-writable unless this user is the group's
+  only member (forge's `~/.claude` is 0775 group `ted`). The handoff and plan are opened relative to
+  that fd, and `build-plans/` is listed through it, so a link swapped in for a root or any
+  directory above it after the check is never followed: there is no second path lookup. The PreCompact guard check walks every directory from
+  `/` down to the guard, not only its own directory.
+- **A `pre_audit` task never goes to operator approval.** One with `requires_approval:
+  true`, a `needs_approval` source or a high risk used to take the approval branch ahead of
+  `launch_kind`, and an operator approval left it `approved` with none of the checks run.
+  It now reaches `launch_fixer`, which refuses `requires_approval: true` itself.
+- **Malformed input routes to failure instead of aborting the tick.** A non-mapping
+  `payload`, an unhashable build-task `status`, an impossible timestamp in the front matter
+  (`2026-02-30`), or any other exception from a check now ends in `routing-failed` with the
+  exception's type name.
+- **Refusal reasons name the field, not the value,** for `task_type`, `target_agent`, a
+  malformed `**Repos:**` entry (its position) and duplicate plans (a count). A refused
+  handoff or plan read names the file and the component's position, never the path: a
+  `build-plans/` programme directory is agent-named. These reasons reach Matrix on
+  dead-letter.
+- **The session log is checked before the task is approved.** Every directory from `$HOME`
+  down to `~/.pm2/logs` must be a real directory owned by this user, and not group- or
+  world-writable unless an ancestor already shuts out every other user (forge's `~/.pm2` is
+  `0700`). A directory the launcher creates is `chmod 0700` after `mkdir`, whatever the
+  umask; an existing one is never changed. The log is opened `O_NOFOLLOW|O_NONBLOCK`, so a
+  planted link or FIFO is refused instead of followed or waited on, and it is created and
+  `fchmod`ed `0600`. A log that can't be opened is a refusal like any other check.
+- **A session that fails to start after approval goes to `routing-failed`,** not left
+  `approved` with nothing running.
+- **A non-mapping `payload` no longer raises on the submitted tick** before the fixer's
+  own check sees it.
+- **Inherited per-agent credentials are dropped** (`SCOPED_MCP_BEARER_TOKEN`,
+  `TASK_QUEUE_TOKEN`, `GITHOST_MCP_AUTH_TOKEN`) before the agent's `.env` is applied, so a
+  fixer gets the agent's own or none, and the bearer presence check sees the agent's own.
+- **One poison queue file no longer aborts the tick.** `process_submitted`,
+  `process_routing_failed` and `archive_expired` each catch any exception per task (an
+  unhashable `risk_level`, `task_type` or `status`, say), and a file that does not parse or
+  is not a mapping is caught too.
+  Each such file is quarantined in `dead-letters/` with the type name only, and the tick
+  goes on. It is not parked for a retry: it may have raised before its approval decision
+  ran, and the retry pass approves without one. At most 20 move per tick, with one
+  `#alerts` summary per tick (counts only), not one per file; a file that cannot be moved
+  stays and alerts at most every 15 minutes. `archive_expired` skips a non-mapping, and
+  archives a task whose `ttl_days` is not an integer on the 30-day default rather than
+  dead-lettering it. The summary is sent from a `finally`, so a pass that raises still
+  reports what it moved; a failed send carries its moved count into the next tick's
+  summary and does not start the debounce, and a debounce stamp dated in the future is
+  ignored. `matrix_notify` now returns whether the send was confirmed.
+- **A dead letter never overwrites an earlier one** of the same name: it is linked in as
+  `<stem>.<n>.yml` instead. A failed fd close in cleanup no longer replaces the
+  result or the refusal it follows.
+- **YAML aliases are refused** in the handoff front matter, as merge keys already were.
+
 ## [1.6.0] - 2026-11-02
 
 Build plan `audit-fixer-2026-11-p2-fixer-autolaunch`, Phase 2. #1365 (id 1448).

@@ -36,6 +36,9 @@ for _agent in ("developer", "security", "steward", "sysadmin", "writer", "resear
     (_HOME / ".claude" / "projects" / _agent).mkdir(parents=True)
 (_HOME / ".claude" / "comms" / "artifacts" / "audit-requests").mkdir(parents=True)
 os.environ["HOME"] = str(_HOME)
+# An inherited override would make the suite read the live roster instead of the fixture
+# copy below: a dispatcher-launched session has it set to ~/scripts/agent-launch.yml.
+os.environ.pop("AGENT_LAUNCH_POLICY", None)
 
 # The roster is resolved from $HOME/scripts/agent-launch.yml at import and must exist.
 # Use the repo's fixture copy, which exercises the real default resolution rather than the
@@ -119,6 +122,16 @@ def isolate(tmp_path, monkeypatch):
     monkeypatch.setattr(td, "ARCHIVE_DIR", queue / "archive")
     monkeypatch.setattr(td, "DEAD_LETTER_DIR", queue / "dead-letters")
     monkeypatch.setattr(td, "AUTH_ALERT_STAMP", queue / ".auth-alert-stamp")
+    monkeypatch.setattr(td, "QUARANTINE_ALERT_STAMP", queue / ".quarantine-alert-stamp")
+    monkeypatch.setitem(td._quarantine_tick, "moved", 0)
+    monkeypatch.setitem(td._quarantine_tick, "held", 0)
+    monkeypatch.setitem(td._quarantine_tick, "failed", 0)
+    monkeypatch.setattr(td, "_quarantine_seen", set())
+    monkeypatch.setitem(td._quarantine_unsent, "moved", 0)
+    # _pin_root refuses a chain directory others can write (FW-35), and pytest's tmp dirs
+    # sit under a world-writable /tmp. Root the checked chain in this test's own tmp dir,
+    # as the guard fixture does; the production value stays "/".
+    monkeypatch.setattr(td, "FIXER_ROOT_TRUST_ROOT", tmp_path)
     # Run records. Without this every launch test writes into the module-scope $HOME and
     # the records outlive the test — which would silently make the concurrency cap the
     # NEXT test measures depend on how many launches ran before it.
@@ -151,7 +164,7 @@ def isolate(tmp_path, monkeypatch):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setattr(td, "load_agent_env", lambda agent_type: {})
 
-    monkeypatch.setattr(td, "matrix_notify", lambda room, title, body: None)
+    monkeypatch.setattr(td, "matrix_notify", lambda room, title, body: True)
     monkeypatch.setattr(td, "bus_log", lambda *a, **k: None)
     monkeypatch.setattr(td.subprocess, "Popen", lambda *a, **k: FakeProc())
     monkeypatch.setattr(td, "pid_alive", lambda pid, start_ticks=None: False)
@@ -234,7 +247,7 @@ def notifications(monkeypatch):
     """Capture matrix_notify calls as (room, title, body)."""
     captured: list[tuple[str, str, str]] = []
     monkeypatch.setattr(
-        td, "matrix_notify", lambda room, title, body: captured.append((room, title, body))
+        td, "matrix_notify", lambda room, title, body: captured.append((room, title, body)) or True
     )
     return captured
 
