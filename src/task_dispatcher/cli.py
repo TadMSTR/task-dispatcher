@@ -418,7 +418,7 @@ def handle_routing_failure(path: Path, task: dict, reason: str) -> None:
     directly, without re-approval. Not every task parked here was approved: a refused
     `pre_audit` never is (its retry goes back through launch_fixer), and a submitted task
     find_agent could not route was parked before the approval decision ran. A task that
-    raised while being routed is not parked here at all: dead_letter_after_error takes it.
+    raised while being routed is not parked here at all: quarantine_queue_file takes it.
 
     On exhaustion the task is dead-lettered and moved out of the active queue.
     Failure behavior is documented explicitly so operators understand the outcome:
@@ -624,6 +624,16 @@ def load_agent_env(agent_type: str) -> dict:
 OAUTH_CRED_PATH = Path.home() / ".claude" / ".credentials.json"
 AUTH_ALERT_STAMP = TASK_QUEUE_DIR / ".auth-alert-stamp"
 AUTH_ALERT_DEBOUNCE_SEC = 900  # 15 min — a dead OAuth hits every queued task at once
+# Queue files the dispatcher cannot route (unparseable, not a mapping, or raising while
+# routed) are moved to dead-letters/, at most this many per tick, with ONE summary alert
+# per tick rather than one per file: the queue is agent-writable, and a per-file alert is
+# an alert flood any agent can cause (FW-26). Failures to move, which repeat every tick
+# until fixed, alert at most once per QUARANTINE_ALERT_DEBOUNCE_SEC (OV-01).
+QUARANTINE_PER_TICK_MAX = 20
+QUARANTINE_ALERT_STAMP = TASK_QUEUE_DIR / ".quarantine-alert-stamp"
+QUARANTINE_ALERT_DEBOUNCE_SEC = 900
+_quarantine_tick = {"moved": 0, "held": 0, "failed": 0}
+_quarantine_seen: set[str] = set()  # names tried this tick: both drain passes see a file
 
 
 def anthropic_creds_usable(child_env: dict) -> bool:
@@ -1472,18 +1482,44 @@ def launch_temporal_workflow(path: Path, task: dict) -> bool:
 
 
 # --- Dead-letter queue ---
+def _link_into_dead_letters(src: Path, name: str) -> Path:
+    """Hard-link src into dead-letters/ under `name`, or `<stem>.<n><suffix>` if that is
+    taken. os.link fails rather than replaces, so an earlier dead letter with the same
+    name is never overwritten (FW-09), and there is no exists-then-write window."""
+    stem, suffix = os.path.splitext(name)
+    for n in range(100):
+        dest = DEAD_LETTER_DIR / (name if n == 0 else f"{stem}.{n}{suffix}")
+        try:
+            os.link(src, dest, follow_symlinks=False)
+        except FileExistsError:
+            continue
+        return dest
+    raise FileExistsError(f"no free dead-letter name for {name}")
+
+
 def move_to_dead_letter(
-    path: Path, task: dict, reason: str, outcome: str = "failed after max retries"
+    path: Path,
+    task: dict,
+    reason: str,
+    outcome: str = "failed after max retries",
+    alert: bool = True,
 ) -> None:
-    """Move a permanently failed task to the dead-letters directory and alert."""
+    """Move a permanently failed task to the dead-letters directory and alert.
+
+    `alert=False` for the quarantine path, which sends one summary alert per tick instead.
+    """
     DEAD_LETTER_DIR.mkdir(exist_ok=True)
     task["failed_reason"] = {
         "timestamp": now_iso(),
         "reason": reason,
         "retry_count": task.get("retry_policy", {}).get("retry_count", 0),
     }
-    dest = DEAD_LETTER_DIR / path.name
-    atomic_write(dest, task)
+    tmp = DEAD_LETTER_DIR / f".{path.stem}.dead-letter.tmp"
+    atomic_write(tmp, task)
+    try:
+        dest = _link_into_dead_letters(tmp, path.name)
+    finally:
+        tmp.unlink(missing_ok=True)
     path.unlink(missing_ok=True)
     # vikunja#557: seventeen audits went here with one Matrix message each and no bus
     # record. High-priority in agent-bus, so it also pushes a notification.
@@ -1495,6 +1531,8 @@ def move_to_dead_letter(
         artifact_path=str(dest),
         metadata=bus_metadata(task) | {"reason": str(reason)[:300]},
     )
+    if not alert:
+        return
     matrix_notify(
         "alerts",
         f"[dead-letter] {task.get('summary', path.stem)}",
@@ -1797,6 +1835,10 @@ FIXER_GUARD_TRUST_ROOT = Path("/")
 # find_plan reads at most this many entries of build-plans/ (138 today) before it refuses:
 # the directory is agent-writable, and an unbounded listing is a tick an agent can stall.
 FIXER_PLAN_DIRS_MAX = 2048
+# _pin_root checks every directory below this one for write by anyone but this uid (FW-35).
+# "/" in production; a module constant so the tests, under a world-writable /tmp, can root
+# the chain in their own tmp dir.
+FIXER_ROOT_TRUST_ROOT = Path("/")
 _FIXER_BUILD_NAME_RE = re.compile(r"[A-Za-z0-9_-]{1,128}")
 _PLAN_REPO_RE = re.compile(r"[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}")
 _PLAN_REPOS_PREFIX = "**Repos:**"
@@ -1863,23 +1905,52 @@ def _lstat_at(dir_fd: int, name: str) -> os.stat_result:
     return os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
 
 
+def _writable_by_others(st: os.stat_result, uid: int) -> bool:
+    """World-writable, or group-writable by a group with a member other than `uid`.
+
+    A sticky bit doesn't help: the owner of a sticky directory can still swap entries in
+    it. Group write by a group only this uid is in (forge's ~/.claude is 0775 group ted,
+    whose only member is ted) is no write by anyone else.
+    """
+    if st.st_mode & 0o002:
+        return True
+    if not st.st_mode & 0o020:
+        return False
+    try:
+        import grp
+        import pwd
+
+        g = grp.getgrgid(st.st_gid)
+        me = pwd.getpwuid(uid).pw_name
+    except (KeyError, ImportError):
+        return True
+    if any(m != me for m in g.gr_mem):
+        return True
+    return any(u.pw_gid == st.st_gid and u.pw_uid != uid for u in pwd.getpwall())
+
+
 def _pin_root(root: Path, what: str) -> int:
     """An fd on `root`, reached one component at a time from `/`. Raises FixerRefused.
 
     Each component is opened O_DIRECTORY|O_NOFOLLOW relative to the fd of the one above
-    it and fstat-checked: a real directory owned by this uid or root. Everything below
-    is then opened relative to the returned fd, so a link swapped in for fixer-handoffs/,
-    build-plans/ or any directory above them after the check is never followed (FW-25):
-    there is no second path-based resolution to redirect.
+    it and fstat-checked: a real directory owned by this uid or root, and (below
+    FIXER_ROOT_TRUST_ROOT) not writable by another user (_writable_by_others, FW-35).
+    Everything below is then opened relative to the returned fd, so a link swapped in for
+    fixer-handoffs/, build-plans/ or any directory above them after the check is never
+    followed (FW-25): there is no second path-based resolution to redirect.
     """
     root = Path(os.path.abspath(root))
     uid = os.getuid()
+    trust = Path(os.path.abspath(FIXER_ROOT_TRUST_ROOT)).parts
     try:
         fd = os.open("/", _DIR_FLAGS)
     except OSError as e:
         raise FixerRefused(f"the {what} root could not be opened ({type(e).__name__})") from e
     try:
-        for part in root.parts[1:]:
+        for i, part in enumerate(root.parts[1:], start=2):
+            # root.parts[:i] is the directory this iteration opens; it is checked for write
+            # by others when it lies strictly below the trust root.
+            below_trust = i > len(trust) and root.parts[: len(trust)] == trust
             if part in (".", ".."):
                 raise FixerRefused(f"the {what} root has a {part!r} component")
             try:
@@ -1899,6 +1970,8 @@ def _pin_root(root: Path, what: str) -> int:
                 raise FixerRefused(f"the {what} root has a component that is not a directory")
             if st.st_uid not in (uid, 0):
                 raise FixerRefused(f"the {what} root has a component not owned by this user")
+            if below_trust and _writable_by_others(st, uid):
+                raise FixerRefused(f"the {what} root has a component another user can write")
     except BaseException:
         _close(fd)
         raise
@@ -2024,7 +2097,8 @@ def find_plan(build_name: str) -> list[str] | None:
     Looked up by build_name, never by a path the handoff names: build-plans/<build>/plan.md
     for a single-plan build, build-plans/<programme>/<build>/plan.md for a programme part.
     `archive`, `.*` and `_*` directories and links are not searched (a plan in an archive
-    belongs to a finalized build). None means no plan exists anywhere: a plan found only
+    belongs to a finalized build). None means neither location has a plan (a plan nested
+    deeper is not searched), and no linked directory is on the way to one: a plan found only
     under a directory that is not searched, two plans, an unreadable directory, or more
     than FIXER_PLAN_DIRS_MAX entries is a refusal (FixerRefused), never a quiet
     "unverified".
@@ -2049,14 +2123,35 @@ def find_plan(build_name: str) -> list[str] | None:
 
 def _find_plan_in(rfd: int, build_name: str) -> list[str] | None:
     def present(parts: list[str]) -> bool:
+        # One component at a time from the pinned fd: a multi-component stat with
+        # follow_symlinks=False still follows a link at every component but the last
+        # (FW-25). A linked directory on the way is refused, not followed and not read as
+        # "absent": a plan behind it would otherwise launch `Repos: unverified`.
+        fd = rfd
         try:
-            os.stat("/".join(parts), dir_fd=rfd, follow_symlinks=False)
+            for part in parts[:-1]:
+                st = _lstat_at(fd, part)
+                if stat.S_ISLNK(st.st_mode):
+                    raise FixerRefused(
+                        f"a linked directory in build-plans is on the way to {build_name}'s "
+                        "plan; not followed, not searched"
+                    )
+                if not stat.S_ISDIR(st.st_mode):
+                    return False
+                nfd = os.open(part, _DIR_FLAGS, dir_fd=fd)
+                if fd != rfd:
+                    _close(fd)
+                fd = nfd
+            _lstat_at(fd, parts[-1])
         except FileNotFoundError:
             return False
         except OSError as e:
             raise FixerRefused(
                 f"build-plans entry for {build_name} is unreadable ({type(e).__name__})"
             ) from e
+        finally:
+            if fd != rfd:
+                _close(fd)
         return True
 
     candidates = [[build_name, "plan.md"]]
@@ -2467,40 +2562,93 @@ def launch_fixer(path: Path, task: dict, *, approval_note: str, retry: bool = Fa
     return True
 
 
-def dead_letter_after_error(path: Path, task: object, e: Exception, where: str) -> None:
-    """Dead-letter a queue file that raised while being routed, instead of parking it.
+def quarantine_queue_file(path: Path, task: object, reason: str) -> None:
+    """Move a queue file the dispatcher cannot route out of the queue, into dead-letters/.
 
-    A file that raises here (an unhashable task_type or risk_level, say) is malformed, not
-    transient, and it may have raised before its approval decision ran. Parking it in
-    routing-failed would hand it to process_routing_failed, whose generic branch approves
-    without that decision, and whose vocabulary guard raised on the same value every tick
-    (OV-24, OV-33). The reason carries the exception type only. If even this fails, log and
-    move on: one file must not stop the tick.
+    For an unparseable file, one that is not a mapping, or one that raised while being
+    routed. Such a file is malformed, not transient, and may have raised before its
+    approval decision ran, so it is never parked in routing-failed, whose generic branch
+    approves without that decision (OV-24, OV-33). Left in the queue it would fail the
+    same way every tick, logged and never seen (OV-33, OV-01).
+
+    A mapping gets a failed_reason and history like any dead letter; anything else is
+    linked across as-is. At most QUARANTINE_PER_TICK_MAX files move per tick; the rest stay
+    for the next tick. flush_quarantine_alert() sends the one alert. `reason` must carry
+    type names only, never a value from the file. Never raises.
     """
-    log.error(f"{path.name}: error while {where} ({type(e).__name__}); dead-lettering")
-    if not isinstance(task, dict):
+    q = _quarantine_tick
+    if path.name in _quarantine_seen:
         return
-    reason = f"Dispatcher error while {where} ({type(e).__name__})"
+    _quarantine_seen.add(path.name)
+    if q["moved"] >= QUARANTINE_PER_TICK_MAX:
+        q["held"] += 1
+        log.warning(f"{path.name}: {reason}; quarantine cap reached this tick, left in place")
+        return
+    log.error(f"{path.name}: {reason}; moving to dead-letters")
     try:
-        if not isinstance(task.get("retry_policy"), dict):
-            task["retry_policy"] = {}
-        task["retry_policy"]["last_failure_reason"] = reason
-        if not isinstance(task.get("history"), list):
-            task["history"] = []
-        from_status = task.get("status")
-        append_history(task, "failed", "dispatcher", reason)
-        task["status"] = "failed"
-        bus_log(
-            "task.failed",
-            source="dispatcher",
-            summary=f"Task failed (dispatcher error, not retried): {reason}",
-            target=task.get("target_agent"),
-            artifact_path=str(path),
-            metadata=bus_metadata(task, from_status=from_status, to_status="failed"),
-        )
-        move_to_dead_letter(path, task, reason, outcome="failed: the dispatcher could not route it")
-    except Exception as e2:
-        log.error(f"{path.name}: dead-letter not recorded ({type(e2).__name__})")
+        if isinstance(task, dict):
+            try:
+                if not isinstance(task.get("retry_policy"), dict):
+                    task["retry_policy"] = {}
+                task["retry_policy"]["last_failure_reason"] = reason
+                if not isinstance(task.get("history"), list):
+                    task["history"] = []
+                from_status = task.get("status")
+                append_history(task, "failed", "dispatcher", reason)
+                task["status"] = "failed"
+                bus_log(
+                    "task.failed",
+                    source="dispatcher",
+                    summary=f"Task failed (dispatcher error, not retried): {reason}",
+                    target=task.get("target_agent"),
+                    artifact_path=str(path),
+                    metadata=bus_metadata(task, from_status=from_status, to_status="failed"),
+                )
+                move_to_dead_letter(
+                    path,
+                    task,
+                    reason,
+                    outcome="failed: the dispatcher could not route it",
+                    alert=False,
+                )
+                q["moved"] += 1
+                return
+            except Exception as e:
+                log.error(f"{path.name}: structured dead-letter failed ({type(e).__name__})")
+        DEAD_LETTER_DIR.mkdir(exist_ok=True)
+        _link_into_dead_letters(path, path.name)
+        path.unlink()
+        q["moved"] += 1
+    except Exception as e:
+        q["failed"] += 1
+        log.error(f"{path.name}: could not be moved to dead-letters ({type(e).__name__})")
+
+
+def flush_quarantine_alert() -> None:
+    """One #alerts message for the tick's quarantine, then reset the counts. Counts only:
+    file names and reasons are agent-influenced, and they are in the dispatcher log."""
+    q = dict(_quarantine_tick)
+    _quarantine_tick.update(moved=0, held=0, failed=0)
+    _quarantine_seen.clear()
+    if not any(q.values()):
+        return
+    if not q["moved"]:
+        # Only files that could not move, or were held: these repeat every tick.
+        try:
+            last = datetime.fromisoformat(QUARANTINE_ALERT_STAMP.read_text().strip())
+            if (datetime.now(UTC) - last).total_seconds() < QUARANTINE_ALERT_DEBOUNCE_SEC:
+                return
+        except (OSError, ValueError, TypeError):
+            pass
+    matrix_notify(
+        "alerts",
+        "[dead-letter] queue files the dispatcher could not route",
+        f"Moved to dead-letters/: {q['moved']}. Left in place over the per-tick cap of "
+        f"{QUARANTINE_PER_TICK_MAX}: {q['held']}. Could not be moved: {q['failed']}.\n"
+        "Names and reasons are in the task-dispatcher log.",
+    )
+    with contextlib.suppress(OSError):
+        QUARANTINE_ALERT_STAMP.write_text(now_iso())
 
 
 def process_submitted(manifests: dict) -> None:
@@ -2512,7 +2660,10 @@ def process_submitted(manifests: dict) -> None:
             try:
                 task = load_yaml(path)
             except Exception as e:
-                log.warning(f"Failed to parse {path.name}: {e}")
+                quarantine_queue_file(path, None, f"unparseable ({type(e).__name__})")
+                continue
+            if not isinstance(task, dict):
+                quarantine_queue_file(path, None, f"not a mapping ({type(task).__name__})")
                 continue
 
             if task.get("status") != "submitted":
@@ -2797,8 +2948,10 @@ def process_submitted(manifests: dict) -> None:
         except Exception as e:
             # One poison queue file must not abort the tick for every other task, every
             # tick (OV-33): an unhashable risk_level and the like used to raise out of
-            # here. Dead-lettered, not parked for a retry (dead_letter_after_error).
-            dead_letter_after_error(path, task, e, "routing")
+            # here. Dead-lettered, not parked for a retry (quarantine_queue_file).
+            quarantine_queue_file(
+                path, task, f"dispatcher error while routing ({type(e).__name__})"
+            )
 
 
 # --- Phase 3: Archive terminal tasks past TTL ---
@@ -2811,6 +2964,10 @@ def archive_expired() -> None:
         try:
             task = load_yaml(path)
         except Exception:
+            continue
+        # Not a mapping: quarantine_queue_file's, earlier in the tick. Skipped here rather
+        # than raised on, which aborted the tick before the run-complete line (OV-18).
+        if not isinstance(task, dict):
             continue
 
         if task.get("status") not in TERMINAL_STATES:
@@ -2843,7 +3000,7 @@ def process_routing_failed(manifests: dict) -> None:
     were not: a refused `pre_audit` fixer, which is never approved before launch_fixer's
     checks pass and is retried through launch_fixer again, and a submitted task find_agent
     could not route, which was parked before the approval decision ran. A task that raised
-    while being routed is dead-lettered (dead_letter_after_error), not parked here. When
+    while being routed is dead-lettered (quarantine_queue_file), not parked here. When
     the retry window passes, this function picks them up and attempts routing directly,
     jumping to the post-approval dispatch logic.
 
@@ -2857,7 +3014,10 @@ def process_routing_failed(manifests: dict) -> None:
         try:
             task = load_yaml(path)
         except Exception as e:
-            log.warning(f"Failed to parse {path.name}: {e}")
+            quarantine_queue_file(path, None, f"unparseable ({type(e).__name__})")
+            continue
+        if not isinstance(task, dict):
+            quarantine_queue_file(path, None, f"not a mapping ({type(task).__name__})")
             continue
 
         # Per item, as in process_submitted (OV-33): a poison file parked here before
@@ -2866,7 +3026,9 @@ def process_routing_failed(manifests: dict) -> None:
         try:
             retry_routing_failed(path, task, manifests)
         except Exception as e:
-            dead_letter_after_error(path, task, e, "retrying routing")
+            quarantine_queue_file(
+                path, task, f"dispatcher error while retrying routing ({type(e).__name__})"
+            )
 
 
 def retry_routing_failed(path: Path, task: dict, manifests: dict) -> None:
@@ -3033,6 +3195,7 @@ def main():
     process_submitted(manifests)
     process_routing_failed(manifests)
     archive_expired()
+    flush_quarantine_alert()
 
     # KEEP THIS AT INFO AND KEEP THE WORDING. vikunja#479 (generic cron liveness for all
     # 39 forge cron jobs) may key a Loki `absent_over_time` alert on exactly this string.

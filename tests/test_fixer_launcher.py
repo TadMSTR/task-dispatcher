@@ -1351,7 +1351,7 @@ def test_a_poison_queue_file_does_not_abort_the_tick(dispatcher, ready, launches
     dispatcher.process_submitted({})
     assert len(launches) == 1
     assert yaml.safe_load(good_path.read_text())["status"] == "approved"
-    _assert_dead_lettered(dispatcher, bad_path, "Dispatcher error while routing (TypeError)")
+    _assert_dead_lettered(dispatcher, bad_path, "dispatcher error while routing (TypeError)")
 
 
 def _assert_dead_lettered(dispatcher, path, reason):
@@ -1388,7 +1388,7 @@ def test_a_poison_file_never_reaches_the_unapproved_retry(
     )
     dispatcher.process_submitted({})
     dispatcher.process_routing_failed({})
-    _assert_dead_lettered(dispatcher, bad_path, "Dispatcher error while routing (TypeError)")
+    _assert_dead_lettered(dispatcher, bad_path, "dispatcher error while routing (TypeError)")
     assert approved == [] and headless == []
 
 
@@ -1421,7 +1421,7 @@ def test_a_poison_routing_failed_file_does_not_stop_the_retry_drain(
     bad_path, _ = write_task(**fields)
     good_path, _ = _queue_fixer(write_task, status="routing-failed")
     dispatcher.process_routing_failed({})
-    _assert_dead_lettered(dispatcher, bad_path, "Dispatcher error while retrying routing")
+    _assert_dead_lettered(dispatcher, bad_path, "dispatcher error while retrying routing")
     assert len(launches) == 1
     assert yaml.safe_load(good_path.read_text())["status"] == "approved"
 
@@ -1446,3 +1446,159 @@ def test_a_poison_routing_failed_file_does_not_stop_the_tick(dispatcher, queue, 
     assert not bad.exists() and not expired.exists()
     assert (dispatcher.ARCHIVE_DIR / expired.name).exists()
     assert "=== task-dispatcher run complete ===" in caplog.text
+
+
+# ── Pass 5: the quarantine class (OV-33, OV-01, FW-26, FW-09) ────────────────
+
+
+@pytest.fixture
+def alerts(dispatcher, monkeypatch):
+    sent: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        dispatcher, "matrix_notify", lambda room, title, body: sent.append((room, title + body))
+    )
+    return sent
+
+
+_UNROUTABLE_BODIES = {
+    "unparseable": "a: [unclosed\n",
+    "a list": "- one\n- two\n",
+    "a string": "just text\n",
+}
+
+
+@pytest.mark.parametrize("shape", sorted(_UNROUTABLE_BODIES))
+def test_an_unroutable_queue_file_is_quarantined_with_one_alert(dispatcher, queue, alerts, shape):
+    """OV-33/OV-01: a file that does not parse, or parses to something not a mapping, was
+    logged and left in the queue, failing the same way every tick and never alerted."""
+    bad = queue / "task-900.yml"
+    bad.write_text(_UNROUTABLE_BODIES[shape])
+    assert dispatcher.main() == 0
+    assert not bad.exists()
+    assert (dispatcher.DEAD_LETTER_DIR / "task-900.yml").read_text() == _UNROUTABLE_BODIES[shape]
+    assert [room for room, _ in alerts] == ["alerts"]
+    assert "Moved to dead-letters/: 1." in alerts[0][1]
+    assert dispatcher.main() == 0
+    assert len(alerts) == 1  # nothing left to report on the next tick
+
+
+def test_quarantine_is_capped_per_tick_with_one_summary_alert(
+    dispatcher, queue, alerts, write_task
+):
+    """FW-26: each poison file used to dead-letter with its own #alerts message, so an
+    agent writing N files sent N alerts. Now at most QUARANTINE_PER_TICK_MAX move per tick,
+    the rest wait, and each tick sends one summary."""
+    cap = dispatcher.QUARANTINE_PER_TICK_MAX
+    for _ in range(cap + 5):
+        write_task(risk_level=["high"], requires_approval=None)
+    assert dispatcher.main() == 0
+    assert len(list(dispatcher.DEAD_LETTER_DIR.iterdir())) == cap
+    assert len(alerts) == 1 and f"cap of {cap}: 5." in alerts[0][1]
+    assert dispatcher.main() == 0
+    assert len(list(dispatcher.DEAD_LETTER_DIR.iterdir())) == cap + 5
+    assert len(alerts) == 2
+
+
+def test_a_failed_quarantine_alerts_and_is_debounced(dispatcher, queue, alerts, monkeypatch):
+    """OV-01: if the move itself fails, the file stays and fails every tick. That used to
+    be a log line only; now it alerts, at most once per debounce window."""
+    (queue / "task-900.yml").write_text("- not a mapping\n")
+
+    def no_link(*a, **k):
+        raise PermissionError(13, "denied")
+
+    monkeypatch.setattr(dispatcher.os, "link", no_link)
+    assert dispatcher.main() == 0
+    assert len(alerts) == 1 and "Could not be moved: 1." in alerts[0][1]
+    assert dispatcher.main() == 0
+    assert len(alerts) == 1  # debounced
+    assert (queue / "task-900.yml").exists()
+
+
+def test_a_dead_letter_never_overwrites_an_earlier_one(dispatcher, queue, alerts, write_task):
+    """FW-09: dead-letters/<name> was written with atomic_write, which replaces."""
+    path, _ = write_task(risk_level=["high"], requires_approval=None)
+    dispatcher.DEAD_LETTER_DIR.mkdir()
+    earlier = dispatcher.DEAD_LETTER_DIR / path.name
+    earlier.write_text("earlier dead letter\n")
+    assert dispatcher.main() == 0
+    assert earlier.read_text() == "earlier dead letter\n"
+    second = dispatcher.DEAD_LETTER_DIR / f"{path.stem}.1{path.suffix}"
+    assert yaml.safe_load(second.read_text())["status"] == "failed"
+
+
+# ── Pass 5: FW-25, FW-35 ──────────────────────────────────────────────────────
+
+
+def test_a_linked_build_dir_with_no_plan_is_refused_not_unverified(dispatcher, home, tmp_path):
+    """FW-25: the existence probe stat'ed `<build>/plan.md` relative to the pinned fd with
+    follow_symlinks=False, which still followed a link at <build>. A link to a directory
+    with no plan read as "no plan" and launched `Repos: unverified`."""
+    root = home / ".claude" / "comms" / "artifacts" / "build-plans"
+    empty = tmp_path / "elsewhere-empty"
+    empty.mkdir()
+    (root / BUILD).symlink_to(empty, target_is_directory=True)
+    with pytest.raises(dispatcher.FixerRefused, match="linked directory"):
+        dispatcher.find_plan(BUILD)
+
+
+def test_a_linked_programme_with_no_plan_is_refused_not_followed(dispatcher, home, tmp_path):
+    root = home / ".claude" / "comms" / "artifacts" / "build-plans"
+    elsewhere = tmp_path / "elsewhere-programme"
+    elsewhere.mkdir()
+    (root / "linked-programme").symlink_to(elsewhere, target_is_directory=True)
+    with pytest.raises(dispatcher.FixerRefused, match="linked directory"):
+        dispatcher.find_plan(BUILD)
+
+
+@pytest.mark.parametrize("mode", [0o777, 0o1777, 0o757])
+def test_a_world_writable_root_component_is_refused(dispatcher, home, mode):
+    """FW-35: _pin_root accepted any root- or self-owned directory whatever its mode, a
+    sticky world-writable one included."""
+    comms = home / ".claude" / "comms"
+    comms.chmod(mode)
+    try:
+        with pytest.raises(dispatcher.FixerRefused, match="another user can write"):
+            dispatcher.find_plan(BUILD)
+    finally:
+        comms.chmod(0o755)
+
+
+def test_a_group_writable_component_with_another_member_is_refused(dispatcher, home, monkeypatch):
+    import grp
+
+    comms = home / ".claude" / "comms"
+    comms.chmod(0o775)
+    real = grp.getgrgid
+
+    class G:
+        gr_mem = ("someone-else",)
+
+    monkeypatch.setattr(
+        grp, "getgrgid", lambda gid: G() if gid == comms.stat().st_gid else real(gid)
+    )
+    with pytest.raises(dispatcher.FixerRefused, match="another user can write"):
+        dispatcher.find_plan(BUILD)
+
+
+def test_a_group_writable_component_only_this_user_is_in_is_accepted(dispatcher, home, monkeypatch):
+    """The control: forge's ~/.claude, comms and artifacts are 0775 group ted, and ted is
+    group ted's only member. That must keep launching."""
+    import grp
+    import pwd
+
+    comms = home / ".claude" / "comms"
+    comms.chmod(0o775)
+    gid = comms.stat().st_gid
+
+    class G:
+        gr_mem = ()
+
+    real_g, real_all = grp.getgrgid, pwd.getpwall
+    monkeypatch.setattr(grp, "getgrgid", lambda g: G() if g == gid else real_g(g))
+    monkeypatch.setattr(
+        pwd,
+        "getpwall",
+        lambda: [u for u in real_all() if u.pw_gid != gid or u.pw_uid == os.getuid()],
+    )
+    assert dispatcher.find_plan(BUILD) is None

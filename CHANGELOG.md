@@ -13,12 +13,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   directory, more than 2048 entries, two plans, or two `**Repos:**` lines in the header now
   go to `routing-failed`. Before, the first four launched `Repos: unverified` with the
   repo check skipped. Three cases still launch unverified, and only these: no
-  `build-plans/` at all, no plan for this build anywhere under it, or a plan with no
-  `**Repos:**` line. `build-plans/` that exists but can't be `lstat`ed is a refusal, not
+  `build-plans/` at all, no plan at `build-plans/<build>/plan.md` or
+  `build-plans/<programme>/<build>/plan.md` (deeper is not searched), or a plan with no
+  `**Repos:**` line. A linked directory on the way to either is a refusal, not followed. `build-plans/` that exists but can't be `lstat`ed is a refusal, not
   the first case.
 - **The roots are pinned.** Every directory from `/` down to `fixer-handoffs/` and
   `build-plans/` is opened `O_DIRECTORY|O_NOFOLLOW` relative to the one above it and must be
-  a real directory owned by this user or root. The handoff and plan are opened relative to
+  a real directory owned by this user or root that no other user can write: not
+  world-writable (sticky or not), and not group-writable unless this user is the group's
+  only member (forge's `~/.claude` is 0775 group `ted`). The handoff and plan are opened relative to
   that fd, and `build-plans/` is listed through it, so a link swapped in for a root or any
   directory above it after the check is never followed: there is no second path lookup. The PreCompact guard check walks every directory from
   `/` down to the guard, not only its own directory.
@@ -51,9 +54,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   fixer gets the agent's own or none, and the bearer presence check sees the agent's own.
 - **One poison queue file no longer aborts the tick.** `process_submitted` and
   `process_routing_failed` each catch any exception per task (an unhashable `risk_level` or
-  `task_type`, say), dead-letter that task with the type name only, and go on to the next.
-  It is dead-lettered, not parked for a retry: it may have raised before its approval
-  decision ran, and the retry pass approves without one. A failed fd close in cleanup no longer replaces the
+  `task_type`, say), and a file that does not parse or is not a mapping is caught too.
+  Each such file is quarantined in `dead-letters/` with the type name only, and the tick
+  goes on. It is not parked for a retry: it may have raised before its approval decision
+  ran, and the retry pass approves without one. At most 20 move per tick, with one
+  `#alerts` summary per tick (counts only), not one per file; a file that cannot be moved
+  stays and alerts at most every 15 minutes. `archive_expired` skips a non-mapping instead
+  of raising out of the tick.
+- **A dead letter never overwrites an earlier one** of the same name: it is linked in as
+  `<stem>.<n>.yml` instead. A failed fd close in cleanup no longer replaces the
   result or the refusal it follows.
 - **YAML aliases are refused** in the handoff front matter, as merge keys already were.
 

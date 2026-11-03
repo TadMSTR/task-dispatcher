@@ -122,6 +122,15 @@ def isolate(tmp_path, monkeypatch):
     monkeypatch.setattr(td, "ARCHIVE_DIR", queue / "archive")
     monkeypatch.setattr(td, "DEAD_LETTER_DIR", queue / "dead-letters")
     monkeypatch.setattr(td, "AUTH_ALERT_STAMP", queue / ".auth-alert-stamp")
+    monkeypatch.setattr(td, "QUARANTINE_ALERT_STAMP", queue / ".quarantine-alert-stamp")
+    monkeypatch.setitem(td._quarantine_tick, "moved", 0)
+    monkeypatch.setitem(td._quarantine_tick, "held", 0)
+    monkeypatch.setitem(td._quarantine_tick, "failed", 0)
+    monkeypatch.setattr(td, "_quarantine_seen", set())
+    # _pin_root refuses a chain directory others can write (FW-35), and pytest's tmp dirs
+    # sit under a world-writable /tmp. Root the checked chain in this test's own tmp dir,
+    # as the guard fixture does; the production value stays "/".
+    monkeypatch.setattr(td, "FIXER_ROOT_TRUST_ROOT", tmp_path)
     # Run records. Without this every launch test writes into the module-scope $HOME and
     # the records outlive the test — which would silently make the concurrency cap the
     # NEXT test measures depend on how many launches ran before it.
