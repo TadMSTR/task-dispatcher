@@ -52,15 +52,20 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Inherited per-agent credentials are dropped** (`SCOPED_MCP_BEARER_TOKEN`,
   `TASK_QUEUE_TOKEN`, `GITHOST_MCP_AUTH_TOKEN`) before the agent's `.env` is applied, so a
   fixer gets the agent's own or none, and the bearer presence check sees the agent's own.
-- **One poison queue file no longer aborts the tick.** `process_submitted` and
-  `process_routing_failed` each catch any exception per task (an unhashable `risk_level` or
-  `task_type`, say), and a file that does not parse or is not a mapping is caught too.
+- **One poison queue file no longer aborts the tick.** `process_submitted`,
+  `process_routing_failed` and `archive_expired` each catch any exception per task (an
+  unhashable `risk_level`, `task_type` or `status`, say), and a file that does not parse or
+  is not a mapping is caught too.
   Each such file is quarantined in `dead-letters/` with the type name only, and the tick
   goes on. It is not parked for a retry: it may have raised before its approval decision
   ran, and the retry pass approves without one. At most 20 move per tick, with one
   `#alerts` summary per tick (counts only), not one per file; a file that cannot be moved
-  stays and alerts at most every 15 minutes. `archive_expired` skips a non-mapping instead
-  of raising out of the tick.
+  stays and alerts at most every 15 minutes. `archive_expired` skips a non-mapping, and
+  archives a task whose `ttl_days` is not an integer on the 30-day default rather than
+  dead-lettering it. The summary is sent from a `finally`, so a pass that raises still
+  reports what it moved; a failed send carries its moved count into the next tick's
+  summary and does not start the debounce, and a debounce stamp dated in the future is
+  ignored. `matrix_notify` now returns whether the send was confirmed.
 - **A dead letter never overwrites an earlier one** of the same name: it is linked in as
   `<stem>.<n>.yml` instead. A failed fd close in cleanup no longer replaces the
   result or the refusal it follows.

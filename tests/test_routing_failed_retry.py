@@ -2,8 +2,10 @@
 
 This function existed entirely untested, and it is the one that re-dispatches work that has
 already failed once. Its whole reason for being separate from process_submitted is that it
-must NOT re-run the approval pipeline: these tasks were already approved, and resetting
-them to "submitted" fired a spurious tasks.approved event on every retry (TQMCP-1/MDISP-1).
+must NOT re-run the approval pipeline: a task parked here normally passed it already, and
+resetting it to "submitted" fired a spurious tasks.approved event on every retry
+(TQMCP-1/MDISP-1). A task that raised before its approval decision ran is quarantined in
+dead-letters/ instead of parked here (OV-24, OV-33).
 
 The property that matters most here is that the retry pass is not a way around the
 vocabulary guards. A task with an unknown workflow_mode that was refused on the first tick

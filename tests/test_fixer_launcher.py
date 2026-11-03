@@ -1455,7 +1455,9 @@ def test_a_poison_routing_failed_file_does_not_stop_the_tick(dispatcher, queue, 
 def alerts(dispatcher, monkeypatch):
     sent: list[tuple[str, str]] = []
     monkeypatch.setattr(
-        dispatcher, "matrix_notify", lambda room, title, body: sent.append((room, title + body))
+        dispatcher,
+        "matrix_notify",
+        lambda room, title, body: sent.append((room, title + body)) or True,
     )
     return sent
 
@@ -1602,3 +1604,132 @@ def test_a_group_writable_component_only_this_user_is_in_is_accepted(dispatcher,
         lambda: [u for u in real_all() if u.pw_gid != gid or u.pw_uid == os.getuid()],
     )
     assert dispatcher.find_plan(BUILD) is None
+
+
+# ── Audit round 1: F-01 (archive_expired), F-03 (quarantine alert delivery) ──
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [{"status": ["completed"]}, {"status": {"completed": 1}}],
+    ids=["status a list", "status a mapping"],
+)
+def test_an_unhashable_status_is_quarantined_by_the_archive_pass(
+    dispatcher, queue, alerts, write_task, caplog, fields
+):
+    """F-01 (OV-33, OV-18): archive_expired had no per-item guard. A status that is not a
+    string raised TypeError out of main() every tick, ahead of flush_quarantine_alert()
+    and the run-complete line. The drain passes skip it (status != "submitted"), so the
+    archive pass is the only one that sees it."""
+    from datetime import UTC, datetime, timedelta
+
+    bad, _ = write_task(**fields)
+    expired, _ = write_task(
+        status="completed",
+        created=(datetime.now(UTC) - timedelta(days=40)).isoformat(),
+        ttl_days=30,
+    )
+    with caplog.at_level("INFO"):
+        assert dispatcher.main() == 0
+    assert not bad.exists()
+    assert (dispatcher.ARCHIVE_DIR / expired.name).exists()
+    assert [room for room, _ in alerts] == ["alerts"]
+    assert "Moved to dead-letters/: 1." in alerts[0][1]
+    assert "=== task-dispatcher run complete ===" in caplog.text
+
+
+@pytest.mark.parametrize("ttl", ["x", "30", None, 1.5, True, [30]], ids=repr)
+def test_a_non_integer_ttl_falls_back_to_the_default_not_the_dead_letters(
+    dispatcher, queue, alerts, write_task, caplog, ttl
+):
+    """F-01: a non-integer ttl_days raised TypeError at the age comparison. It is not
+    quarantined: that would rewrite a completed task as failed and emit task.failed for
+    it. It archives on the 30-day default instead."""
+    from datetime import UTC, datetime, timedelta
+
+    old, _ = write_task(
+        status="completed",
+        created=(datetime.now(UTC) - timedelta(days=40)).isoformat(),
+        ttl_days=ttl,
+    )
+    young, _ = write_task(
+        status="completed",
+        created=(datetime.now(UTC) - timedelta(days=10)).isoformat(),
+        ttl_days=ttl,
+    )
+    with caplog.at_level("INFO"):
+        assert dispatcher.main() == 0
+    assert (dispatcher.ARCHIVE_DIR / old.name).exists()
+    assert yaml.safe_load((dispatcher.ARCHIVE_DIR / old.name).read_text())["status"] == "completed"
+    assert young.exists()
+    assert alerts == []
+    assert "=== task-dispatcher run complete ===" in caplog.text
+
+
+def test_the_quarantine_alert_is_flushed_even_when_a_later_pass_raises(
+    dispatcher, queue, alerts, monkeypatch
+):
+    """F-01: flush_quarantine_alert() ran after archive_expired, so anything raising there
+    lost the tick's dead-letter summary. It now runs in main()'s finally."""
+    (queue / "task-900.yml").write_text("- not a mapping\n")
+
+    def boom():
+        raise RuntimeError("archive pass failed")
+
+    monkeypatch.setattr(dispatcher, "archive_expired", boom)
+    with pytest.raises(RuntimeError):
+        dispatcher.main()
+    assert len(alerts) == 1 and "Moved to dead-letters/: 1." in alerts[0][1]
+
+
+def test_a_failed_quarantine_alert_is_retried_with_its_counts(dispatcher, queue, monkeypatch):
+    """F-03: the counts were reset and the debounce stamp written before and regardless of
+    the send, so a moved-files summary whose send failed was never retried, and a failed
+    held/failed alert suppressed the next one for 15 minutes."""
+    sent: list[str] = []
+    ok = iter([False, True])
+
+    def notify(room, title, body):
+        sent.append(body)
+        return next(ok)
+
+    monkeypatch.setattr(dispatcher, "matrix_notify", notify)
+    (queue / "task-900.yml").write_text("- not a mapping\n")
+    assert dispatcher.main() == 0
+    assert not dispatcher.QUARANTINE_ALERT_STAMP.exists()
+    assert dispatcher.main() == 0
+    assert len(sent) == 2 and "Moved to dead-letters/: 1." in sent[1]
+    assert dispatcher.QUARANTINE_ALERT_STAMP.exists()
+    assert dispatcher.main() == 0
+    assert len(sent) == 2  # delivered: nothing carried over
+
+
+def test_an_unsent_moved_count_does_not_shrink_the_next_ticks_cap(
+    dispatcher, queue, write_task, monkeypatch
+):
+    """F-03: the carried count is reported, not charged against QUARANTINE_PER_TICK_MAX."""
+    monkeypatch.setattr(dispatcher, "matrix_notify", lambda room, title, body: False)
+    cap = dispatcher.QUARANTINE_PER_TICK_MAX
+    for _ in range(cap * 2):
+        write_task(risk_level=["high"], requires_approval=None)
+    assert dispatcher.main() == 0
+    assert dispatcher.main() == 0
+    assert len(list(dispatcher.DEAD_LETTER_DIR.iterdir())) == cap * 2
+
+
+def test_a_future_alert_stamp_does_not_silence_the_alert(dispatcher, queue, alerts, monkeypatch):
+    """F-03: a stamp dated in the future read as "alerted just now" for as long as it
+    stayed in the future. It is treated as absent."""
+    from datetime import UTC, datetime, timedelta
+
+    dispatcher.QUARANTINE_ALERT_STAMP.write_text(
+        (datetime.now(UTC) + timedelta(days=365)).isoformat()
+    )
+    (queue / "task-900.yml").write_text("- not a mapping\n")
+
+    def no_link(*a, **k):
+        raise PermissionError(13, "denied")
+
+    monkeypatch.setattr(dispatcher.os, "link", no_link)
+    assert dispatcher.main() == 0
+    assert len(alerts) == 1 and "Could not be moved: 1." in alerts[0][1]

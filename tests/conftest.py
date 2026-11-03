@@ -127,6 +127,7 @@ def isolate(tmp_path, monkeypatch):
     monkeypatch.setitem(td._quarantine_tick, "held", 0)
     monkeypatch.setitem(td._quarantine_tick, "failed", 0)
     monkeypatch.setattr(td, "_quarantine_seen", set())
+    monkeypatch.setitem(td._quarantine_unsent, "moved", 0)
     # _pin_root refuses a chain directory others can write (FW-35), and pytest's tmp dirs
     # sit under a world-writable /tmp. Root the checked chain in this test's own tmp dir,
     # as the guard fixture does; the production value stays "/".
@@ -163,7 +164,7 @@ def isolate(tmp_path, monkeypatch):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setattr(td, "load_agent_env", lambda agent_type: {})
 
-    monkeypatch.setattr(td, "matrix_notify", lambda room, title, body: None)
+    monkeypatch.setattr(td, "matrix_notify", lambda room, title, body: True)
     monkeypatch.setattr(td, "bus_log", lambda *a, **k: None)
     monkeypatch.setattr(td.subprocess, "Popen", lambda *a, **k: FakeProc())
     monkeypatch.setattr(td, "pid_alive", lambda pid, start_ticks=None: False)
@@ -246,7 +247,7 @@ def notifications(monkeypatch):
     """Capture matrix_notify calls as (room, title, body)."""
     captured: list[tuple[str, str, str]] = []
     monkeypatch.setattr(
-        td, "matrix_notify", lambda room, title, body: captured.append((room, title, body))
+        td, "matrix_notify", lambda room, title, body: captured.append((room, title, body)) or True
     )
     return captured
 

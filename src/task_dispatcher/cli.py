@@ -509,8 +509,10 @@ def _parse_mcp_response(resp: httpx.Response, expected_id: int) -> dict:
     return resp.json()
 
 
-def matrix_notify(room: str, title: str, body: str) -> None:
-    """Post a notification to a named Matrix room via matrix-mcp, verifying delivery."""
+def matrix_notify(room: str, title: str, body: str) -> bool:
+    """Post a notification to a named Matrix room via matrix-mcp, verifying delivery.
+
+    True only when the send was confirmed. Never raises; most callers ignore the result."""
     try:
         with httpx.Client(timeout=10) as client:
             init_resp = client.post(
@@ -534,7 +536,7 @@ def matrix_notify(room: str, title: str, body: str) -> None:
                     f"matrix_notify: init handshake failed for #{room} "
                     f"(status={init_resp.status_code}, body={init_body})"
                 )
-                return
+                return False
 
             call_headers = {**_MCP_HEADERS, "mcp-session-id": session_id}
             call_resp = client.post(
@@ -564,10 +566,12 @@ def matrix_notify(room: str, title: str, body: str) -> None:
                     f"matrix_notify failed for #{room}: {title!r} "
                     f"(status={call_resp.status_code}, body={call_body})"
                 )
-                return
+                return False
         log.info(f"matrix_notify sent to #{room}: {title}")
+        return True
     except Exception as e:
         log.warning(f"matrix_notify failed for #{room}: {title!r}: {e}")
+        return False
 
 
 # --- .env file reader (SMCP-28) ---
@@ -634,6 +638,9 @@ QUARANTINE_ALERT_STAMP = TASK_QUEUE_DIR / ".quarantine-alert-stamp"
 QUARANTINE_ALERT_DEBOUNCE_SEC = 900
 _quarantine_tick = {"moved": 0, "held": 0, "failed": 0}
 _quarantine_seen: set[str] = set()  # names tried this tick: both drain passes see a file
+# Moved files whose summary send failed, reported with the next tick's. Kept out of
+# _quarantine_tick, whose moved count is the per-tick cap (F-03).
+_quarantine_unsent = {"moved": 0}
 
 
 def anthropic_creds_usable(child_env: dict) -> bool:
@@ -2626,8 +2633,16 @@ def quarantine_queue_file(path: Path, task: object, reason: str) -> None:
 
 def flush_quarantine_alert() -> None:
     """One #alerts message for the tick's quarantine, then reset the counts. Counts only:
-    file names and reasons are agent-influenced, and they are in the dispatcher log."""
+    file names and reasons are agent-influenced, and they are in the dispatcher log.
+
+    A failed send carries the moved count into the next tick's alert, and the debounce
+    stamp is written only once a send is confirmed (F-03). Held and failed are recounted every
+    tick, so they are not carried. A stamp dated in the future is treated as absent; it
+    would otherwise silence the held/failed alert for as long as it stayed ahead (F-03).
+    """
     q = dict(_quarantine_tick)
+    q["moved"] += _quarantine_unsent["moved"]
+    _quarantine_unsent["moved"] = 0
     _quarantine_tick.update(moved=0, held=0, failed=0)
     _quarantine_seen.clear()
     if not any(q.values()):
@@ -2636,17 +2651,23 @@ def flush_quarantine_alert() -> None:
         # Only files that could not move, or were held: these repeat every tick.
         try:
             last = datetime.fromisoformat(QUARANTINE_ALERT_STAMP.read_text().strip())
-            if (datetime.now(UTC) - last).total_seconds() < QUARANTINE_ALERT_DEBOUNCE_SEC:
+            if last.tzinfo is None:
+                last = last.replace(tzinfo=UTC)
+            age = (datetime.now(UTC) - last).total_seconds()
+            if 0 <= age < QUARANTINE_ALERT_DEBOUNCE_SEC:
                 return
         except (OSError, ValueError, TypeError):
             pass
-    matrix_notify(
+    sent = matrix_notify(
         "alerts",
         "[dead-letter] queue files the dispatcher could not route",
         f"Moved to dead-letters/: {q['moved']}. Left in place over the per-tick cap of "
         f"{QUARANTINE_PER_TICK_MAX}: {q['held']}. Could not be moved: {q['failed']}.\n"
         "Names and reasons are in the task-dispatcher log.",
     )
+    if not sent:
+        _quarantine_unsent["moved"] = q["moved"]
+        return
     with contextlib.suppress(OSError):
         QUARANTINE_ALERT_STAMP.write_text(now_iso())
 
@@ -2969,26 +2990,49 @@ def archive_expired() -> None:
         # than raised on, which aborted the tick before the run-complete line (OV-18).
         if not isinstance(task, dict):
             continue
-
-        if task.get("status") not in TERMINAL_STATES:
-            continue
-
-        ttl_days = task.get("ttl_days", 30)
-        created_str = task.get("created", "")
+        # Per item, as in both drain passes: one poison file raised out of main() every
+        # tick, ahead of flush_quarantine_alert() and the run-complete line (F-01, OV-33).
         try:
-            created = datetime.fromisoformat(str(created_str))
-            if created.tzinfo is None:
-                created = created.replace(tzinfo=UTC)
-        except (ValueError, TypeError):
-            continue
-
-        age_days = (now - created).days
-        if age_days >= ttl_days:
-            dest = ARCHIVE_DIR / path.name
-            path.rename(dest)
-            log.info(
-                f"Archived {path.name} (age={age_days}d, ttl={ttl_days}d, status={task['status']})"
+            _archive_one(path, task, now)
+        except Exception as e:
+            quarantine_queue_file(
+                path, task, f"dispatcher error while archiving ({type(e).__name__})"
             )
+
+
+def _archive_one(path: Path, task: dict, now: datetime) -> None:
+    status = task.get("status")
+    if not isinstance(status, str):
+        # The drain passes skip it (status != "submitted"), so this pass is the only one
+        # that sees it; left alone it would sit in the queue for good (F-01).
+        raise TypeError(f"status is {type(status).__name__}, not str")
+    if status not in TERMINAL_STATES:
+        return
+
+    ttl_days = task.get("ttl_days", 30)
+    if type(ttl_days) is not int:
+        # Not quarantined: that would rewrite a completed task as failed and emit
+        # task.failed for it. The default applies instead (F-01).
+        log.warning(f"{path.name}: ttl_days is {type(ttl_days).__name__}, not int; using 30")
+        ttl_days = 30
+    created_str = task.get("created", "")
+    try:
+        created = datetime.fromisoformat(str(created_str))
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=UTC)
+    except (ValueError, TypeError):
+        return
+
+    age_days = (now - created).days
+    if age_days >= ttl_days:
+        dest = ARCHIVE_DIR / path.name
+        try:
+            path.rename(dest)
+        except OSError as e:
+            # Transient (the file went, or the archive is unwritable): not the file's fault.
+            log.warning(f"{path.name}: could not be archived ({type(e).__name__})")
+            return
+        log.info(f"Archived {path.name} (age={age_days}d, ttl={ttl_days}d, status={status})")
 
 
 # --- Phase 1b: Retry routing-failed tasks (FIX: TQMCP-1/MDISP-1) ---
@@ -3192,10 +3236,14 @@ def main():
     # would leak slots.
     sweep_dead_runs(reap_runs())
 
-    process_submitted(manifests)
-    process_routing_failed(manifests)
-    archive_expired()
-    flush_quarantine_alert()
+    try:
+        process_submitted(manifests)
+        process_routing_failed(manifests)
+        archive_expired()
+    finally:
+        # In a finally so a pass that raises still sends the files it dead-lettered
+        # (F-01). The run-complete line below stays outside it: it means the tick finished.
+        flush_quarantine_alert()
 
     # KEEP THIS AT INFO AND KEEP THE WORDING. vikunja#479 (generic cron liveness for all
     # 39 forge cron jobs) may key a Loki `absent_over_time` alert on exactly this string.
