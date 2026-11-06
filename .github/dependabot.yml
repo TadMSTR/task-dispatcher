@@ -1,0 +1,39 @@
+# Dependabot configuration (vikunja#1123).
+#
+# The ecosystem is `pip`: this repo has no uv.lock, CI installs with `pip install -e`, and
+# pyproject.toml is the only manifest. Switch to `uv` in the same change that commits a
+# lock, or the lock freezes (repo standard F11). No `docker` ecosystem; there's no
+# Dockerfile. The `bus` extra's agent-bus is a git-SHA pin, which Dependabot doesn't move.
+# Bump it by hand, along with its tag comment.
+version: 2
+
+updates:
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    groups:
+      dev-tools:
+        patterns: ["ruff", "coverage", "pytest", "pytest-*"]
+    # A Python major is a reading task. The bounded httpx range already stops one arriving
+    # silently.
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    # From agent-platform-templates repo-scaffolding/baseline/dependabot-github-actions.yml.template.
+    # Actions are SHA-pinned with a trailing version comment. Dependabot bumps the SHA and the
+    # comment together.
+    #
+    # Explicit and sized to this repo: 2 distinct actions across .github/workflows/ as of
+    # 2026-11-06. At the cap Dependabot never raises the next bump, and nothing reports it.
+    # Re-count when a workflow adds an action. No codeql-action, so no codeql groups.
+    open-pull-requests-limit: 2
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
