@@ -33,7 +33,7 @@ dependencies = [
 bus = [
     "agent-bus @ git+https://github.com/TadMSTR/agent-bus@41c1adea50d1b2cc5f9fc5849569adc4348af635",
 ]
-dev = ["ruff==0.16.0", "coverage>=7.0", "pytest>=8.0", "pytest-cov>=5.0"]
+dev = ["ruff==0.17.3", "coverage>=7.17.1", "pytest>=9.2.0", "pytest-cov>=7.1.0"]
 
 [project.scripts]
 task-dispatcher = "task_dispatcher:_console"
