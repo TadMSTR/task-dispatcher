@@ -5,7 +5,7 @@ description = "Forge task dispatcher — the launch-control plane for the agent 
 requires-python = ">=3.11"
 license = { text = "MIT" }
 dependencies = [
-    "httpx>=0.28,<0.29",
+    "httpx>=0.28.1,<0.29",
     "pyyaml>=6.0",
 ]
 
